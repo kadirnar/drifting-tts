@@ -23,8 +23,9 @@ The Turkish [drifting-tts](https://github.com/kadirnar/drifting-tts) model runni
 | `tts.js` | the pipeline: text encoder → duration expansion → one DriftDiT pass → BigVGAN-v2 |
 | `app.js`, `index.html` | the demo page |
 
-The models are the `onnx/*_fp16.onnx` graphs of [Vyvo/drifting-tts-tr](https://huggingface.co/Vyvo/drifting-tts-tr).
-Together they are about 370 MB. The browser caches them after the first visit. They store their weights in fp16 and compute in fp32.
+The models are the ONNX graphs in `onnx/` of [Vyvo/drifting-tts-tr](https://huggingface.co/Vyvo/drifting-tts-tr):
+the fp32 text encoder and the generator and vocoder with fp16 weights (`*_fp16.onnx`, computed in fp32). Together they
+are about 385 MB, and the browser caches them after the first visit.
 
 ## Run locally
 

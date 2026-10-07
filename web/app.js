@@ -4,7 +4,7 @@ import { DriftingTTS, SAMPLE_RATE, toWav } from "./tts.js";
 const params = new URLSearchParams(location.search);
 // pinned to a revision: the browser cache is keyed by URL, so a model update must change the URL
 const MODELS = params.get("models") ??
-  "https://huggingface.co/Vyvo/drifting-tts-tr/resolve/c88792c5411bb95b0ceb3b5b0d58624f5e95dcd9/onnx";
+  "https://huggingface.co/Vyvo/drifting-tts-tr/resolve/98b91956593c5c0a3303fba5ee3414ab6762e20c/onnx";
 const EXAMPLES = [
   "Merhaba, nasılsınız? Bugün hava çok güzel.",
   "İstanbul'dan Ankara'ya giden hızlı tren saat 09.15'te kalkıyor.",

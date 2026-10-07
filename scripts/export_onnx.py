@@ -11,7 +11,9 @@ Three graphs; the glue between them is a few lines of JavaScript (web/tts.js):
 Between the encoder and the generator, each token's condition column is repeated ``ceil(exp(logw) * scale)`` times
 (the hard alignment of ``durations_to_alignment``). The graphs are simplified with onnxslim when it is installed.
 ``--fp16`` also writes ``*_fp16.onnx`` copies that store the weights in half precision (half the download) and cast
-them back to fp32 when the session is created, so they compute exactly like the fp32 graphs on any WebGPU device.
+them back to fp32 when the session is created, so they compute like the fp32 graphs on any WebGPU device. The web demo
+loads the fp32 text encoder (15 MB more; it carries most of the rounding error) and the fp16 generator and vocoder:
+``config.json["web"]`` names the files.
 
     python scripts/export_onnx.py --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --out web/models
 """
@@ -104,14 +106,18 @@ def simplify(path: Path) -> None:
 
 
 def half_weights(src: Path, dst: Path, min_size: int = 1024) -> None:
-    """Store large fp32 initializers as fp16, each followed by a Cast back to fp32 (folded at session creation)."""
+    """Store large fp32 initializers as fp16, each followed by a Cast back to fp32 (folded at session creation).
+
+    Depthwise ``[C, 1, K]`` kernels stay fp32: they are BigVGAN's anti-aliasing filters (2 MB), and rounding them
+    costs more than all the other weights together."""
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
     m = onnx.load(str(src))
     keep, casts = [], []
     for init in m.graph.initializer:
-        if init.data_type != TensorProto.FLOAT or np.prod(init.dims) < min_size:
+        depthwise = len(init.dims) == 3 and init.dims[1] == 1
+        if init.data_type != TensorProto.FLOAT or np.prod(init.dims) < min_size or depthwise:
             keep.append(init)
             continue
         half = numpy_helper.from_array(numpy_helper.to_array(init).astype(np.float16), init.name + "_fp16")
@@ -185,13 +191,16 @@ def main() -> None:
         for name in ("text_encoder", "generator", "vocoder"):
             half_weights(out / f"{name}.onnx", out / f"{name}_fp16.onnx")
 
+    half = "_fp16" if args.fp16 else ""
     meta = {"sample_rate": 24000, "hop_length": 256, "n_mels": 100, "cond_channels": int(cond.shape[1]),
             "noise_classes": gen.noise_classes, "noise_coords": max(1, gen.noise_coords),
             "duration_scale": tts.duration_scale,
             "duration_scales": {str(k): v for k, v in tts.duration_scales.items()},
             "temperature": float(getattr(tts, "temperature", None) or 0.3),
             "voices": {k: v["id"] for k, v in VOICES.items()}, "default_voice": DEFAULT_VOICE,
-            "files": {f.name: f.stat().st_size for f in sorted(out.glob("*.onnx"))}}
+            "files": {f.name: f.stat().st_size for f in sorted(out.glob("*.onnx"))},
+            "web": {"text_encoder": "text_encoder.onnx", "generator": f"generator{half}.onnx",
+                    "vocoder": f"vocoder{half}.onnx"}}
     (out / "config.json").write_text(json.dumps(meta, indent=1))
     print(f"wrote {out}: " + ", ".join(f"{f.name} {f.stat().st_size / 1e6:.0f} MB" for f in sorted(out.glob("*.onnx"))))
 

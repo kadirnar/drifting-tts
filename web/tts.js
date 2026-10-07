@@ -113,12 +113,13 @@ export class DriftingTTS {
     this.provider = provider;
   }
 
-  // `load(url)` reads `url`/config.json, then the graphs (`suffix` "_fp16": half-precision weights, half the download).
-  // `onProgress(loadedBytes, totalBytes, file)` reports the download.
-  static async load(ort, baseUrl, { suffix = "_fp16", providers = null, onProgress = () => {}, fetchBytes = null } = {}) {
+  // `load(url)` reads `url`/config.json, then the graphs it lists under "web" (fp16-weight generator and vocoder);
+  // `suffix` ("" or "_fp16") picks one variant for all three instead. `onProgress(loaded, total, file)` reports the
+  // download.
+  static async load(ort, baseUrl, { suffix = null, providers = null, onProgress = () => {}, fetchBytes = null } = {}) {
     const get = fetchBytes ?? fetchCached;
     const config = JSON.parse(new TextDecoder().decode(await get(`${baseUrl}/config.json`)));
-    const names = GRAPHS.map((g) => `${g}${suffix}.onnx`);
+    const names = GRAPHS.map((g) => (suffix === null && config.web?.[g]) || `${g}${suffix ?? "_fp16"}.onnx`);
     const sizes = names.map((n) => config.files?.[n] ?? 0);
     const total = sizes.reduce((s, x) => s + x, 0);
     const loaded = names.map(() => 0);
