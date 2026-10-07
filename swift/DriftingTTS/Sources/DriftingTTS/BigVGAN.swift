@@ -62,6 +62,7 @@ private struct VocoderActivation {
         let b = hasBeta ? try schema.require(name + ".act.beta", [channels]) : a
         alpha = logarithmic ? exp(a) : a
         inverseBeta = 1.0 / ((logarithmic ? exp(b) : b) + 1e-9)
+        try Task.checkCancellation()
         eval(alpha, inverseBeta)
     }
 
@@ -111,6 +112,7 @@ private struct VocoderUpsample {
         let paddedWeight = padded(original, widths: [[0, 0], [offset, stride * taps - kernel - offset], [0, 0]])
         weight = flipped(paddedWeight.reshaped([output, taps, stride, input]), axis: 1)
             .transposed(2, 0, 1, 3).reshaped([stride * output, taps, input])
+        try Task.checkCancellation()
         eval(weight, bias)
     }
 
@@ -247,19 +249,44 @@ final class BigVGAN {
     }
 
     func callAsFunction(_ mel: MLXArray) -> MLXArray {
+        // The common implementation only throws through this callback; a no-op cannot fail.
+        try! decode(mel, checkCancellation: {})
+    }
+
+    /// Stop submitting subsequent stages after the current bounded GPU work completes.
+    /// Already committed Metal commands cannot be interrupted.
+    func decodeChecked(_ mel: MLXArray) throws -> MLXArray {
+        try decode(mel, checkCancellation: { try Task.checkCancellation() })
+    }
+
+    private func decode(_ mel: MLXArray, checkCancellation: () throws -> Void) throws -> MLXArray {
+        try checkCancellation()
         var x = pre(mel.asType(.float32))
         for i in upsample.indices {
+            try checkCancellation()
             x = upsample[i](x)
+            try checkCancellation()
             var sum = blocks[i][0](x)
-            if lowMemory { eval(sum) }
+            if lowMemory {
+                eval(sum)
+                try checkCancellation()
+            }
             for j in 1..<blocks[i].count {
+                try checkCancellation()
                 sum = sum + blocks[i][j](x)
-                if lowMemory { eval(sum) }
+                if lowMemory {
+                    eval(sum)
+                    try checkCancellation()
+                }
             }
             x = sum / Float(blocks[i].count)
             // Materialization bounds live intermediate graphs for the iPhone. It does not change precision.
-            if lowMemory { eval(x) }
+            if lowMemory {
+                eval(x)
+                try checkCancellation()
+            }
         }
+        try checkCancellation()
         let audio = post(activation(x))[.ellipsis, 0]
         return useTanh ? tanh(audio) : audio
     }

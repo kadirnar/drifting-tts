@@ -78,7 +78,7 @@ private struct SpeechView: View {
                                     metric("Üretim ve akış", value: String(format: "%.2f sn", total))
                                 }
                                 if model.peakMemoryBytes > 0 {
-                                    metric("MLX tepe belleği",
+                                    metric("MLX tepe · oturum",
                                            value: String(format: "%.0f MB", Double(model.peakMemoryBytes) / 1_000_000))
                                 }
                                 Text("TTFA, ilk PCM verisinin hazır olduğu ana kadardır. Hoparlör gecikmesini içermez.")

@@ -61,6 +61,7 @@ struct TensorWeights {
         guard remaining.isEmpty else {
             throw TensorWeightError.invalid("Unexpected tensors: \(remaining.keys.sorted().joined(separator: ", "))")
         }
+        try Task.checkCancellation()
         eval(Array(checked.values))
         return checked
     }

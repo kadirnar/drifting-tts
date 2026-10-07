@@ -9,6 +9,7 @@ on:
       - "web/tests/**"
       - "scripts/*swift*"
       - ".github/workflows/apple.yml"
+      - "!**/*.md"
   pull_request:
     paths:
       - "swift/**"
@@ -17,6 +18,7 @@ on:
       - "web/tests/**"
       - "scripts/*swift*"
       - ".github/workflows/apple.yml"
+      - "!**/*.md"
   workflow_dispatch:
 
 permissions:

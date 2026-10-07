@@ -90,8 +90,8 @@ public actor DriftingSynthesizer {
                 let end = min(offset + count, frames)
                 let left = max(0, offset - vocoder.contextFrames)
                 let right = min(frames, end + vocoder.contextFrames)
-                let samples = Device.withDefaultDevice(device) {
-                    let decoded = vocoder(mel[0..., left..<right, 0...])
+                let samples = try Device.withDefaultDevice(device) {
+                    let decoded = try vocoder.decodeChecked(mel[0..., left..<right, 0...])
                     let from = (offset - left) * vocoder.hopLength
                     let to = (end - left) * vocoder.hopLength
                     return clip(decoded[0, from..<to], min: -1, max: 1).asArray(Float.self)
@@ -116,28 +116,31 @@ public actor DriftingSynthesizer {
     private func makeMel(ids: [Int], speaker: Int, scale: Float, temperature: Float,
                          cfgScale: Float, key: MLXArray) throws -> (MLXArray, MLXArray) {
         try Device.withDefaultDevice(device) {
-        let spk = MLXArray([Int32(speaker)])
-        let (tokens, logw) = acoustic.encode(ids: MLXArray(ids.map(Int32.init)).reshaped([1, ids.count]),
-                                             speaker: spk, pitchShift: 0)
-        let logs = logw.asArray(Float.self)
-        var indices: [Int32] = []
-        for (index, value) in logs.enumerated() {
-            let predicted = ceilf(expf(value) * scale)
-            guard predicted.isFinite, predicted >= 0, predicted <= 1024 else { throw SynthesisError.invalidDuration }
-            let duration = Int(predicted)
-            guard indices.count + duration <= 1024 else { throw SynthesisError.sentenceTooLong(indices.count + duration) }
-            indices.append(contentsOf: repeatElement(Int32(index), count: duration))
-        }
-        guard !indices.isEmpty else { throw SynthesisError.invalidDuration }
-        let condition = take(tokens, MLXArray(indices), axis: 1)
-        let keys = MLXRandom.split(key: key, into: 3)
-        let noise = MLXRandom.normal([1, indices.count, config.nMels], key: keys[1]) * temperature
-        let labels = MLXRandom.randInt(low: 0, high: config.model.gen.noiseClasses,
-            [1, max(1, config.model.gen.noiseCoords)], key: keys[2])
-        let result = acoustic.generate(noise: noise, condition: condition, speaker: spk,
-            cfg: MLXArray([cfgScale]), noiseLabels: labels) * config.stats.std + config.stats.mean
-        eval(result)
-        return (result, keys[0])
+            let spk = MLXArray([Int32(speaker)])
+            let (tokens, logw) = acoustic.encode(ids: MLXArray(ids.map(Int32.init)).reshaped([1, ids.count]),
+                                                 speaker: spk, pitchShift: 0)
+            let logs = logw.asArray(Float.self)
+            try Task.checkCancellation()
+            var indices: [Int32] = []
+            for (index, value) in logs.enumerated() {
+                let predicted = ceilf(expf(value) * scale)
+                guard predicted.isFinite, predicted >= 0, predicted <= 1024 else { throw SynthesisError.invalidDuration }
+                let duration = Int(predicted)
+                guard indices.count + duration <= 1024 else { throw SynthesisError.sentenceTooLong(indices.count + duration) }
+                indices.append(contentsOf: repeatElement(Int32(index), count: duration))
+            }
+            guard !indices.isEmpty else { throw SynthesisError.invalidDuration }
+            let condition = take(tokens, MLXArray(indices), axis: 1)
+            let keys = MLXRandom.split(key: key, into: 3)
+            let noise = MLXRandom.normal([1, indices.count, config.nMels], key: keys[1]) * temperature
+            let labels = MLXRandom.randInt(low: 0, high: config.model.gen.noiseClasses,
+                [1, max(1, config.model.gen.noiseCoords)], key: keys[2])
+            try Task.checkCancellation()
+            let result = acoustic.generate(noise: noise, condition: condition, speaker: spk,
+                cfg: MLXArray([cfgScale]), noiseLabels: labels) * config.stats.std + config.stats.mean
+            try Task.checkCancellation()
+            eval(result)
+            return (result, keys[0])
         }
     }
 }

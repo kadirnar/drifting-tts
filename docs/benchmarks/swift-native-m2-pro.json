@@ -1,0 +1,128 @@
+{
+  "date": "2026-10-07",
+  "hardware": "Apple M2 Pro, 16 GB",
+  "os": "macOS 26.5.2",
+  "swift": "6.3.3",
+  "mlx_swift": "0.32.3",
+  "measured_commit": "e897886c6eea9d2eda0bc7ce546d7ac24e17cace",
+  "checkpoint_revision": "2de3308045f6f559b2efa2d8cca3749fa3262848",
+  "settings": {
+    "first_chunk_frames": 24,
+    "chunk_frames": 128,
+    "cache_bytes": 33554432,
+    "dtype": "float32",
+    "voice": "studio",
+    "seed": 0
+  },
+  "notes": [
+    "Mac native Swift GPU measurements, not iPhone measurements.",
+    "Warm medians exclude run 0; 5 measured repetitions.",
+    "Model loading excluded; first PCM includes host transfer, excludes audio device playback.",
+    "Peak memory is MLX process high-water active allocation, including model load; cache and non-MLX overhead excluded.",
+    "First-ever shader-cache run separately observed 734.5 ms; subsequent process cold runs benefit from OS shader caches."
+  ],
+  "cases": {
+    "short": {
+      "text": "Merhaba, nasılsınız?",
+      "runs": [
+        {
+          "totalSeconds": 0.36904479190707207,
+          "ttfaSeconds": 0.1584086250513792,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        },
+        {
+          "totalSeconds": 0.2997671663761139,
+          "ttfaSeconds": 0.10999224986881018,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        },
+        {
+          "totalSeconds": 0.29894133331254125,
+          "ttfaSeconds": 0.10881404159590602,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        },
+        {
+          "totalSeconds": 0.30108537478372455,
+          "ttfaSeconds": 0.11160174990072846,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        },
+        {
+          "totalSeconds": 0.2991424170322716,
+          "ttfaSeconds": 0.10975212510675192,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        },
+        {
+          "totalSeconds": 0.2977397502399981,
+          "ttfaSeconds": 0.10847420850768685,
+          "audioSeconds": 1.312,
+          "peakMemoryBytes": 1205428212
+        }
+      ],
+      "warm_ttfa_median_ms": 109.75212510675192,
+      "warm_total_median_s": 0.2991424170322716,
+      "maximum_peak_active_bytes": 1205428212
+    },
+    "long": {
+      "text": "İstanbul Boğazının iki yakası, tarihi köprüler ve vapurlarla birbirine bağlanır. Bugün hava oldukça güzel.",
+      "runs": [
+        {
+          "peakMemoryBytes": 1507811316,
+          "audioSeconds": 6.731333333333334,
+          "ttfaSeconds": 0.15480449981987476,
+          "totalSeconds": 1.8987600416876376
+        },
+        {
+          "audioSeconds": 6.731333333333334,
+          "totalSeconds": 1.6583299585618079,
+          "peakMemoryBytes": 1507811316,
+          "ttfaSeconds": 0.11700600013136864
+        },
+        {
+          "audioSeconds": 6.731333333333334,
+          "peakMemoryBytes": 1507811316,
+          "totalSeconds": 1.6404349585063756,
+          "ttfaSeconds": 0.11724524991586804
+        },
+        {
+          "peakMemoryBytes": 1507811380,
+          "ttfaSeconds": 0.1181421666406095,
+          "audioSeconds": 6.731333333333334,
+          "totalSeconds": 1.6377670834772289
+        },
+        {
+          "totalSeconds": 1.6730504999868572,
+          "ttfaSeconds": 0.1155286249704659,
+          "audioSeconds": 6.731333333333334,
+          "peakMemoryBytes": 1507811380
+        },
+        {
+          "totalSeconds": 1.6469573751091957,
+          "peakMemoryBytes": 1507811380,
+          "ttfaSeconds": 0.11653429176658392,
+          "audioSeconds": 6.731333333333334
+        }
+      ],
+      "warm_ttfa_median_ms": 117.00600013136864,
+      "warm_total_median_s": 1.6469573751091957,
+      "maximum_peak_active_bytes": 1507811380
+    }
+  },
+  "production_waveform_parity": {
+    "short": {
+      "samples": 31488,
+      "max_absolute_error": 8.985400199890137e-05,
+      "snr_db": 73.78495840851463,
+      "includes_pcm16_quantization": true
+    },
+    "long": {
+      "samples": 161552,
+      "max_absolute_error": 7.811188697814941e-05,
+      "snr_db": 74.66828979423575,
+      "includes_pcm16_quantization": true
+    }
+  }
+}

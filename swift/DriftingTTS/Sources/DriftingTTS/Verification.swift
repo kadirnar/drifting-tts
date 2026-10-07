@@ -122,23 +122,30 @@ public enum Verification {
         func result() -> [AudioChunk] { chunks }
     }
 
-    /// Exercise public synthesis, sentence pauses, streamed sample accounting, and seeded waveform parity.
-    public static func runPipeline(directory: URL, device: Device = .cpu) async throws -> [String: Double] {
-        let cases = try readCases(directory)
-        let item = cases.pipeline
-        let expected = try Device.withDefaultDevice(device) {
+    private static func waveform(directory: URL, device: Device) throws -> [Float] {
+        try Device.withDefaultDevice(device) {
             let values = try loadArrays(url: directory.appendingPathComponent("references.safetensors"))
             guard let waveform = values["pipeline.waveform"] else {
                 throw VerificationError.mismatch("missing pipeline waveform")
             }
             return waveform.asArray(Float.self)
         }
-        let synth = try DriftingSynthesizer(modelDirectory: directory, device: device)
-        let collector = ChunkCollector()
-        let options = SynthesisOptions(voice: item.speaker, temperature: item.temperature, cfgScale: item.cfgScale,
+    }
+
+    private static func options(for item: Cases.Pipeline) -> SynthesisOptions {
+        SynthesisOptions(voice: item.speaker, temperature: item.temperature, cfgScale: item.cfgScale,
             lengthScale: item.lengthScale, seed: item.seed, pause: item.pause,
             chunkFrames: item.chunkFrames, firstChunkFrames: item.firstChunkFrames)
-        let metrics = try await synth.synthesize(item.text, options: options) { chunk in
+    }
+
+    /// Exercise public synthesis, sentence pauses, streamed sample accounting, and seeded waveform parity.
+    public static func runPipeline(directory: URL, device: Device = .cpu) async throws -> [String: Double] {
+        let cases = try readCases(directory)
+        let item = cases.pipeline
+        let expected = try waveform(directory: directory, device: device)
+        let synth = try DriftingSynthesizer(modelDirectory: directory, device: device)
+        let collector = ChunkCollector()
+        let metrics = try await synth.synthesize(item.text, options: options(for: item)) { chunk in
             await collector.append(chunk)
         }
         let chunks = await collector.result()
@@ -150,5 +157,85 @@ public enum Verification {
         }
         let error = try compare(samples, expected, name: "pipeline.waveform", absoluteTolerance: 2e-6)
         return ["pipeline.waveform": error]
+    }
+
+    /// Check cancellation and invalid requests through the public API, then reuse the same engine.
+    public static func runLifecycle(directory: URL, device: Device = .cpu) async throws -> [String: Double] {
+        // Self-cancel inside a separate task to avoid launch races and leave the caller uncancelled.
+        // A nonexistent path proves cancellation is checked before any checkpoint file is read.
+        let cancelledLoad = Task.detached {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try DriftingSynthesizer(modelDirectory: directory.appendingPathComponent("missing-cancelled-load"),
+                                       device: device)
+        }
+        do {
+            try await cancelledLoad.value
+            throw VerificationError.mismatch("pre-cancelled initialization completed")
+        } catch is CancellationError {}
+
+        let item = try readCases(directory).pipeline
+        let expected = try waveform(directory: directory, device: device)
+        let validOptions = options(for: item)
+        let synth = try DriftingSynthesizer(modelDirectory: directory, device: device)
+        var invalid: [(String, SynthesisOptions)] = []
+        func add(_ name: String, _ change: (inout SynthesisOptions) -> Void) {
+            var value = validOptions
+            change(&value)
+            invalid.append((name, value))
+        }
+        add("NaN CFG") { $0.cfgScale = .nan }
+        add("zero duration scale") { $0.lengthScale = 0 }
+        add("negative duration scale") { $0.lengthScale = -1 }
+        add("excessive duration scale") { $0.lengthScale = 5 }
+        add("infinite duration scale") { $0.lengthScale = .infinity }
+        add("negative pause") { $0.pause = -0.01 }
+        add("excessive pause") { $0.pause = 11 }
+        add("NaN pause") { $0.pause = .nan }
+        add("negative temperature") { $0.temperature = -0.1 }
+        add("excessive temperature") { $0.temperature = 6 }
+        add("NaN temperature") { $0.temperature = .nan }
+        add("zero chunk size") { $0.chunkFrames = 0 }
+        add("excessive chunk size") { $0.chunkFrames = 513 }
+        add("zero first chunk size") { $0.firstChunkFrames = 0 }
+        add("excessive first chunk size") { $0.firstChunkFrames = 513 }
+        for (name, options) in invalid {
+            do {
+                _ = try await synth.synthesize(item.text, options: options) { _ in
+                    throw VerificationError.mismatch("invalid option emitted audio: \(name)")
+                }
+                throw VerificationError.mismatch("invalid option accepted: \(name)")
+            } catch SynthesisError.invalidOptions {}
+        }
+
+        let partial = ChunkCollector()
+        do {
+            _ = try await synth.synthesize(item.text, options: validOptions) { chunk in
+                await partial.append(chunk)
+                if await partial.result().count == 2 { throw CancellationError() }
+            }
+            throw VerificationError.mismatch("callback cancellation did not stop synthesis")
+        } catch is CancellationError {}
+        let partialChunks = await partial.result()
+        let prefix = partialChunks.flatMap(\.samples)
+        guard partialChunks.count == 2, partialChunks.allSatisfy({ !$0.isSilence }),
+              !prefix.isEmpty, prefix.count < expected.count else {
+            throw VerificationError.mismatch("cancelled synthesis emitted an unexpected number of chunks")
+        }
+        let prefixError = try compare(prefix, Array(expected.prefix(prefix.count)),
+                                      name: "lifecycle.cancelled_prefix", absoluteTolerance: 2e-6)
+
+        // The callback error must reset the busy flag and leave deterministic request state intact.
+        let recovered = ChunkCollector()
+        _ = try await synth.synthesize(item.text, options: validOptions) { chunk in
+            await recovered.append(chunk)
+        }
+        let recoveredChunks = await recovered.result()
+        guard recoveredChunks.filter(\.isSilence).count == item.silenceChunks else {
+            throw VerificationError.mismatch("reused engine produced incorrect sentence pauses")
+        }
+        let reusedError = try compare(recoveredChunks.flatMap(\.samples), expected,
+                                      name: "lifecycle.reused_waveform", absoluteTolerance: 2e-6)
+        return ["lifecycle.pre_cancelled_load": 0, "lifecycle.invalid_options": 0,
+                "lifecycle.cancelled_prefix": prefixError, "lifecycle.reused_waveform": reusedError]
     }
 }

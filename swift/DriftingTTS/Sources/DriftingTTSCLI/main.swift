@@ -16,6 +16,7 @@ struct DriftingCLI {
             let directory = URL(fileURLWithPath: path)
             var errors = try Verification.run(directory: directory, device: device)
             errors.merge(try await Verification.runPipeline(directory: directory, device: device)) { _, new in new }
+            errors.merge(try await Verification.runLifecycle(directory: directory, device: device)) { _, new in new }
             print(String(data: try JSONEncoder().encode(errors), encoding: .utf8)!)
             return
         }
