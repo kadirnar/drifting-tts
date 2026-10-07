@@ -106,16 +106,10 @@ See [streaming, memory settings and reproducible benchmarks](docs/MLX.md).
   **84–97 ms** across short/long sentences and a paragraph ([methodology and results](docs/RESULTS.md#mlx)).
   The first request and optional `--compile` need separate measurement; these are not model-loading times.
 
-## On iPhone (native MLX Swift)
+## On iPhone and native macOS
 
-[`ios/DriftingTTSApp.xcodeproj`](ios/) is a SwiftUI app targeting **iOS 17+**, with memory-conscious streaming
-defaults for **iPhone 14 Pro**. It downloads the pinned model once (496 MB), then generates and plays Turkish speech
-on the device with no server. The native engine uses the same safetensors through MLX Swift 0.32.3.
-
-Open the project in **Xcode 26.4+ / Swift 6.3**, select your signing Team and a physical iPhone, then build and run.
-Tap **Modeli hazırla** followed by **Seslendir**. The app displays first-PCM TTFA and playback scheduling latency.
-See [build instructions, memory settings and validation status](ios/README.md). Native numerical parity and real
-model synthesis have been checked on an M2 Pro; physical iPhone performance still needs device measurement.
+The native Swift/MLX engine, iPhone app, installation instructions and device benchmarks are maintained in
+[**drifting-tts-swift**](https://github.com/kadirnar/drifting-tts-swift).
 
 ## Benchmark: Freya-TR-Eval
 
@@ -180,8 +174,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
 | [drifting_tts/mlx/](drifting_tts/mlx/) | MLX inference for Apple silicon (`python -m drifting_tts.mlx`) |
-| [ios/README.md](ios/README.md) | native iPhone app, offline model installation and device validation |
-| [swift/DriftingTTS/](swift/DriftingTTS/) | Swift MLX engine, streaming API and native parity fixtures |
+| [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
 
