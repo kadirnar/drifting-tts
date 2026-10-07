@@ -12,7 +12,7 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 | | |
 |---|---|
 | **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **1.23%** (Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 2.94 |
-| **Speed** (RTX 5090) | first audio after **23–68 ms**, 60–140× faster than real time |
+| **Speed** (RTX 5090) | first audio after **12–14 ms** for any sentence length (streaming, CUDA graphs), 50–100× faster than real time |
 | **Size** | 67.7 M acoustic model + 112 M BigVGAN-v2 vocoder |
 | **Voices** | `studio` (default), `male` and `female` |
 
@@ -61,12 +61,25 @@ drifting-tts synthesize --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt 
     --text "Merhaba, nasılsınız?" --out merhaba.wav
 ```
 
+**Lowest latency: streaming.** `fast=True` runs the acoustic model as CUDA graphs, with the same output. `stream()`
+yields the audio in pieces, and on an RTX 5090 the first piece (0.34 s) is ready after about 12 ms. The vocoder streams
+in overlapping windows whose pieces join into the whole-sentence audio; Freya WER and CER are unchanged
+([details](docs/RESULTS.md#latency-and-size)):
+
+```python
+tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda",
+                  vocoder=hf_hub_download(repo, "bigvgan_v2_ft.pt"), cuda_kernel=True, fast=True)
+for piece in tts.stream("Merhaba! Bu ses parça parça, bekletmeden geliyor.", speaker="studio",
+                        cfg_scale=2.0, temperature=0.3):
+    play(piece)   # float32 tensor at 24 kHz
+```
+
 ## In the browser (WebGPU)
 
 The model also runs entirely client-side with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): the
 **[WebGPU demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)** downloads about 385 MB once, and after
-that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after 0.2–0.4 s, and speech
-is generated about 10–13× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
+that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after about 0.1 s, and
+speech is generated 12–22× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
 
 - **Graphs:** `scripts/export_onnx.py` writes the three ONNX graphs (text encoder, generator, vocoder) and checks each
   against PyTorch. They are published under [`onnx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/onnx) in

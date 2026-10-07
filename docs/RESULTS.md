@@ -66,22 +66,44 @@ The existing voices kept their quality. Their Freya WER went from 1.92% to 1.74%
 
 ## Latency and size
 
-**Setup:** RTX 5090, PyTorch 2.11, fp32, T = 0.3, α = 2, fine-tuned BigVGAN-v2. Each value is the median of 100 runs
-after warm-up, measured with `scripts/bench_ttfa.py`.
+**Setup:** RTX 5090, PyTorch 2.11, T = 0.3, α = 2, `studio` voice, fine-tuned BigVGAN-v2 with its CUDA kernel
+(`--cuda-kernel`). Each value is the median of 100 runs after warm-up, measured with `scripts/bench_ttfa.py --mode
+<mode>`. **TTFA** (time to first audio) runs from the input text to the first audio on the host.
 
-**TTFA** (time to first audio) runs from the input text to the first sentence's waveform on the host. Synthesis
-streams sentence by sentence, so later sentences are generated while the first one plays.
+| mode | short sentence | long sentence (6.0 s) | 4-sentence paragraph | first call after loading | load |
+|---|---|---|---|---|---|
+| `sentence`: each sentence vocoded whole | 21.4 ms | 39.5 ms | 30.9 ms | 282 ms | 2.0 s |
+| `stream`: `Synthesizer.stream` | 18.4 ms | 19.2 ms | 18.9 ms | 294 ms | 1.9 s |
+| **`fast`: `Synthesizer(fast=True).stream`** | **12.3 ms** | **13.9 ms** | **13.6 ms** | **39 ms** | 3.7 s |
+| `fast` + `compile=True` + `tf32=True` | 10.6 ms | 11.3 ms | 11.2 ms | 35 ms | 15 s |
 
-| input | first audio | TTFA | TTFA, BigVGAN CUDA kernel (`--cuda-kernel`) |
-|---|---|---|---|
-| short sentence ("Merhaba, nasılsınız?") | 1.6 s | 27.1 ms | **22.7 ms** |
-| one long sentence | 7.8 s | 67.6 ms | **45.8 ms** |
-| 4-sentence paragraph (21.7 s in total) | 5.2 s | 50.3 ms | **35.9 ms** |
+How the time to first audio was cut ([drifting_tts/fast.py](../drifting_tts/fast.py)):
 
-- **Breakdown:** the text frontend takes 0.1 ms and the acoustic model (text encoder + one DriftDiT pass) about
-  10 ms for any sentence length. The rest is the vocoder, which grows with the length of the first sentence.
-- **Whole paragraph:** 148 ms for 21.7 s of audio (RTF 0.007). p90 latencies are within 0.5 ms of the medians.
-- **Cold start:** the first call after loading takes about 0.3 s (CUDA / cuDNN initialisation).
+- **Streaming vocoder.** Each sentence is still generated in one pass, but the vocoder no longer waits for the
+  whole mel:
+  - it first vocodes 32 frames (0.34 s), with 32 frames of right context;
+  - then windows of 256 frames, with 32 frames of context on each side.
+
+  BigVGAN-v2's receptive field is about 24 frames, so the pieces join into what vocoding the whole sentence gives,
+  and TTFA no longer grows with the sentence.
+- **CUDA graphs.** The acoustic model launched about 1,750 small kernels per sentence, and half of its 9.5 ms was
+  launch overhead.
+  - The text encoder and the DiT now run as CUDA graphs, captured once per length bucket: tokens padded to
+    multiples of 32, frames to multiples of 64.
+  - The padding is masked, so the mel is bit-identical to the eager model's.
+  - The acoustic model now takes about 4 ms, and the first vocoder window about 7.7 ms.
+- **What is left.** The first vocoder window is limited by the number of kernels in BigVGAN-v2: about 700 sequential
+  kernels at ~10 µs each. fp16 overflows in BigVGAN, and `torch.compile` of BigVGAN gained 17% while changing the
+  output, so neither is used.
+- **Options that change the output slightly.**
+  - `compile=True` fuses the DiT with `torch.compile` (one dynamic-shape compilation).
+  - `tf32=True` runs its matmuls in TF32; the mel SNR is 74 dB against fp32, and the log-spectral distance of the
+    audio is 0.4–0.7 dB.
+  - Together they save about 2 ms.
+
+Quality is unchanged. On all 495 Freya-TR-Eval sentences, `sentence` mode and `fast` streaming both give WER 1.25% and
+CER 0.24%, with UTMOSv2 2.935 and 2.934 (`drifting-tts benchmark --fast`). Streaming costs more GPU time per
+sentence, because of the window overlaps, but it stays 50–100× faster than real time.
 
 | component | parameters |
 |---|---|
@@ -117,9 +139,15 @@ run after the warm-up pass:
 
 | input | audio | first audio | total | acoustic model | vocoder |
 |---|---|---|---|---|---|
-| "Merhaba, nasılsınız? Bugün hava çok güzel." (2 sentences) | 2.9 s | 185 ms | 303 ms | 156 ms | 138 ms |
-| 2-sentence train announcement (female voice) | 7.8 s | 373 ms | 600 ms | 168 ms | 429 ms |
-| one sentence | 3.7 s | 289 ms | 290 ms | 89 ms | 200 ms |
+| "Merhaba, nasılsınız? Bugün hava çok güzel." (2 sentences) | 2.9 s | 110 ms | 247 ms | 103 ms | 135 ms |
+| 2-sentence train announcement (female voice) | 7.8 s | 113 ms | 348 ms | 115 ms | 231 ms |
+| one sentence | 3.7 s | 97 ms | 194 ms | 69 ms | 124 ms |
+
+The page streams like `Synthesizer.stream`: the vocoder starts with a 32-frame window, and every piece is played as
+soon as it is ready. The text-encoder graph is exported without its attention mask, which is all ones for one
+utterance; the mask's IsNaN guard ran on the CPU, which cost a GPU round trip in every layer. Together these changes
+cut the first audio from 131–172 ms to 97–113 ms, with the GPU otherwise idle in both runs. The text encoder alone went
+from 30 to 8 ms. A sentence of a length not seen before sometimes costs about 20 ms more, for kernel compilation.
 
 - **Download:** loading the 385 MB of graphs from the Hub took about 11 s here, plus under 1 s of warm-up for
   shader compilation. Later visits load the graphs from the browser cache.

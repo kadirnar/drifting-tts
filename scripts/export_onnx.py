@@ -19,17 +19,32 @@ loads the fp32 text encoder (15 MB more; it carries most of the rounding error) 
 """
 
 import argparse
+import contextlib
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from drifting_tts.text import SYMBOLS
 from drifting_tts.train import load_tts
 from drifting_tts.vocoder import load_bigvgan
 from drifting_tts.voices import DEFAULT_VOICE, VOICES
+
+
+@contextlib.contextmanager
+def unmasked_attention():
+    """One utterance has no padding, so the encoder's attention mask is all ones. Dropping it keeps the exported graph
+    free of the IsNaN / Where guard for fully masked rows, which onnxruntime-web runs on the CPU: a GPU round trip in
+    every layer (30 ms -> a few ms for the text encoder in the browser)."""
+    sdpa = F.scaled_dot_product_attention
+    F.scaled_dot_product_attention = lambda q, k, v, attn_mask=None, **kw: sdpa(q, k, v, **kw)
+    try:
+        yield
+    finally:
+        F.scaled_dot_product_attention = sdpa
 
 
 class TextEncoder(nn.Module):
@@ -168,8 +183,9 @@ def main() -> None:
                 torch.randint(0, gen.noise_classes, (1, max(1, gen.noise_coords))))
     mel = torch.randn(1, 100, t) * 2 - 5
 
-    export(enc, (text, spk), out / "text_encoder.onnx", ["text", "speaker"], ["cond", "logw"],
-           {"text": {1: "N"}, "cond": {2: "N"}, "logw": {2: "N"}})
+    with unmasked_attention():
+        export(enc, (text, spk), out / "text_encoder.onnx", ["text", "speaker"], ["cond", "logw"],
+               {"text": {1: "N"}, "cond": {2: "N"}, "logw": {2: "N"}})
     export(generator, gen_args, out / "generator.onnx", ["z", "cond", "speaker", "cfg_scale", "noise_labels"], ["mel"],
            {"z": {2: "T"}, "cond": {2: "T"}, "mel": {2: "T"}})
     export(vocoder, (mel,), out / "vocoder.onnx", ["mel"], ["audio"], {"mel": {2: "T"}, "audio": {1: "S"}})
