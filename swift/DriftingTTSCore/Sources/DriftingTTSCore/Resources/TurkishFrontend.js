@@ -1,15 +1,18 @@
+// Generated from web/text.js by scripts/sync_swift_frontend.py; do not edit.
+"use strict";
+globalThis.DriftingText = (() => {
 // Turkish text frontend for the browser: a port of drifting_tts/text.py (normalize, text_to_ids) and
 // drifting_tts.synthesize.split_sentences. web/tests/text.test.mjs checks it against Python outputs.
 //
 // Porting notes: Python's \w \d \b are Unicode-aware but JS's are ASCII-only (even with the u flag), and JS's \s is a
 // different set, so the classes below spell out Python's; int() reads any Unicode decimal digit and has no size limit.
 
-export const PAD = "<pad>", BLANK = "<blank>";
+const PAD = "<pad>", BLANK = "<blank>";
 const LETTERS = "abcçdefgğhıijklmnoöpqrsştuüvwxyz";
 const PUNCTUATION = " .,!?";
-export const SYMBOLS = [PAD, BLANK, ...LETTERS, ...PUNCTUATION];
-export const SYMBOL_TO_ID = new Map(SYMBOLS.map((s, i) => [s, i]));
-export const PAD_ID = SYMBOL_TO_ID.get(PAD), BLANK_ID = SYMBOL_TO_ID.get(BLANK);
+const SYMBOLS = [PAD, BLANK, ...LETTERS, ...PUNCTUATION];
+const SYMBOL_TO_ID = new Map(SYMBOLS.map((s, i) => [s, i]));
+const PAD_ID = SYMBOL_TO_ID.get(PAD), BLANK_ID = SYMBOL_TO_ID.get(BLANK);
 
 // Python character classes (bracket contents)
 const W = String.raw`\p{L}\p{N}_`; // \w
@@ -113,7 +116,7 @@ function belowThousand(n) {
 }
 
 /** Verbalise a non-negative integer (number or BigInt) in Turkish (1100 -> "bin yüz"). */
-export function numberToWords(n) {
+function numberToWords(n) {
   n = BigInt(n);
   if (n === 0n) return "sıfır";
   const words = [];
@@ -136,7 +139,7 @@ const HARMONY = { a: "ı", ı: "ı", e: "i", i: "i", o: "u", u: "u", ö: "ü", �
 const isVowel = (c) => c.length > 0 && VOWELS.includes(c);
 
 /** Turkish ordinal (14 -> "on dördüncü") using four-way vowel harmony. */
-export function ordinalToWords(n) {
+function ordinalToWords(n) {
   const head = numberToWords(n).split(" ");
   let last = head.pop();
   const v = HARMONY[[...last].filter(isVowel).at(-1)];
@@ -213,10 +216,10 @@ const isCombining = (c) => /\p{M}/u.test(c) && c.normalize("NFD") === c &&
 const SPACES = re(`^[${S}]+|[${S}]+$`);
 const strip = (s) => s.replace(SPACES, ""); // str.strip()
 
-export const turkishLower = (text) => text.replaceAll("I", "ı").replaceAll("İ", "i").toLowerCase();
+const turkishLower = (text) => text.replaceAll("I", "ı").replaceAll("İ", "i").toLowerCase();
 
 /** Normalise raw Turkish text to the symbol alphabet (lower-case letters, space and ".,!?"). */
-export function normalize(text) {
+function normalize(text) {
   // drop combining marks left after NFC, e.g. the U+0307 in "i\u0307" that "İ".toLowerCase() produces
   text = [...text.normalize("NFC")].filter((c) => !isCombining(c)).map((c) => CHAR_MAP[c] ?? c).join("");
   // an apostrophe between a letter/digit/unit and a letter starts a suffix (Anadolu'ya, 2021'de, $'a); others are
@@ -251,7 +254,7 @@ export function normalize(text) {
 }
 
 /** Map text to symbol ids; optionally intersperse a blank token (Grad-TTS) for alignment. */
-export function textToIds(text, { intersperseBlank = true, normalized = false } = {}) {
+function textToIds(text, { intersperseBlank = true, normalized = false } = {}) {
   if (!normalized) text = normalize(text);
   const ids = [...text].map((c) => {
     if (!SYMBOL_TO_ID.has(c)) throw new Error(`not in the symbol alphabet: ${JSON.stringify(c)}`);
@@ -264,7 +267,7 @@ export function textToIds(text, { intersperseBlank = true, normalized = false } 
 }
 
 /** Split normalised text into sentences (the generator is trained on <= 16 s utterances). */
-export function splitSentences(text, maxChars = 180) {
+function splitSentences(text, maxChars = 180) {
   const out = [];
   for (const part of text.split(re(`(?<=[.!?])[${S}]+`, "u"))) {
     let s = [...strip(part)]; // code points, as Python indexes strings
@@ -279,3 +282,7 @@ export function splitSentences(text, maxChars = 180) {
   }
   return out;
 }
+
+return Object.freeze({normalize, textToIds, splitSentences, numberToWords, ordinalToWords,
+symbols: Object.freeze(SYMBOLS), padID: PAD_ID, blankID: BLANK_ID});
+})();

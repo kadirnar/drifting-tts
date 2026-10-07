@@ -1,0 +1,53 @@
+{
+  "format_version": 1,
+  "python_mlx_version": "0.32.3",
+  "encode_cases": [
+    {
+      "name": "short",
+      "pitch_shift": 0.0
+    },
+    {
+      "name": "pitched",
+      "pitch_shift": 2.0
+    },
+    {
+      "name": "lowered",
+      "pitch_shift": -3.0
+    }
+  ],
+  "generate_cases": [
+    {
+      "name": "frames17"
+    },
+    {
+      "name": "frames22"
+    }
+  ],
+  "vocoder_cases": [
+    {
+      "name": "frames1"
+    },
+    {
+      "name": "frames7"
+    },
+    {
+      "name": "frames79"
+    }
+  ],
+  "context_frames": 19,
+  "chunk_start": 22,
+  "chunk_end": 29,
+  "pipeline": {
+    "text": "Merhaba. İyi günler!",
+    "speaker": "female",
+    "seed": 19,
+    "cfg_scale": 1.5,
+    "temperature": 0.4,
+    "length_scale": 1.0,
+    "pause": 0.002,
+    "chunk_frames": 11,
+    "first_chunk_frames": 3,
+    "sample_count": 688,
+    "silence_chunks": 1
+  }
+}

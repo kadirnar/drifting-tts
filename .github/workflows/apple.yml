@@ -1,0 +1,130 @@
+name: Apple native
+
+on:
+  push:
+    paths:
+      - "swift/**"
+      - "ios/**"
+      - "web/text.js"
+      - "web/tests/**"
+      - "scripts/*swift*"
+      - ".github/workflows/apple.yml"
+  pull_request:
+    paths:
+      - "swift/**"
+      - "ios/**"
+      - "web/text.js"
+      - "web/tests/**"
+      - "scripts/*swift*"
+      - ".github/workflows/apple.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      # https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
+      DEVELOPER_DIR: /Applications/Xcode_26.4.1.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun swift --version
+          python3 - <<'PY'
+          import re
+          import subprocess
+          version = subprocess.check_output(["xcrun", "swift", "--version"], text=True)
+          match = re.search(r"Swift version (\d+)\.(\d+)", version)
+          assert match and tuple(map(int, match.groups())) >= (6, 3), version
+          PY
+          if ! xcrun metal -v; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal -v
+          fi
+
+      - name: Check shared Turkish frontend
+        run: |
+          python3 scripts/sync_swift_frontend.py --check
+          node web/tests/text.test.mjs
+
+      - name: Test Core package
+        run: swift test --package-path swift/DriftingTTSCore --jobs 3
+
+      - name: Test native MLX parity on macOS CPU
+        working-directory: swift/DriftingTTS
+        # Xcode builds MLX's Metal resource even though these tests explicitly use the CPU.
+        # Plain `swift test` cannot compile Metal shaders (see mlx-swift's README).
+        run: |
+          xcodebuild test \
+            -scheme DriftingTTS-Package \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/drifting-macos" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/drifting-packages" \
+            -resultBundlePath "$RUNNER_TEMP/native-parity.xcresult" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -parallel-testing-enabled NO \
+            -only-testing:DriftingTTSTests \
+            -jobs 3 | tee "$RUNNER_TEMP/native-parity.log"
+
+      - name: Generate iOS project with pinned packages
+        run: |
+          if ! command -v xcodegen >/dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate --spec ios/project.yml
+          mkdir -p ios/DriftingTTSApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+          cp swift/DriftingTTS/Package.resolved \
+            ios/DriftingTTSApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Build unsigned iOS app
+        run: |
+          xcodebuild build \
+            -project ios/DriftingTTSApp.xcodeproj \
+            -scheme DriftingTTSApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/drifting-ios" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/drifting-packages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -jobs 3 \
+            CODE_SIGNING_ALLOWED=NO | tee "$RUNNER_TEMP/ios-build.log"
+
+      - name: Verify dependency lockfile was preserved
+        run: |
+          git diff --exit-code -- swift/DriftingTTS/Package.resolved
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          original = Path("swift/DriftingTTS/Package.resolved")
+          app = Path("ios/DriftingTTSApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+          def pins(path):
+              return {p["identity"]: p["state"] for p in json.loads(path.read_text())["pins"]}
+          assert pins(original) == pins(app), "Xcode changed a pinned dependency revision"
+          PY
+
+      - name: Save native build and test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-native-diagnostics
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/native-parity.log
+            ${{ runner.temp }}/native-parity.xcresult
+            ${{ runner.temp }}/ios-build.log

@@ -1,0 +1,358 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		04A5B373B8E7FFE10C32856D /* SpeechViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71B58014B7CEFE230D168AEC /* SpeechViewModel.swift */; };
+		24998BE01772230C6343F012 /* PCMPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFFE6E429F0F8420253DE526 /* PCMPlayer.swift */; };
+		A7EA0DF78CD1279C72A7BC1D /* DriftingTTSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CB53F6B0EB284A6D27B78D3 /* DriftingTTSApp.swift */; };
+		A929A45E72D9B5E5B8C99492 /* DriftingTTS in Frameworks */ = {isa = PBXBuildFile; productRef = 86731CF393EDCEBCAE843F18 /* DriftingTTS */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1B77CE5259DE0E947C5998FD /* DriftingTTSApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DriftingTTSApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4CB53F6B0EB284A6D27B78D3 /* DriftingTTSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriftingTTSApp.swift; sourceTree = "<group>"; };
+		591ACC8A294DA492B19CBDC4 /* OptionalMemory.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OptionalMemory.entitlements; sourceTree = "<group>"; };
+		71B58014B7CEFE230D168AEC /* SpeechViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechViewModel.swift; sourceTree = "<group>"; };
+		EFFE6E429F0F8420253DE526 /* PCMPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCMPlayer.swift; sourceTree = "<group>"; };
+		F6D2D1F2AE1C722247D882ED /* DriftingTTS */ = {isa = PBXFileReference; lastKnownFileType = folder; name = DriftingTTS; path = ../swift/DriftingTTS; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A4DC3623E3E65E70E7F66A4C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A929A45E72D9B5E5B8C99492 /* DriftingTTS in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		3E5BBBC814F7D65A74B86AA2 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1B77CE5259DE0E947C5998FD /* DriftingTTSApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		41024D5437A833557D174EA1 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				F6D2D1F2AE1C722247D882ED /* DriftingTTS */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		7E32810AF3BF6A1DD1ECB826 = {
+			isa = PBXGroup;
+			children = (
+				D06E26073E9700E83AD05546 /* DriftingTTSApp */,
+				41024D5437A833557D174EA1 /* Packages */,
+				3E5BBBC814F7D65A74B86AA2 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D06E26073E9700E83AD05546 /* DriftingTTSApp */ = {
+			isa = PBXGroup;
+			children = (
+				4CB53F6B0EB284A6D27B78D3 /* DriftingTTSApp.swift */,
+				591ACC8A294DA492B19CBDC4 /* OptionalMemory.entitlements */,
+				EFFE6E429F0F8420253DE526 /* PCMPlayer.swift */,
+				71B58014B7CEFE230D168AEC /* SpeechViewModel.swift */,
+			);
+			path = DriftingTTSApp;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		3BD98BB1852F510365E34CE1 /* DriftingTTSApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00CC6A618A9DDB8F1A2E96D /* Build configuration list for PBXNativeTarget "DriftingTTSApp" */;
+			buildPhases = (
+				90C252064E21988147C96B33 /* Sources */,
+				A4DC3623E3E65E70E7F66A4C /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DriftingTTSApp;
+			packageProductDependencies = (
+				86731CF393EDCEBCAE843F18 /* DriftingTTS */,
+			);
+			productName = DriftingTTSApp;
+			productReference = 1B77CE5259DE0E947C5998FD /* DriftingTTSApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		78D4D72DB7D8661C7988E6EE /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					3BD98BB1852F510365E34CE1 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 89A276EF44F4FF491A98FC09 /* Build configuration list for PBXProject "DriftingTTSApp" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 7E32810AF3BF6A1DD1ECB826;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				EBAFD90A5417EFC8F1E939B8 /* XCLocalSwiftPackageReference "../swift/DriftingTTS" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 3E5BBBC814F7D65A74B86AA2 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				3BD98BB1852F510365E34CE1 /* DriftingTTSApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		90C252064E21988147C96B33 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A7EA0DF78CD1279C72A7BC1D /* DriftingTTSApp.swift in Sources */,
+				24998BE01772230C6343F012 /* PCMPlayer.swift in Sources */,
+				04A5B373B8E7FFE10C32856D /* SpeechViewModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0F1990BBFCD02D2AA9682C4A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		40E5558505258EC24E10E523 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Drifting TTS";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kadirnar.DriftingTTSApp;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		583C629BE731BE7E1901EE4E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		7DA5FAAAFA0BCA7D8FC73CAC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Drifting TTS";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kadirnar.DriftingTTSApp;
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		89A276EF44F4FF491A98FC09 /* Build configuration list for PBXProject "DriftingTTSApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0F1990BBFCD02D2AA9682C4A /* Debug */,
+				583C629BE731BE7E1901EE4E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A00CC6A618A9DDB8F1A2E96D /* Build configuration list for PBXNativeTarget "DriftingTTSApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				40E5558505258EC24E10E523 /* Debug */,
+				7DA5FAAAFA0BCA7D8FC73CAC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		EBAFD90A5417EFC8F1E939B8 /* XCLocalSwiftPackageReference "../swift/DriftingTTS" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../swift/DriftingTTS;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		86731CF393EDCEBCAE843F18 /* DriftingTTS */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = DriftingTTS;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 78D4D72DB7D8661C7988E6EE /* Project object */;
+}

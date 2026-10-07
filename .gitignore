@@ -27,3 +27,13 @@ outputs/
 web/models/
 *.onnx
 .claude/
+
+# SwiftPM / Xcode local build and signing state
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Small deterministic parity fixtures; released weights remain excluded above.
+!swift/DriftingTTS/Tests/DriftingTTSTests/Fixtures/*.safetensors
