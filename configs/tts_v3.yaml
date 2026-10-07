@@ -1,0 +1,39 @@
+# High-quality recipe for one 32 GB GPU (RTX 5090), BigVGAN-v2 mels (`prepare --backend bigvgan --f0 --save-audio`).
+# v2 (2-D Mel-MAE + spectral detail + pitch) plus:
+#   - drift.mode kyutai (Kyutai's released learned-temperature field): in 10k-step pilots it beat the official
+#     field on harmonic contrast (0.98 vs 0.93 of the recordings), CER (15.4% vs 17.7%) and speaker similarity;
+#   - the paper's block features (every_k_block 2) and CFG scales [1, 4];
+#   - larger per-condition sets (G = N = 16) and a 60 M generator (hidden 512, depth 12);
+#   - data filtered on measured quality (`drifting-tts score`);
+#   - location subsampling and a compiled generator to fit the step into ~0.5 s.
+base: tts_v2.yaml
+
+data:
+  min_quality: 0
+  filters:                 # needs data/train/scores.jsonl (`drifting-tts score --data data/train`)
+    min_mos: 3.0           # DNSMOS P.835 OVRL
+    min_spk_sim: 0.5       # cosine to the speaker centroid
+    rate: [8, 20]          # letters per second
+    min_bandwidth: 10000   # Hz
+    max_cer: 0.15          # Whisper large-v3 vs the transcript
+
+model:
+  gen:
+    hidden: 512
+    depth: 12
+    heads: 8
+
+drift:
+  mode: kyutai
+  every_k_block: 2
+  cfg_max: 4.0
+  max_locations: 1024
+  gen_per_cond: 16
+  uncond_per_cond: 16
+
+train:
+  steps: 150000
+  compile: true
+  num_workers: 3
+  sample_every: 10000
+  save_every: 5000

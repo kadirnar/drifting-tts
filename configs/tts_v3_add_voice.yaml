@@ -1,0 +1,18 @@
+# Add a voice to the trained v3 model: fine-tune on the base corpus merged with the new voice's data, so the
+# existing voices are kept. Prepare the new voice with the same front end and merge it after the base corpus:
+#   drifting-tts prepare --parquet-glob ... --out data/new_voice --backend bigvgan --f0 --save-audio \
+#       --speaker-name new_voice --val-size 100 --dev-size 100 --val-max-seconds 16
+#   drifting-tts merge-data --out data/train_new_voice data/train data/new_voice --repeat 1 2
+# The model grows one speaker row, initialised at the mean of the existing ones (train.grow_speakers).
+base: tts_v3.yaml
+
+data:
+  root: data/train_new_voice
+
+train:
+  init_from: runs/tts_v3/model_ema.pt
+  steps: 30000
+  lr: 0.0001
+  warmup: 1000
+  sample_every: 5000
+  save_every: 5000

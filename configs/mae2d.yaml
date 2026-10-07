@@ -1,0 +1,12 @@
+# 2-D Mel-MAE: ResNet over (frequency x time) so that harmonic structure reaches the drift kernel
+base: mae.yaml
+
+model:
+  type: 2d
+  base_channels: 32       # stages: 32, 64, 128, 256 channels
+  layers: [2, 2, 2, 2]
+  input_patch: [2, 2]     # (frequency, time) patchification -> 50 x 128 grid for a 256-frame crop
+  mask_patch: [10, 8]     # masked (frequency, time) blocks, in mel bins / frames
+
+train:
+  batch_size: 64

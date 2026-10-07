@@ -1,0 +1,6 @@
+# tts_v2 + 4-step drifting with on-policy rollout (DriftTTS-style). Evaluate with --steps 1/2/4.
+base: tts_v2.yaml
+
+model:
+  gen:
+    num_steps: 4

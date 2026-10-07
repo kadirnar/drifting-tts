@@ -1,0 +1,12 @@
+# tts_v2 for a >= 40 GB GPU (A100 / H100 / L40S): twice the conditions per step and more samples per condition.
+# The paper (Table 2) and Kyutai both find that larger positive / negative sets and more rows per step help.
+base: tts_v2.yaml
+
+drift:
+  gen_per_cond: 16
+  uncond_per_cond: 16
+
+train:
+  batch_size: 32
+  batch_frames: 48000
+  lr: 0.0003

@@ -1,0 +1,8 @@
+numpy
+numba
+pyyaml
+soundfile
+huggingface_hub
+librosa
+scipy
+matplotlib

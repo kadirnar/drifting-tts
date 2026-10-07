@@ -1,0 +1,90 @@
+# One-step drifting TTS (v1 recipe)
+data:
+  root: data/train
+  min_quality: 60
+  max_frames: 1500         # <= 16 s
+
+mae:
+  path: runs/mae/mae_ema.pt
+
+model:
+  text:
+    d: 192
+    heads: 2
+    layers: 6
+    ffn: 768
+    dropout: 0.1
+    spk_dim: 64
+  gen:                     # DriftDiT, ~23 M parameters
+    hidden: 384
+    depth: 8
+    heads: 6
+    patch: 2
+    mlp_ratio: 4.0
+    n_registers: 16        # official n_cls_tokens
+    noise_classes: 64      # official style embeddings
+    noise_coords: 32
+    residual_prior: true   # output = aligned prior mean + generator output
+    num_steps: 1           # >1: multi-step drifting with on-policy rollout (DriftTTS); 1 = the paper's 1-NFE
+  pitch:
+    enabled: false         # FastPitch-style token pitch conditioning (needs `prepare --f0`)
+
+drift:
+  # official: the paper / official code (fixed temperatures, two-sided softmax, batch-level scale).
+  # kyutai:   Kyutai's released Pocket TTS objective (pocket-tts samplers.py): the official product-form field
+  #           at one learned temperature, per-row distance / coordinate normalisation, max-candidate tau loss.
+  # learned:  the simplified pseudo-code of Kyutai's blog (union softmax, mean tau loss); unstable here, kept
+  #           for reproducibility (docs/DESIGN.md §5).
+  mode: official
+  tau_init: 1.0            # mode learned
+  tau_lr: 0.001            # mode learned
+  kyutai:
+    tau_init: 1.0          # blog recipe (fastest to train); Kyutai's released drifting.yaml starts at 10.0
+    tau_lr: null           # null = train.lr: Kyutai trains tau with the model's LR and schedule, no weight decay
+    per_feature_tau: false # false: one global tau (Kyutai); true: one tau per Mel-MAE feature map
+  crop_frames: 256         # 2.7 s windows for the drift loss
+  gen_per_cond: 8          # G generated samples per condition (N_neg)
+  pos_views: 8             # target + 7 perturbed views (N_pos)
+  view_noise: 0.05         # std of the view perturbation (normalised mel units)
+  uncond_per_cond: 8       # unconditional real negatives per condition (CFG)
+  uncond_bank: 2048
+  cfg_min: 1.0
+  cfg_max: 3.0
+  cfg_power: 3.0           # official neg_cfg_pw
+  no_cfg_frac: 0.1
+  temperatures: [0.02, 0.05, 0.2]   # used by mode: official
+  affinity_floor: 1.0e-6
+  patch_sizes: [2, 4]
+  every_k_block: 0         # official: 2 (adds the pre-GroupNorm output of every 2nd residual block)
+  mel_patch: 4
+  spectral_detail: false   # add mel-minus-frequency-envelope features (harmonic contrast)
+  key_weights: {}          # per feature map multipliers, exact name or glob, e.g. {"detail_*": 4.0}
+  feature_dtype: bf16      # fp32: frozen MAE features in fp32 / TF32 instead of bf16 autocast
+  max_locations: null      # e.g. 1024: random subset of locations per step for larger maps (unbiased, cheaper)
+  detach_cond: false
+  reduce: mean             # average the drift loss over feature maps
+
+loss:
+  drift: 1.0
+  prior: 1.0
+  duration: 1.0
+  recon: 0.0               # optional L1 anchor to the target
+  pitch: 0.1               # token pitch predictor (model.pitch.enabled)
+
+train:
+  seed: 0
+  steps: 100000
+  batch_size: 16           # conditions per step -> 128 generated crops
+  batch_frames: 24000
+  lr: 0.0002
+  weight_decay: 0.01
+  warmup: 5000
+  schedule: const
+  grad_clip: 2.0
+  ema_decay: 0.999
+  num_workers: 4
+  compile: false           # torch.compile the generator (CUDA; up to a minute of compilation at start-up)
+  log_every: 50
+  sample_every: 2500
+  sample_temperature: 0.5  # noise temperature of the TensorBoard samples
+  save_every: 2500

@@ -1,0 +1,142 @@
+# drifting-tts: one-step Turkish text-to-speech
+
+[![Demo](https://img.shields.io/badge/🤗%20Demo-Space-yellow)](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)
+[![Model](https://img.shields.io/badge/🤗%20Model-Vyvo%2Fdrifting--tts--tr-blue)](https://huggingface.co/Vyvo/drifting-tts-tr)
+[![Paper](https://img.shields.io/badge/arXiv-2602.04770-b31b1b)](https://arxiv.org/abs/2602.04770)
+
+A Turkish TTS model that turns text into speech with **a single network pass**, with no diffusion or flow steps.
+It is trained with *[Generative Modeling via Drifting](https://arxiv.org/abs/2602.04770)* (Deng et al., 2026), using
+the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blog/2026-09-28-pocket-tts-drifting/).
+
+| | |
+|---|---|
+| **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **1.23%** (Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 2.94 |
+| **Speed** (RTX 5090) | first audio after **23–68 ms**, 60–140× faster than real time |
+| **Size** | 67.7 M acoustic model + 112 M BigVGAN-v2 vocoder |
+| **Voices** | `studio` (default), `male` and `female` |
+
+## Listen
+
+| text | studio | male | female |
+|---|---|---|---|
+| *Merhaba! Bu ses, tek bir ağ değerlendirmesiyle üretildi; difüzyon adımı yok.* | [wav](docs/samples/v31_studio_1.wav) | [wav](docs/samples/v31_male_1.wav) | [wav](docs/samples/v31_female_1.wav) |
+| *İstanbul Boğazı'nın iki yakası, 1973 yılında açılan köprüyle birbirine bağlandı.* | [wav](docs/samples/v31_studio_2.wav) | [wav](docs/samples/v31_male_2.wav) | [wav](docs/samples/v31_female_2.wav) |
+| *Toplantı yarın saat 14:30'da, 2. katta; lütfen geç kalmayın.* | [wav](docs/samples/v31_studio_3.wav) | [wav](docs/samples/v31_male_3.wav) | [wav](docs/samples/v31_female_3.wav) |
+| *Prof. Dr. Ayşe Yılmaz, 250 TL'lik bağışın tamamının öğrencilere ayrılacağını söyledi.* | [wav](docs/samples/v31_studio_4.wav) | [wav](docs/samples/v31_male_4.wav) | [wav](docs/samples/v31_female_4.wav) |
+
+Or try any text in the **[online demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)**.
+
+## Quick start
+
+```bash
+pip install "drifting-tts[bigvgan] @ git+https://github.com/kadirnar/drifting-tts"   # needs a CUDA build of PyTorch
+```
+
+```python
+import soundfile as sf
+from huggingface_hub import hf_hub_download
+from drifting_tts.synthesize import Synthesizer
+
+repo = "Vyvo/drifting-tts-tr"
+tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda",
+                  vocoder=hf_hub_download(repo, "bigvgan_v2_ft.pt"))
+
+wav, info = tts("Merhaba, bu cümle tek adımda üretildi.", speaker="studio", cfg_scale=2.0, temperature=0.3)
+sf.write("merhaba.wav", wav.numpy(), 24000)
+```
+
+- `speaker`: `"studio"` (default, the clearest voice), `"male"` or `"female"`.
+- `temperature`: the noise level. 0.3 sounds clearest; higher values give more variety.
+- `cfg_scale`: the guidance strength, learned during training, so it costs nothing at inference.
+- Numbers, dates, times, units, currencies and common abbreviations are read out in Turkish automatically.
+
+The same from the command line:
+
+```bash
+hf download Vyvo/drifting-tts-tr --local-dir .
+drifting-tts synthesize --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --speaker female --cfg 2 \
+    --text "Merhaba, nasılsınız?" --out merhaba.wav
+```
+
+## Benchmark: Freya-TR-Eval
+
+[Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) has 495 everyday Turkish sentences that this
+model never saw. The protocol is the one in the FreyaTTS report: audio downsampled to 8 kHz, transcribed by
+Whisper large-v3, and both texts normalised the same way. Lower is better.
+
+| system | parameters | WER | CER |
+|---|---|---|---|
+| **drifting-tts v3.1, studio voice** | 68 M + 112 M vocoder | **1.23%** | **0.24%** |
+| drifting-tts v3.1, male voice | 68 M + 112 M vocoder | 1.74% | 0.38% |
+| drifting-tts v3.1, female voice | 68 M + 112 M vocoder | 3.02% | 0.70% |
+| Piper (tr, dfki) | 16 M | 3.76% (report: 4.4%) | 0.83% (1.1%) |
+| MMS-TTS (tr) | 36 M | 6.26% (report: 6.8%) | 1.43% (1.7%) |
+| FreyaTTS | 183 M | report: 8.0% | report: 3.0% |
+| XTTS-v2 | 470 M | report: 11.1% | report: 3.9% |
+
+- Piper and MMS-TTS were re-run in this repository's harness. Their scores are close to those in the FreyaTTS
+  report, so the numbers are comparable.
+- "report" values are copied from the FreyaTTS report (arXiv 2607.09530, Table 2).
+- Reproduce with `drifting-tts benchmark --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --speaker studio`.
+
+## How it works
+
+```
+text ─► Turkish normaliser ─► text encoder ─► durations + pitch ─► DriftDiT (1 pass) ─► mel ─► BigVGAN-v2 ─► audio
+```
+
+1. A text encoder predicts how long each character lasts and its pitch, then lays the text out over time.
+2. The **DriftDiT** generator turns random noise plus that layout into a mel spectrogram in one forward pass.
+3. Training uses a **drifting field**: generated samples are pulled toward real recordings and pushed away from each
+   other, so the model's output distribution moves toward the data distribution. Similarity is measured in the
+   features of a frozen mel autoencoder, with a learned kernel temperature.
+4. BigVGAN-v2, fine-tuned on the model's own spectrograms, turns the mel into a 24 kHz waveform.
+
+## Train it yourself
+
+Any Hugging Face parquet dataset with `audio` and `text` columns works (`speaker` is optional).
+
+```bash
+pip install -e ".[dev,eval,bigvgan,score]"
+drifting-tts prepare --dataset <hf-dataset-id> --out data/train --backend bigvgan --f0 --save-audio --dev-size 200
+drifting-tts train-mae --config configs/mae2d.yaml --workdir runs/mae2d train.steps=60000  # feature encoder
+drifting-tts score --data data/train                                                       # data quality scores
+drifting-tts train --config configs/tts_v3.yaml --workdir runs/tts_v3                     # the TTS model
+drifting-tts calibrate-durations --model runs/tts_v3/model_ema.pt --temperature 0.3
+drifting-tts finetune-vocoder --config configs/vocoder_bigvgan.yaml --workdir runs/vocoder_v3 \
+    tts.path=runs/tts_v3/model_ema.pt train.steps=15000
+```
+
+On one RTX 5090 the TTS model trains in 13.6 h (150k steps) and the vocoder fine-tunes in about 1 h. New voices can
+be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voice)).
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/RESULTS.md](docs/RESULTS.md) | benchmark details, voices, latency and parameter counts |
+| [docs/TRAINING.md](docs/TRAINING.md) | the training recipe, the evidence behind each choice, adding a voice |
+| [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
+| [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
+| [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
+| [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
+
+## Limitations
+
+- **Voices:** three built-in voices; no voice cloning from a reference recording.
+- **Prosody:** durations and pitch come from simple predictors. Intonation is natural but flatter than in real speech.
+- **Naturalness:** measured only with an automatic score (UTMOSv2), not by listeners.
+
+## Citation and license
+
+```bibtex
+@article{deng2026drifting,
+  title   = {Generative Modeling via Drifting},
+  author  = {Deng, Mingyang and Li, He and Li, Tianhong and Du, Yilun and He, Kaiming},
+  journal = {arXiv preprint arXiv:2602.04770},
+  year    = {2026}
+}
+```
+
+The code is MIT. The vocoder is fine-tuned from
+[NVIDIA BigVGAN-v2](https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x) (MIT).

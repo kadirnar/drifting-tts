@@ -1,0 +1,17 @@
+# Improved recipe against muffled output (see docs/TRAINING.md):
+#   2-D Mel-MAE kernel features + spectral-detail features and pitch conditioning, 1-NFE.
+# Needs: `prepare --f0` data and a 2-D Mel-MAE (configs/mae2d.yaml).
+base: tts.yaml
+
+mae:
+  path: runs/mae2d/mae_ema.pt
+
+model:
+  pitch:
+    enabled: true
+
+drift:
+  spectral_detail: true
+
+train:
+  steps: 150000

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drifting-tts"
+version = "0.1.0"
+description = "One-step text-to-speech with Drifting Models (arXiv 2602.04770)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Kadir Nar", email = "kadir.nar@hotmail.com" }]
+dependencies = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "numpy",
+    "numba",
+    "einops",
+    "pyyaml",
+    "soundfile",
+    "pyarrow",
+    "tqdm",
+    "tensorboard",
+    "vocos",
+    "pyworld",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+# evaluation judges: Whisper large-v3, WavLM-Large + ECAPA-TDNN, UTMOSv2 (not on PyPI; it pulls torchvision, so
+# install torchvision first from the same index as torch, e.g. --index-url https://download.pytorch.org/whl/cu128)
+eval = ["faster-whisper", "transformers", "safetensors",
+        "utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git@v1.3.0"]
+bigvgan = ["librosa", "scipy", "matplotlib", "nnAudio"]   # BigVGAN-v2 backend (its code imports these; nnAudio: CQT-D)
+# data scoring (`drifting-tts score`): Whisper large-v3, DNSMOS (Microsoft's ONNX models run in torch), ECAPA
+score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", "librosa", "speechbrain>=1.0"]
+
+[project.scripts]
+drifting-tts = "drifting_tts.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["drifting_tts*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E731", "B905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

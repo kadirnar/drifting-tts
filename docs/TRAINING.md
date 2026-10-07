@@ -1,0 +1,108 @@
+# Training guide
+
+## The recipe (v3)
+
+`configs/tts_v3.yaml` is the recipe behind the released model. It extends the v2 config, which adds a 2-D Mel-MAE
+with spectral-detail features and pitch conditioning to the first recipe. Each choice was checked in 10k-step
+pilots:
+
+| choice | evidence |
+|---|---|
+| Kyutai's released learned-temperature field (`drift.mode: kyutai`) | pilot: harmonic contrast 0.98 vs 0.93, CER 15.4% vs 17.7% against the paper's fixed temperatures |
+| the paper's block features (`every_k_block: 2`), CFG α ∈ [1, 4] | 48 → 80 feature maps; as in the official code |
+| G = N = 16 samples / negatives per condition, a 60 M generator | larger per-condition sets beat more conditions at a fixed budget (paper, Table 2) |
+| training data filtered on measured quality (`drifting-tts score`) | Whisper CER, DNSMOS, bandwidth, speaker purity, speaking rate |
+| location subsampling of large feature maps, a compiled generator | 3.1 it/s on an RTX 5090 |
+
+Tested and **not** adopted:
+- **A prior-mean negative plus texture drift against over-smoothing.** It lowered harmonic contrast to 0.75 and
+  raised CER to 22% in the pilot.
+- **The paper's fixed temperatures.** They lost the A/B against `kyutai`.
+
+## Pipeline
+
+```bash
+uv venv --python 3.12 && uv pip install -e ".[dev,eval,bigvgan,score]"   # + a CUDA build of torch
+drifting-tts prepare --dataset <hf-dataset-id> --out data/train --backend bigvgan --f0 --save-audio --dev-size 200
+drifting-tts train-mae --config configs/mae2d.yaml --workdir runs/mae2d train.steps=60000
+drifting-tts score --data data/train                                       # quality scores for the filters
+drifting-tts train --config configs/tts_v3.yaml --workdir runs/tts_v3
+drifting-tts calibrate-durations --model runs/tts_v3/model_ema.pt --temperature 0.3
+drifting-tts finetune-vocoder --config configs/vocoder_bigvgan.yaml --workdir runs/vocoder_v3 \
+    tts.path=runs/tts_v3/model_ema.pt train.steps=15000
+```
+
+- **Data format:** `prepare` reads a Hugging Face parquet dataset (or local files with `--parquet-glob`). It needs
+  `audio` and `text` columns; `speaker` and `quality_score` are optional.
+- **Filters:** `data.filters` in the config uses the scores from `drifting-tts score`
+  ([EVALUATION.md](EVALUATION.md#data-curation)).
+
+Measured on one RTX 5090 (32 GB). The container had a 7.7-CPU quota, so keep `OMP_NUM_THREADS`/`NUMBA_NUM_THREADS`
+≤ 4.
+
+| stage | throughput | time |
+|---|---|---|
+| 2-D Mel-MAE, 60k steps, batch 64 | 10–35 it/s | ~1.5 h |
+| TTS v3, 150k steps (16 conditions × 16 samples, 60 M generator, kyutai) | 3.08 it/s, bf16, compiled | 13.6 h |
+| BigVGAN-v2 fine-tuning, 15k steps (4 × 16384 samples) | ~4.7 it/s | ~1 h |
+
+## Adding a voice
+
+A new voice is fine-tuned into a trained model. Its data is mixed with the original training data, so the existing
+voices are kept.
+
+```bash
+drifting-tts prepare --dataset <new-voice-dataset> --out data/new_voice --backend bigvgan --f0 --save-audio \
+    --speaker-name new_voice --val-size 100 --dev-size 100 --val-max-seconds 16
+drifting-tts merge-data --out data/train_new_voice data/train data/new_voice --repeat 1 2
+drifting-tts train --config configs/tts_v3_add_voice.yaml --workdir runs/tts_v3_new_voice
+drifting-tts calibrate-durations --model runs/tts_v3_new_voice/model_ema.pt --temperature 0.3 \
+    --speakers studio male female
+```
+
+- **Speaker table:** the model grows one row per new speaker, initialised at the mean of the old ones.
+- **Kernel temperature:** fine-tuning resumes the learned temperature.
+- **Duration factor:** `calibrate-durations` gives every listed voice its own factor.
+- **Cost and results:** the `studio` voice (30k steps) took 2.7 h on an RTX 5090. Its results are in
+  [RESULTS.md](RESULTS.md#adding-the-studio-voice-v3--v31).
+
+## BigVGAN-v2 vocoder fine-tuning
+
+The vocoder is fine-tuned on the model's own ground-truth-aligned mels, starting from NVIDIA's released generator
+**and** discriminators (`configs/vocoder_bigvgan.yaml`):
+- **Losses:** LSGAN, feature matching and a multi-scale mel L1, as in the official recipe.
+- **Optimiser:** AdamW (0.8, 0.99) at LR 1.35e-5, where the released schedule ended.
+- **Precision:** fp32. bf16 audibly hurts the snake activations.
+
+BigVGAN mel frames are uncentred: `F` frames correspond to `F·256` samples starting at `s·256`. `--cuda-kernel`
+builds BigVGAN's fused activation for the local GPU. It is 2.4–2.9× faster at inference, with SNR ≥ 51.6 dB against
+the PyTorch path.
+
+## What to look at while training
+
+- **`train/centroid_mse`** should keep decreasing.
+- **`train/across_sample_std`** should stay roughly flat. A drop towards 0 means collapse; growth means divergence.
+- **`train/tau_mean`** (`drift.mode: kyutai`) should anneal after a brief rise.
+- **`train/pitch`** is the token pitch MSE in normalised log-F0 units. `train/force_*` are the raw drift norms; the
+  drift loss itself is constant by construction.
+- **Audio samples** are written to `runs/<run>/samples/` every `sample_every` steps.
+
+## Judging the result
+
+Tune on the `dev` split and report on `val` once:
+
+```bash
+M=runs/tts_v3/model_ema.pt
+drifting-tts evaluate --model $M --harmonic --split dev --num 200 --temperature 0.3 0.5 0.7 1.0
+drifting-tts evaluate --model $M --split dev --num 100 --temperature 0.3 0.5 0.7 --cfg 1.0 1.5 2.0
+drifting-tts calibrate-durations --model $M --temperature 0.3      # store the chosen temperature
+drifting-tts benchmark --model $M --speaker studio                 # Freya-TR-Eval
+```
+
+**Listen** above all: UTMOSv2 is trained on English and is only a relative proxy.
+
+# The v2 recipe
+
+`configs/tts_v2.yaml` adds the 2-D Mel-MAE with spectral-detail kernel features and FastPitch-style pitch
+conditioning. `configs/tts_v2_k4.yaml` adds 4-step drifting with on-policy rollout. `scripts/train_v2.sh` runs the
+v2 pipeline end to end.

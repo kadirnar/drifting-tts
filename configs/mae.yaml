@@ -1,0 +1,31 @@
+# Mel-MAE feature encoder (mel analogue of the paper's latent-MAE ResNet)
+data:
+  root: data/train
+  min_quality: 0        # the feature encoder benefits from all data
+  max_frames: 2812
+
+model:
+  n_mels: 100
+  base_channels: 64     # stages: 64, 128, 256, 512 channels at T, T/2, T/4, T/8
+  layers: [2, 2, 2, 2]
+  kernel: 5
+  mask_patch: 8         # ~85 ms time patches
+  speaker_head: true    # speaker classification fine-tuning (paper: "cls ft")
+
+train:
+  seed: 0
+  steps: 30000
+  batch_size: 128
+  crop_frames: 256
+  mask_ratio: 0.5       # paper: 50% masking
+  lr: 0.001
+  weight_decay: 0.01
+  warmup: 1000
+  schedule: cosine
+  grad_clip: 2.0
+  ema_decay: 0.9995
+  cls_weight: 0.1
+  cls_finetune_steps: 3000   # last steps add the classification loss
+  num_workers: 6
+  log_every: 100
+  save_every: 2000
