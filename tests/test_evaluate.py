@@ -104,14 +104,14 @@ def test_evaluate_cli_with_fake_judges(tiny_run, monkeypatch):
     import drifting_tts.vocoder
 
     class FakeVocoder:
-        def __init__(self, *args, **kwargs):
-            pass
+        def __init__(self, *args, backend="vocos", **kwargs):
+            self.mel, self.name = backend, "fake"
 
         def __call__(self, mel):
             return 0.1 * torch.sin(0.05 * torch.arange(mel.shape[-1] * 256, dtype=torch.float32))[None]
 
     fake = Judges(asr=lambda w: "merhaba dünya", sv=lambda w: SPK, mos=lambda w: len(w) / 16_000)
-    monkeypatch.setattr(drifting_tts.vocoder, "Vocoder", FakeVocoder)
+    monkeypatch.setattr(drifting_tts.vocoder, "load_vocoder", FakeVocoder)
     monkeypatch.setattr(drifting_tts.judges, "load_judges", lambda *args, **kwargs: fake)
     out = tiny_run / "full"
     main(["evaluate", "--model", str(tiny_run / "run" / "model_ema.pt"), "--split", "dev", "--num", "5",

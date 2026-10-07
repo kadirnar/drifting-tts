@@ -1,10 +1,11 @@
-"""Synthesise speech: text -> durations -> one DriftDiT evaluation (1-NFE) -> Vocos."""
+"""Synthesise speech: text -> durations -> one DriftDiT evaluation (1-NFE) -> vocoder."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import time
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -38,11 +39,19 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--steps", type=int, default=None, help="generator evaluations (default: as trained, 1-NFE)")
     p.add_argument("--attn-window", type=int, default=None,
                    help="sliding-window attention radius in tokens (2 frames each); default: full attention")
-    p.add_argument("--vocoder", default=None,
-                   help="fine-tuned vocoder (vocos_ft.pt / bigvgan_ft.pt from finetune-vocoder)")
+    add_vocoder_args(p)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+
+def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> None:
+    from .vocoder import VOCODERS
+
+    stock = "the stock vocoder of the model's mel front end (BigVGAN-v2 or Vocos)"
+    p.add_argument("--vocoder", default=default,
+                   help=f"{' | '.join(VOCODERS)} or a checkpoint (bigvgan_ft.pt / vocos_ft.pt from finetune-vocoder); "
+                        f"default: {default or stock}")
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
 def preferred_temperature(model) -> float:
@@ -54,32 +63,52 @@ def preferred_temperature(model) -> float:
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False):
-        """``fast`` (CUDA): the acoustic model and the streaming vocoder's windows run as CUDA graphs
+        """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
+        checkpoint path, or ``None`` for the stock vocoder of the model's mel front end.
+        ``fast`` (CUDA): the acoustic model and the streaming vocoder's windows run as CUDA graphs
         (:mod:`drifting_tts.fast`), captured here (about 2 s); the output is the same as without it. ``compile`` also
         fuses the DiT with ``torch.compile`` (about 20 s the first time) and ``tf32`` uses TF32 matmuls: both are
         faster but change the output slightly (0.4-0.7 dB log-spectral distance with TF32)."""
         from .train import load_tts
-        from .vocoder import Vocoder
+        from .vocoder import load_vocoder
 
         self.model, self.cfg, stats = load_tts(model_path, device)
         self.stats = MelStats(stats["mean"], stats["std"])
-        self.vocoder = Vocoder(device, finetuned=vocoder, backend=stats.get("backend", "vocos"),
-                               cuda_kernel=cuda_kernel)
+        backend = stats.get("backend", "vocos")
+        self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=backend)
+        if self.vocoder.mel != backend:
+            raise ValueError(f"vocoder {self.vocoder.name!r} expects {self.vocoder.mel} mels, but the model produces "
+                             f"{backend} mels")
         self.device = device
         self.default_temperature = preferred_temperature(self.model)
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
         self.acoustic, self.vocoder_graphs = None, None
         if fast:
-            from .fast import GraphedAcoustic, stream_vocoder
+            from .fast import GraphedAcoustic
 
             self.acoustic = GraphedAcoustic(self.model, compile=compile, tf32=tf32)
             self.acoustic.warmup()
-            self.vocoder_graphs = {"pool": torch.cuda.graph_pool_handle()}
-            with torch.no_grad():  # capture the two window sizes of the streaming vocoder
-                for _ in stream_vocoder(self.vocoder, torch.full((1, 100, 384), self.stats.mean, device=device),
-                                        graphs=self.vocoder_graphs):
+            self.vocoder_graphs = self._capture_vocoder()
+
+    def _capture_vocoder(self, first: int = 32, chunk: int = 256) -> dict | None:
+        """CUDA graphs of the streaming vocoder's two window sizes, or ``None`` (eager windows) for a vocoder that
+        does not stream or cannot be captured."""
+        from .fast import stream_vocoder
+
+        voc = self.vocoder
+        if not voc.graphs or voc.context is None:
+            return None
+        graphs = {"pool": torch.cuda.graph_pool_handle()}
+        mel = torch.full((1, 100, first + chunk + voc.context), self.stats.mean, device=self.device)
+        try:
+            with torch.no_grad():
+                for _ in stream_vocoder(voc, mel, first=first, chunk=chunk, context=voc.context, graphs=graphs):
                     pass
+        except RuntimeError as e:
+            warnings.warn(f"vocoder {voc.name!r} runs eagerly: CUDA graph capture failed ({e})", stacklevel=3)
+            return None
+        return graphs
 
     def speaker_id(self, speaker: str | int) -> int:
         """A voice name (``male`` / ``female``), a training speaker ID, or a dataset speaker name."""
@@ -106,6 +135,16 @@ class Synthesizer:
                                        cfg_scale=cfg_scale, temperature=temperature, length_scale=length_scale,
                                        generator=g, attn_window=attn_window, pitch_shift=pitch_shift, steps=steps)
         return mel
+
+    @torch.no_grad()
+    def mels(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
+             length_scale: float = 1.0, seed: int = 0) -> list[torch.Tensor]:
+        """The unnormalised log-mel ``[1, n_mels, T]`` of each sentence, with the same draws as :meth:`__call__`
+        (whose waveform joins their vocoded sentences with ``pause`` seconds of silence)."""
+        spk, tempo = self._speaker(speaker)
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        return [self.stats.denormalize(self._mel(s, spk, g, cfg_scale, temperature, length_scale * tempo))
+                for s in split_sentences(normalize(text))]
 
     @torch.no_grad()
     def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0,
@@ -139,7 +178,8 @@ class Synthesizer:
         """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
 
         Each sentence is generated in one pass. The vocoder then streams: the first ``first`` mel frames (0.34 s), then
-        ``chunk``-frame windows, each with 32 frames of context (see :func:`drifting_tts.fast.stream_vocoder`)."""
+        ``chunk``-frame windows, each with the vocoder's ``context`` (32 frames for BigVGAN-v2; see
+        :func:`drifting_tts.fast.stream_vocoder`). A vocoder without one (Griffin-Lim) yields each sentence whole."""
         from .fast import stream_vocoder
 
         spk, tempo = self._speaker(speaker)
@@ -149,7 +189,8 @@ class Synthesizer:
             mel = self.stats.denormalize(self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo))
             if k:
                 yield silence
-            for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, graphs=self.vocoder_graphs):
+            for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, context=self.vocoder.context,
+                                        graphs=self.vocoder_graphs):
                 yield piece.cpu()
 
     def _sync(self) -> None:

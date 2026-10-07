@@ -6,6 +6,7 @@ TTFA runs from the input text to the first audio on the host. ``--mode``:
 - ``fast``: ``stream`` with CUDA graphs and TF32 (``Synthesizer(fast=True)``); ``--compile`` adds ``torch.compile``.
 
     python scripts/bench_ttfa.py --mode fast --cuda-kernel     # weights from huggingface.co/Vyvo/drifting-tts-tr
+    python scripts/bench_ttfa.py --mode fast --vocoder bigvgan-base --cuda-kernel   # any vocoder of the registry
 """
 
 import argparse
@@ -16,7 +17,7 @@ import numpy as np
 import torch
 
 from drifting_tts.audio import SAMPLE_RATE
-from drifting_tts.synthesize import Synthesizer, split_sentences
+from drifting_tts.synthesize import Synthesizer, add_vocoder_args, split_sentences
 from drifting_tts.text import normalize, text_to_ids
 from drifting_tts.voices import DEFAULT_VOICE, voice_id
 
@@ -80,8 +81,7 @@ def run_stream(synth: Synthesizer, text: str, seed: int, speaker: int, temperatu
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", default=None, help="TTS checkpoint (default: Vyvo/drifting-tts-tr)")
-    p.add_argument("--vocoder", default=None, help="fine-tuned BigVGAN-v2 (default: Vyvo/drifting-tts-tr)")
-    p.add_argument("--cuda-kernel", action="store_true", help="BigVGAN fused activation kernel")
+    add_vocoder_args(p, default="bigvgan-v2-ft")  # fine-tuned BigVGAN-v2 from Vyvo/drifting-tts-tr
     p.add_argument("--mode", choices=["sentence", "stream", "fast"], default="sentence")
     p.add_argument("--compile", action="store_true", help="--mode fast: also torch.compile the DiT")
     p.add_argument("--tf32", action="store_true", help="--mode fast: TF32 matmuls")
@@ -91,11 +91,10 @@ def main() -> None:
     p.add_argument("--cfg", type=float, default=2.0)
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
-    if args.model is None or args.vocoder is None:
+    if args.model is None:
         from huggingface_hub import hf_hub_download
 
-        args.model = args.model or hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt")
-        args.vocoder = args.vocoder or hf_hub_download("Vyvo/drifting-tts-tr", "bigvgan_v2_ft.pt")
+        args.model = hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt")
     t = time.perf_counter()
     synth = Synthesizer(args.model, "cuda", vocoder=args.vocoder, cuda_kernel=args.cuda_kernel,
                         fast=args.mode == "fast", compile=args.compile, tf32=args.tf32)

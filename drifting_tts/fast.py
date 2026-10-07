@@ -7,8 +7,10 @@
   (``torch.compile`` of the DiT; one dynamic-shape compilation, about 20 s on first use).
 * **Vocoder** (:func:`stream_vocoder`): the first ``first`` frames are vocoded with ``context`` frames of right
   context, then windows of ``chunk`` frames with ``context`` frames on each side. BigVGAN-v2's receptive field is
-  about 24 frames, so with 32 frames of context the chunks match vocoding the whole utterance (63 dB SNR, the TF32
-  noise floor). Fixed-size windows run as CUDA graphs. Time to first audio no longer grows with the sentence.
+  about 24 frames, so with 32 frames of context the chunks match vocoding the whole utterance up to the TF32 noise
+  floor (> 95 dB SNR in fp32). Each vocoder of the registry has its own measured context (``Vocoder.context``,
+  docs/VOCODERS.md).
+  Fixed-size windows run as CUDA graphs. Time to first audio no longer grows with the sentence.
 """
 
 from __future__ import annotations
@@ -143,12 +145,13 @@ class GraphedAcoustic:
 
 
 def stream_vocoder(vocode: Callable[[Tensor], Tensor], mel: Tensor, hop: int = 256, first: int = 32,
-                   chunk: int = 256, context: int = 32, graphs: dict | None = None) -> Iterator[Tensor]:
+                   chunk: int = 256, context: int | None = 32, graphs: dict | None = None) -> Iterator[Tensor]:
     """Vocode ``mel`` ``[1, n_mels, T]`` window by window; yields the waveform in pieces (``[samples]``).
 
+    ``context``: ``None`` vocodes the whole mel in one piece (a vocoder that cannot stream, e.g. Griffin-Lim).
     ``graphs``: a dict that caches CUDA graphs of ``vocode`` for the two fixed window sizes (``None``: eager)."""
     t = mel.shape[-1]
-    if t <= first + context:
+    if context is None or t <= first + context:
         yield vocode(mel)[0]
         return
 
