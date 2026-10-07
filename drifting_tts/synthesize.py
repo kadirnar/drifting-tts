@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import time
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import torch
 
 from .audio import SAMPLE_RATE
 from .data import MelStats
-from .text import normalize, text_to_ids
+from .text import normalize, split_sentences, text_to_ids  # noqa: F401 (split_sentences re-exported)
 from .voices import DEFAULT_VOICE, VOICES, voice_id
 
 DEFAULT_TEMPERATURE = 0.5  # CLI default noise temperature (lowest CER in the README sweep)
@@ -43,21 +42,6 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-
-
-def split_sentences(text: str, max_chars: int = 180) -> list[str]:
-    """Split normalised text into sentences (the generator is trained on <= 16 s utterances)."""
-    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    out: list[str] = []
-    for s in parts:
-        while len(s) > max_chars:  # very long sentences: split at the last comma / space before the limit
-            cut = max(s.rfind(",", 0, max_chars), s.rfind(" ", 0, max_chars))
-            cut = cut if cut > 0 else max_chars
-            out.append(s[: cut + 1].strip())
-            s = s[cut + 1:].strip()
-        if s:
-            out.append(s)
-    return out
 
 
 def preferred_temperature(model) -> float:

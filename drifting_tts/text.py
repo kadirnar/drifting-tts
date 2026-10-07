@@ -238,3 +238,18 @@ def text_to_ids(text: str, intersperse_blank: bool = True, normalized: bool = Fa
 
 def ids_to_text(ids: list[int]) -> str:
     return "".join(SYMBOLS[i] for i in ids if i not in (PAD_ID, BLANK_ID))
+
+
+def split_sentences(text: str, max_chars: int = 180) -> list[str]:
+    """Split normalised text into sentences (the generator is trained on <= 16 s utterances)."""
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    out: list[str] = []
+    for s in parts:
+        while len(s) > max_chars:  # very long sentences: split at the last comma / space before the limit
+            cut = max(s.rfind(",", 0, max_chars), s.rfind(" ", 0, max_chars))
+            cut = cut if cut > 0 else max_chars
+            out.append(s[: cut + 1].strip())
+            s = s[cut + 1:].strip()
+        if s:
+            out.append(s)
+    return out
