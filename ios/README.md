@@ -90,9 +90,17 @@ actual iPhone's results when choosing a larger chunk size or cache.
 
 ## Validation available in this workspace
 
-The Xcode project was generated with XcodeGen 2.45.4; its property list and Swift source syntax were checked.
-`ModelStore` passed Swift 6 type checking, verified the real cached checkpoint's sizes/hashes twice and respected
-cancellation. The SwiftUI app passed macOS Swift 6 type checking against the runtime's public types and a
-compile-only synthesizer interface stub. This host has no full Xcode
-installation, iOS SDK or connected iPhone validation available, so **iOS compilation, signing and physical-device
-runtime measurements remain unverified**. The Swift package's separate Mac validation does not replace those checks.
+The [Apple native CI run](https://github.com/kadirnar/drifting-tts/actions/runs/37675907933) passed on 2026-10-07,
+using Xcode 26.4.1 on a macOS 26 ARM64 runner. It compiled the complete app in **Release for generic iOS** with
+signing disabled, preserved dependency pins, and passed the native CPU parity/lifecycle, Core and JavaScript
+frontend tests. CI runs the iOS build and native tests independently.
+
+On the local M2 Pro, all 20 native numerical/lifecycle checks passed on both CPU and Metal GPU. Real model
+synthesis passed for all three voices; the short and two-sentence waveform comparisons against Python are
+documented in the [native engine results](../swift/DriftingTTS/README.md). `ModelStore` verified the real cached
+checkpoint's sizes/hashes twice and respected cancellation.
+
+**Signing, installation, playback and TTFA on a physical iPhone 14 Pro remain unverified.** This local Mac has only
+Command Line Tools, so the iOS build was validated remotely. A full Xcode installation, development Team and
+connected physical iPhone are needed for the remaining device checks. An unsigned CI build cannot be installed
+directly on the phone.

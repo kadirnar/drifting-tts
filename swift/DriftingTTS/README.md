@@ -31,6 +31,8 @@ xcodebuild test -scheme DriftingTTS-Package -destination 'platform=macOS,arch=ar
 The test fixtures compare encoder, pitch conditioning, generator, vocoder, context cropping, seeded RNG and
 end-to-end streaming against deterministic Python MLX references. Lifecycle checks exercise invalid options,
 cancellation and reuse. Regenerate fixtures from the repository root with `python scripts/make_swift_fixtures.py`.
+The [validated CI run](https://github.com/kadirnar/drifting-tts/actions/runs/37675907933) passed the Xcode tests and
+the unsigned iOS Release build on 2026-10-07. Local CPU and Metal GPU runs passed all 20 verification metrics.
 
 The `drifting-tts-swift` executable supports:
 
