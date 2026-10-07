@@ -34,6 +34,8 @@ eval = ["faster-whisper", "transformers", "safetensors",
 bigvgan = ["librosa", "scipy", "matplotlib", "nnAudio"]   # BigVGAN-v2 backend (its code imports these; nnAudio: CQT-D)
 # data scoring (`drifting-tts score`): Whisper large-v3, DNSMOS (Microsoft's ONNX models run in torch), ECAPA
 score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", "librosa", "speechbrain>=1.0"]
+# MLX inference on Apple silicon (`drifting_tts.mlx`); on Linux install "mlx[cpu]" or "mlx[cuda]" instead
+mlx = ["mlx>=0.29", "huggingface_hub"]
 
 [project.scripts]
 drifting-tts = "drifting_tts.cli:main"

@@ -101,28 +101,49 @@ below 4e-5. The whole JavaScript pipeline in `web/tts.js` was also run under onn
 PyTorch run. Its text normalisation, token IDs and frame counts were identical, and the audio matched at an SNR of
 80–84 dB.
 
-The web demo loads the `*_fp16.onnx` graphs. They store their weights in fp16, which halves the download to 368 MB, and
-compute in fp32:
+The fp16 copies (`*_fp16.onnx`) store the weights in half precision and compute in fp32. BigVGAN's anti-aliasing
+filters stay in fp32. The web demo loads the fp32 text encoder and the fp16 generator and vocoder: the text encoder is
+small, yet it accounts for most of the rounding error.
 
 | graphs | download | audio vs PyTorch |
 |---|---|---|
-| fp32 | 729 MB | SNR 91 dB |
-| fp16 weights, fp32 compute (web demo) | 368 MB | SNR 35 dB, log-spectral distance 0.9 dB |
+| all fp32 | 729 MB | SNR 91 dB |
+| web demo: fp32 text encoder, fp16-weight generator and vocoder | 385 MB | SNR 44–47 dB, log-spectral distance 0.6 dB |
+| all with fp16 weights | 369 MB | SNR 38–43 dB |
 
-**Setup:** RTX 5090, headless Chrome 153, onnxruntime-web 1.30 WebGPU, fp16-weight graphs. Each value is a single
+**Setup:** RTX 5090, headless Chrome 153, onnxruntime-web 1.30 WebGPU, the web demo's graphs. Each value is a single
 run after the warm-up pass:
 
 | input | audio | first audio | total | acoustic model | vocoder |
 |---|---|---|---|---|---|
-| "Merhaba, nasılsınız? Bugün hava çok güzel." (2 sentences) | 2.9 s | 182 ms | 297 ms | 139 ms | 154 ms |
-| 2-sentence train announcement (female voice) | 7.8 s | 240 ms | 392 ms | 133 ms | 257 ms |
-| one sentence | 3.7 s | 185 ms | 186 ms | 77 ms | 108 ms |
+| "Merhaba, nasılsınız? Bugün hava çok güzel." (2 sentences) | 2.9 s | 185 ms | 303 ms | 156 ms | 138 ms |
+| 2-sentence train announcement (female voice) | 7.8 s | 373 ms | 600 ms | 168 ms | 429 ms |
+| one sentence | 3.7 s | 289 ms | 290 ms | 89 ms | 200 ms |
 
-- **Download:** loading the 368 MB of graphs from the Hub took 8 s here, plus 0.9 s of warm-up for shader
-  compilation. Later visits load the graphs from the browser cache.
+- **Download:** loading the 385 MB of graphs from the Hub took about 11 s here, plus under 1 s of warm-up for
+  shader compilation. Later visits load the graphs from the browser cache.
 - **Intelligibility:** Whisper large-v3 transcribed all three browser outputs with 0% CER.
 - **Other devices:** laptop and integrated GPUs will be slower. Without WebGPU the page falls back to WASM on the
   CPU, which is far slower than real time.
+
+## MLX
+
+`drifting_tts.mlx` is a port of the inference model to MLX for Apple silicon: the text encoder, the pitch and duration
+predictors, DriftDiT and BigVGAN-v2. In BigVGAN, the anti-aliased activations are written in polyphase form and the
+transposed convolutions as strided phases, so nothing is interleaved or zero-inserted. Every part was checked against
+PyTorch with MLX 0.32 on Linux (CPU backend):
+
+| check | result |
+|---|---|
+| acoustic model, same token ids and noise (real checkpoint) | identical frame counts, mel relative error ≤ 1.4e-5 |
+| BigVGAN-v2, fp32 weights (real fine-tuned checkpoint) | SNR 98.9 dB |
+| BigVGAN-v2, published weights (fp16, snake parameters fp32) | SNR 59.1 dB |
+| whole pipeline, published weights, same noise as a PyTorch run | identical sample count, SNR 59.9 dB |
+| Whisper large-v3 on two MLX outputs | 0% CER |
+
+The published weights (`mlx/` in the model repo, 496 MB) keep the acoustic model in fp32. Storing it in fp16 as well
+lowered the end-to-end SNR to 31.9 dB. The speed on Apple silicon has not been measured. MLX's Linux CPU build ships a
+reference BLAS and is far slower than PyTorch on the same CPU, so the timings measured here say nothing about Metal.
 
 ## Spectral detail
 

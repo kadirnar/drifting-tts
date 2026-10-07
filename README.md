@@ -63,15 +63,40 @@ drifting-tts synthesize --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt 
 ## In the browser (WebGPU)
 
 The model also runs entirely client-side with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): the
-**[WebGPU demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)** downloads about 370 MB once, and after
-that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after about 0.2 s, and speech
-is generated 10–20× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
+**[WebGPU demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)** downloads about 385 MB once, and after
+that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after 0.2–0.4 s, and speech
+is generated about 10–13× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
 
 - **Graphs:** `scripts/export_onnx.py` writes the three ONNX graphs (text encoder, generator, vocoder) and checks each
   against PyTorch. They are published under [`onnx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/onnx) in
   the model repo.
 - **Page:** [`web/`](web/) holds the page, the pipeline (`tts.js`) and a JavaScript port of the Turkish text frontend
   (`text.js`).
+
+## On a Mac (MLX)
+
+`drifting_tts.mlx` runs the model with [MLX](https://github.com/ml-explore/mlx) on Apple silicon. It needs neither
+PyTorch nor the rest of the training stack:
+
+```bash
+pip install mlx huggingface_hub numpy
+pip install --no-deps "drifting-tts @ git+https://github.com/kadirnar/drifting-tts"
+python -m drifting_tts.mlx --text "Merhaba, nasılsınız?" --speaker studio --out merhaba.wav
+```
+
+```python
+from drifting_tts.mlx import Synthesizer, write_wav
+
+tts = Synthesizer.from_pretrained()        # downloads mlx/ from Vyvo/drifting-tts-tr (about 500 MB, once)
+wav, info = tts("Merhaba, bu cümle MLX ile üretildi.", speaker="studio")
+write_wav("merhaba.wav", wav)
+```
+
+- **Settings:** the same voices and options as the PyTorch API. The defaults are the recommended T = 0.3 and α = 2.
+- **Weights:** `python -m drifting_tts.mlx.convert` converts the PyTorch checkpoints. The result is published under
+  [`mlx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/mlx).
+- **Status:** the port matches PyTorch ([details](docs/RESULTS.md#mlx)). It was validated with MLX's Linux CPU
+  build, and its speed on Apple silicon has not been measured yet.
 
 ## Benchmark: Freya-TR-Eval
 
@@ -134,6 +159,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
+| [drifting_tts/mlx/](drifting_tts/mlx/) | MLX inference for Apple silicon (`python -m drifting_tts.mlx`) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
 

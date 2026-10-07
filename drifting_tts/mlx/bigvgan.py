@@ -1,0 +1,214 @@
+"""BigVGAN-v2 generator (NVIDIA, MIT) in MLX for inference: weight norm removed, channels-last internally."""
+
+from __future__ import annotations
+
+import math
+from functools import partial
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+
+def kaiser_sinc_filter(cutoff: float, half_width: float, kernel_size: int) -> np.ndarray:
+    """``alias_free_activation``'s ``kaiser_sinc_filter1d`` (float64 maths, float32 result)."""
+    half = kernel_size // 2
+    a = 2.285 * (half - 1) * math.pi * 4 * half_width + 7.95
+    beta = 0.1102 * (a - 8.7) if a > 50 else 0.5842 * (a - 21) ** 0.4 + 0.07886 * (a - 21) if a >= 21 else 0.0
+    t = np.arange(-half, half) + 0.5 if kernel_size % 2 == 0 else np.arange(kernel_size) - half
+    f = 2 * cutoff * np.kaiser(kernel_size, beta) * np.sinc(2 * cutoff * t)
+    return (f / f.sum()).astype(np.float32)
+
+
+# Activation1d's fixed setup: ratio 2, 12 taps, the same low-pass (cutoff 0.25, half width 0.3) up and down.
+_F = kaiser_sinc_filter(0.25, 0.3, 12)
+# UpSample1d (replicate pad 5, transposed conv, crop 15 / 15, times 2): the even / odd output phases are 6-tap filters
+# over x edge-padded by 3, starting at offsets 0 / 1
+_UP_EVEN, _UP_ODD = [2 * float(v) for v in _F[11::-2]], [2 * float(v) for v in _F[10::-2]]
+# LowPassFilter1d (replicate pad 5 / 6, stride 2): 6-tap filters over the even / odd samples of its padded input
+_DOWN = [float(v) for v in _F[0::2]] + [float(v) for v in _F[1::2]]
+
+
+def get_padding(kernel_size: int, dilation: int = 1) -> int:
+    return (kernel_size * dilation - dilation) // 2
+
+
+def _snake(x: mx.array, alpha: mx.array, inv_beta: mx.array) -> mx.array:
+    return x + inv_beta * mx.square(mx.sin(x * alpha))
+
+
+@partial(mx.compile, shapeless=True)
+def _upsample_snake(alpha: mx.array, inv_beta: mx.array, *x: mx.array) -> tuple[mx.array, mx.array]:
+    """Snake of the even / odd phases of the 2x upsampled signal; ``x``: the padded input at the 7 shifts."""
+    even = sum(w * v for w, v in zip(_UP_EVEN, x[:6]))
+    odd = sum(w * v for w, v in zip(_UP_ODD, x[1:]))
+    return _snake(even, alpha, inv_beta), _snake(odd, alpha, inv_beta)
+
+
+@partial(mx.compile, shapeless=True)
+def _downsample(*z: mx.array) -> mx.array:
+    """``z``: the padded even phase at 6 shifts, then the padded odd phase at 6 shifts."""
+    return sum(w * v for w, v in zip(_DOWN, z))
+
+
+class SnakeBeta(nn.Module):
+    """``x + 1 / (beta + 1e-9) * sin(alpha * x) ** 2`` per channel (``beta = alpha``: Snake)."""
+
+    def __init__(self, channels: int, logscale: bool = True, beta: bool = True):
+        super().__init__()
+        self.logscale = logscale
+        self.alpha = mx.zeros((channels,)) if logscale else mx.ones((channels,))
+        if beta:
+            self.beta = mx.zeros((channels,)) if logscale else mx.ones((channels,))
+
+    def coefficients(self) -> tuple[mx.array, mx.array]:
+        """``alpha`` and ``1 / (beta + 1e-9)``."""
+        alpha, beta = self.alpha, self.get("beta", self.alpha)
+        if self.logscale:
+            alpha, beta = mx.exp(alpha), mx.exp(beta)
+        return alpha, 1.0 / (beta + 1e-9)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return _snake(x, *self.coefficients())
+
+
+def _edge(x: mx.array, n: int) -> mx.array:
+    return mx.broadcast_to(x, (x.shape[0], n, x.shape[2]))
+
+
+class Activation1d(nn.Module):
+    """Anti-aliased snake (2x upsample, snake, 2x low-pass downsample) in polyphase form: the 2x signal is kept as
+    its even / odd phases and both filters run as fused elementwise kernels over shifted views. ``[B, T, C]``."""
+
+    def __init__(self, channels: int, logscale: bool = True, beta: bool = True):
+        super().__init__()
+        self.act = SnakeBeta(channels, logscale, beta)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        t = x.shape[1]
+        x = mx.pad(x, [(0, 0), (3, 3), (0, 0)], mode="edge")
+        even, odd = _upsample_snake(*self.act.coefficients(), *(x[:, r: r + t] for r in range(7)))
+        # the phases of the upsampled signal replicate-padded by 5 / 6, as LowPassFilter1d pads it
+        first, last = even[:, :1], odd[:, -1:]
+        pad_even = mx.concatenate([_edge(first, 3), odd, _edge(last, 2)], axis=1)
+        pad_odd = mx.concatenate([_edge(first, 2), even, _edge(last, 3)], axis=1)
+        return _downsample(*(pad_even[:, i: i + t] for i in range(6)), *(pad_odd[:, i: i + t] for i in range(6)))
+
+
+class ConvTranspose1d(nn.Module):
+    """``torch.nn.ConvTranspose1d`` (weight ``[out, kernel, in]``, as ``mx.conv_transpose1d``) computed as one stride-1
+    convolution with ``stride`` phases of output channels: no zero insertion."""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int, padding: int = 0):
+        super().__init__()
+        scale = math.sqrt(1 / (in_channels * kernel_size))
+        self.weight = mx.random.uniform(-scale, scale, (out_channels, kernel_size, in_channels))
+        self.bias = mx.zeros((out_channels,))
+        self.stride, self.padding = stride, padding
+        # output t = stride * q + r takes input q - s through kernel tap stride * s + r + padding
+        lo = min(-((r + padding) // stride) for r in range(stride))
+        hi = max((kernel_size - 1 - r - padding) // stride for r in range(stride))
+        self.taps, self.shift, self.offset = hi - lo + 1, hi, -stride * lo - padding
+
+    def _polyphase(self) -> mx.array:
+        """``[stride * out, taps, in]`` weight of the equivalent stride-1 convolution."""
+        o, k, i = self.weight.shape
+        u, n = self.stride, self.taps
+        w = mx.pad(self.weight, [(0, 0), (self.offset, u * n - k - self.offset), (0, 0)])
+        return w.reshape(o, n, u, i)[:, ::-1].transpose(2, 0, 1, 3).reshape(u * o, n, i)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        b, t, _ = x.shape
+        u, (o, k, _) = self.stride, self.weight.shape
+        length = (t - 1) * u - 2 * self.padding + k
+        q = -(-length // u)
+        left, right = self.shift, q + self.taps - 1 - t - self.shift
+        w = self._polyphase()
+        if left == right:
+            y = mx.conv1d(x, w, padding=left)
+        else:
+            y = mx.conv1d(mx.pad(x, [(0, 0), (left, max(right, 0)), (0, 0)])[:, : q + self.taps - 1], w)
+        return y.reshape(b, q * u, o)[:, :length] + self.bias
+
+
+class AMPBlock1(nn.Module):
+    def __init__(self, channels: int, kernel_size: int, dilation: list[int], logscale: bool, beta: bool):
+        super().__init__()
+        conv = lambda d: nn.Conv1d(channels, channels, kernel_size, padding=get_padding(kernel_size, d), dilation=d)
+        self.convs1 = [conv(d) for d in dilation]
+        self.convs2 = [conv(1) for _ in dilation]
+        self.activations = [Activation1d(channels, logscale, beta) for _ in range(2 * len(dilation))]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        for c1, c2, a1, a2 in zip(self.convs1, self.convs2, self.activations[::2], self.activations[1::2]):
+            x = x + c2(a2(c1(a1(x))))
+        return x
+
+
+class BigVGAN(nn.Module):
+    """BigVGAN-v2 generator from its ``config.json`` hparams. Parameter names are those of the PyTorch state dict
+    without the anti-aliasing filter buffers; ``use_tanh_at_final=false`` returns the unclamped waveform (the
+    reference clamps it to ``[-1, 1]``)."""
+
+    def __init__(self, h: dict):
+        super().__init__()
+        if str(h.get("resblock", "1")) != "1":
+            raise NotImplementedError("only AMPBlock1 (resblock '1') is supported")
+        if h["activation"] not in ("snake", "snakebeta"):
+            raise ValueError(f"unknown activation {h['activation']!r}")
+        logscale, beta = h["snake_logscale"], h["activation"] == "snakebeta"
+        self.num_kernels = len(h["resblock_kernel_sizes"])
+        ch = h["upsample_initial_channel"]
+        self.conv_pre = nn.Conv1d(h["num_mels"], ch, 7, padding=3)
+        self.ups, self.resblocks = [], []
+        for u, k in zip(h["upsample_rates"], h["upsample_kernel_sizes"]):
+            self.ups.append([ConvTranspose1d(ch, ch // 2, k, u, (k - u) // 2)])
+            ch //= 2
+            self.resblocks.extend(AMPBlock1(ch, rk, d, logscale, beta)
+                                  for rk, d in zip(h["resblock_kernel_sizes"], h["resblock_dilation_sizes"]))
+        self.activation_post = Activation1d(ch, logscale, beta)
+        self.conv_post = nn.Conv1d(ch, 1, 7, padding=3, bias=h.get("use_bias_at_final", True))
+        self.use_tanh_at_final = h.get("use_tanh_at_final", True)
+
+    def __call__(self, mel: mx.array) -> mx.array:
+        """Log-mel ``[B, num_mels, T]`` -> waveform ``[B, T * prod(upsample_rates)]``."""
+        x = self.conv_pre(mel.transpose(0, 2, 1).astype(self.conv_pre.weight.dtype))
+        n = self.num_kernels
+        for i, (up,) in enumerate(self.ups):
+            x = up(x)
+            x = sum(block(x) for block in self.resblocks[i * n: (i + 1) * n]) / n
+        x = self.conv_post(self.activation_post(x))[..., 0]
+        return mx.tanh(x) if self.use_tanh_at_final else x
+
+
+def _to_numpy(v) -> np.ndarray:
+    return v.detach().cpu().float().numpy() if hasattr(v, "detach") else np.asarray(v, dtype=np.float32)
+
+
+def convert_bigvgan(state_dict: dict) -> dict[str, np.ndarray]:
+    """PyTorch generator state dict (tensors or arrays) -> float32 MLX weights keyed as ``BigVGAN``'s parameters.
+    Old-style weight norm (``weight_g`` / ``weight_v``) is folded; the anti-aliasing filters are checked against the
+    recomputed one and dropped."""
+    sd = {k: _to_numpy(v) for k, v in state_dict.items()}
+    for k in [k for k in sd if k.endswith(".weight_v")]:
+        v, g = sd.pop(k).astype(np.float64), sd.pop(k[:-1] + "g")
+        sd[k[:-2]] = g * v / np.sqrt((v.reshape(len(v), -1) ** 2).sum(1)).reshape(g.shape)
+    out = {}
+    for k, v in sd.items():
+        if k.endswith(".filter"):
+            if v.size != _F.size or np.abs(v.ravel() - _F).max() > 1e-6:
+                raise ValueError(f"{k} is not BigVGAN's anti-aliasing filter")
+            continue
+        if v.ndim == 3:  # ConvTranspose1d [in, out, k] / Conv1d [out, in, k] -> [out, k, in]
+            v = v.transpose(1, 2, 0) if k.startswith("ups.") else v.transpose(0, 2, 1)
+        out[k] = np.ascontiguousarray(v, dtype=np.float32)
+    return out
+
+
+def load_bigvgan(weights: str, hparams: dict, dtype: mx.Dtype = mx.float32) -> BigVGAN:
+    """``weights``: a ``.safetensors`` of :func:`convert_bigvgan` output (any float storage), cast to ``dtype``.
+    Keep float32: the snake activations are precision sensitive."""
+    model = BigVGAN(hparams)
+    model.load_weights([(k, v.astype(dtype)) for k, v in mx.load(weights).items()])
+    mx.eval(model.parameters())
+    return model
