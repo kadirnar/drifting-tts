@@ -22,3 +22,8 @@ outputs/
 # Secrets
 .env
 *.token
+
+# ONNX exports (published on the Hugging Face model repo) and local agent worktrees
+web/models/
+*.onnx
+.claude/

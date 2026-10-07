@@ -1,6 +1,7 @@
 # drifting-tts: one-step Turkish text-to-speech
 
 [![Demo](https://img.shields.io/badge/🤗%20Demo-Space-yellow)](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)
+[![WebGPU](https://img.shields.io/badge/🤗%20WebGPU-in%20your%20browser-orange)](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)
 [![Model](https://img.shields.io/badge/🤗%20Model-Vyvo%2Fdrifting--tts--tr-blue)](https://huggingface.co/Vyvo/drifting-tts-tr)
 [![Paper](https://img.shields.io/badge/arXiv-2602.04770-b31b1b)](https://arxiv.org/abs/2602.04770)
 
@@ -24,7 +25,8 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 | *Toplantı yarın saat 14:30'da, 2. katta; lütfen geç kalmayın.* | [wav](docs/samples/v31_studio_3.wav) | [wav](docs/samples/v31_male_3.wav) | [wav](docs/samples/v31_female_3.wav) |
 | *Prof. Dr. Ayşe Yılmaz, 250 TL'lik bağışın tamamının öğrencilere ayrılacağını söyledi.* | [wav](docs/samples/v31_studio_4.wav) | [wav](docs/samples/v31_male_4.wav) | [wav](docs/samples/v31_female_4.wav) |
 
-Or try any text in the **[online demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)**.
+Or try any text in the **[online demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)**, or run the model
+**[in your browser with WebGPU](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)**.
 
 ## Quick start
 
@@ -57,6 +59,19 @@ hf download Vyvo/drifting-tts-tr --local-dir .
 drifting-tts synthesize --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --speaker female --cfg 2 \
     --text "Merhaba, nasılsınız?" --out merhaba.wav
 ```
+
+## In the browser (WebGPU)
+
+The model also runs entirely client-side with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): the
+**[WebGPU demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)** downloads about 370 MB once, and after
+that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after about 0.2 s, and speech
+is generated 10–20× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
+
+- **Graphs:** `scripts/export_onnx.py` writes the three ONNX graphs (text encoder, generator, vocoder) and checks each
+  against PyTorch. They are published under [`onnx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/onnx) in
+  the model repo.
+- **Page:** [`web/`](web/) holds the page, the pipeline (`tts.js`) and a JavaScript port of the Turkish text frontend
+  (`text.js`).
 
 ## Benchmark: Freya-TR-Eval
 
@@ -119,6 +134,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
+| [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
 
 ## Limitations

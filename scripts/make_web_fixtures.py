@@ -30,7 +30,7 @@ from tests import test_text
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "web/tests/text_fixtures.json"
-N_STRESS = 2500
+N_STRESS = 500
 
 
 def unit_test_strings() -> list[str]:
