@@ -143,8 +143,53 @@ PyTorch with MLX 0.32 on Linux (CPU backend):
 | Whisper large-v3 on two MLX outputs | 0% CER |
 
 The published weights (`mlx/` in the model repo, 496 MB) keep the acoustic model in fp32. Storing it in fp16 as well
-lowered the end-to-end SNR to 31.9 dB. The speed on Apple silicon has not been measured. MLX's Linux CPU build ships a
-reference BLAS and is far slower than PyTorch on the same CPU, so the timings measured here say nothing about Metal.
+lowered the end-to-end SNR to 31.9 dB. The older Linux CPU results above establish numerical parity; the Apple GPU
+measurements below were performed separately.
+
+### Apple M2 Pro, 7 October 2026
+
+Apple M2 Pro, 16 GB, macOS 26.5.2; Python 3.11.15, MLX/MLX Metal 0.32.3, NumPy 2.4.6. Published MLX weights at
+Hugging Face revision `2de3308045f6f559b2efa2d8cca3749fa3262848`; float32 compute, studio voice, temperature 0.3,
+CFG 2. Each input had two warmups followed by ten measurements (seeds 0–9). Separate processes, GPU device,
+256 MiB unused allocator cache limit for **both** implementations. No playback, networking or download latency.
+
+| input | original API TTFA p50 / p95 | streaming TTFA p50 / p95 | original total p50 | streaming total p50 |
+|---|---|---|---|---|
+| short sentence | 150.2 / 163.7 ms | 83.7 / 87.3 ms | 150.5 ms | 242.0 ms |
+| long sentence | 701.2 / 709.3 ms | 97.1 / 102.4 ms | 701.2 ms | 991.0 ms |
+| 4-sentence paragraph | 2072.5 / 2131.5 ms | 95.5 / 97.9 ms | 2072.6 ms | 3040.0 ms |
+
+The baseline is the unmodified public MLX API at `17c85cff2a0604988f532add8a8e0d13bdae9d87`, which returns the
+**complete waveform**. The updated streaming API returns **256 ms of PCM** first, then grows from 128 to 256 to a
+maximum of 512 mel frames per chunk. These are caller-visible TTFA measurements; the old API has no streaming
+consumer boundary. The improvement is 1.8× / 7.2× / 21.7× in first-delivery latency, not in total computation.
+Repeated context increases total generation cost: streaming RTF is 0.165–0.184, versus about 0.115–0.117 for the
+original buffered API. All measured warm streaming runs had zero calculated playback deficit.
+
+The first request in the controlled processes (short input, weights already materialized) took 197.4 ms original
+and 110.8 ms streaming. Weight loading was 57 ms and 142 ms respectively. These values are **process-cold**, not
+machine-cold: the OS and Metal caches were already populated by previous work. An initial exploratory run before
+the cache cap showed much larger variability. Full graph compilation remains opt-in because first-use and unseen
+shape compilation can cost seconds; see [MLX usage and caveats](MLX.md).
+
+With `--compile`, a separate five-run warm measurement (two warmups per input, otherwise the same settings) gave
+TTFA p50 **70.8 / 79.4 / 77.3 ms** and total generation p50 **198.2 / 832.0 / 2506.9 ms** for the same three inputs.
+Its TTFA p95 was 72.7 / 81.9 / 80.8 ms, with zero playback deficit. This optional configuration is suitable when
+shapes are warmed before serving; it does not promise these times for unseen text lengths.
+
+Three real checkpoint outputs (short, long and paragraph, seed 0) matched the original waveform exactly after
+concatenating streamed chunks: identical sample counts and maximum absolute sample difference 0.0 on this machine.
+The optional compiled mode retained identical sample counts with SNR 86.3–91.2 dB versus the original, reflecting
+small float32 arithmetic differences (maximum absolute sample error 0.000186).
+All three named voices were synthesized successfully in an MLX-only environment with no PyTorch installed.
+This is numerical/output validation, not a new listening study or a rerun of the full Freya/Whisper benchmark.
+
+The full Mac test suite finished with **382 passed, 5 skipped** (Ruff also passed). It covers PyTorch CPU training
+smoke tests, MLX/PyTorch numerical parity, chunk boundaries,
+seed stability, compilation, and public streaming behavior. Two CUDA tests require NVIDIA hardware; optional
+jiwer and two uncached upstream weight tests are reported as skips. The JavaScript frontend passed 9,394 checks.
+Run `python scripts/bench_mlx_ttfa.py` for raw measurements and provenance; see [MLX.md](MLX.md) for the exact API
+and benchmark options.
 
 ## Spectral detail
 

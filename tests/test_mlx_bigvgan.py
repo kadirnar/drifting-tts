@@ -14,6 +14,7 @@ from drifting_tts.mlx.bigvgan import (  # noqa: E402
     ConvTranspose1d,
     convert_bigvgan,
     load_bigvgan,
+    vocoder_context_frames,
 )
 
 # tiny BigVGAN-v2-shaped generator (both upsampling shapes of the 24 kHz model, snakebeta with log-scale parameters)
@@ -101,3 +102,46 @@ def test_snake_without_beta():
     assert not any(k.endswith("beta") for k, _ in tree_flatten(model.parameters()))
     out = model(mx.random.normal((1, 100, 5)))
     assert out.shape == (1, 40) and float(mx.abs(out).max()) <= 1
+
+
+def test_vocoder_context_frames():
+    production = {**TINY, "upsample_rates": [4, 4, 2, 2, 2, 2],
+                  "upsample_kernel_sizes": [8, 8, 4, 4, 4, 4],
+                  "resblock_kernel_sizes": [3, 7, 11], "resblock_dilation_sizes": [[1, 3, 5]] * 3}
+    assert vocoder_context_frames(production) == 38
+    assert vocoder_context_frames(TINY) == 19
+
+
+def test_chunk_context_matches_full_vocoder():
+    mx.random.seed(10)
+    model = BigVGAN(TINY).prepare_for_inference()
+    mel = mx.random.normal((1, 100, 79)) * 2 - 5
+    full = np.array(model(mel))
+    context, hop = model.context_frames, model.hop_length
+    # Start/end boundaries retain the real model padding; interior chunks need both sides.
+    for start, end in ((0, 1), (1, 8), (30, 31), (30, 53), (76, 79)):
+        left, right = max(0, start - context), min(mel.shape[-1], end + context)
+        decoded = np.array(model(mel[..., left:right]))
+        chunk = decoded[:, (start - left) * hop:(end - left) * hop]
+        np.testing.assert_allclose(chunk, full[:, start * hop:end * hop], atol=1e-5, rtol=1e-5)
+
+
+def test_inference_constants_preserve_weights_and_refresh_after_update():
+    mx.random.seed(11)
+    model = BigVGAN(TINY)
+    mel = mx.random.normal((1, 100, 7))
+    names = [name for name, _ in tree_flatten(model.parameters())]
+    before = np.array(model(mel))
+    model.prepare_for_inference()
+    assert [name for name, _ in tree_flatten(model.parameters())] == names
+    np.testing.assert_array_equal(np.array(model(mel)), before)
+
+    # MLX update/load_weights replace tensors directly: prepared transforms must not stay stale.
+    up, snake = model.ups[0][0], model.activation_post.act
+    up.update({"weight": up.weight * 0.5})
+    snake.update({"alpha": snake.alpha + 0.5, "beta": snake.beta - 0.5})
+    changed = np.array(model(mel))
+    assert not np.allclose(changed, before)
+    model.prepare_for_inference()
+    np.testing.assert_array_equal(np.array(model(mel)), changed)
+    assert [name for name, _ in tree_flatten(model.parameters())] == names

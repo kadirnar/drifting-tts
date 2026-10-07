@@ -82,22 +82,29 @@ PyTorch nor the rest of the training stack:
 ```bash
 pip install mlx huggingface_hub numpy
 pip install --no-deps "drifting-tts @ git+https://github.com/kadirnar/drifting-tts"
-python -m drifting_tts.mlx --text "Merhaba, nasılsınız?" --speaker studio --out merhaba.wav
+python -m drifting_tts.mlx --stream --text "Merhaba, nasılsınız?" --speaker studio --out merhaba.wav
 ```
 
 ```python
 from drifting_tts.mlx import Synthesizer, write_wav
+import mlx.core as mx
 
+mx.set_cache_limit(256 * 1024 * 1024)      # process-wide unused allocator cache; not total memory
 tts = Synthesizer.from_pretrained()        # downloads mlx/ from Vyvo/drifting-tts-tr (about 500 MB, once)
 wav, info = tts("Merhaba, bu cümle MLX ile üretildi.", speaker="studio")
 write_wav("merhaba.wav", wav)
 ```
 
+For low latency, consume `tts.stream(text)` as it yields `(audio, info)` chunks. The first chunk contains 256 ms of
+host-ready audio; later chunks grow to reduce repeated vocoder work. `tts(text)` still waits for the whole waveform.
+See [streaming, memory settings and reproducible benchmarks](docs/MLX.md).
+
 - **Settings:** the same voices and options as the PyTorch API. The defaults are the recommended T = 0.3 and α = 2.
 - **Weights:** `python -m drifting_tts.mlx.convert` converts the PyTorch checkpoints. The result is published under
   [`mlx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/mlx).
-- **Status:** the port matches PyTorch ([details](docs/RESULTS.md#mlx)). It was validated with MLX's Linux CPU
-  build, and its speed on Apple silicon has not been measured yet.
+- **Mac validation:** tested on Apple M2 Pro (16 GB), macOS 26.5.2, MLX 0.32.3. Warm streaming TTFA is about
+  **84–97 ms** across short/long sentences and a paragraph ([methodology and results](docs/RESULTS.md#mlx)).
+  The first request and optional `--compile` need separate measurement; these are not model-loading times.
 
 ## Benchmark: Freya-TR-Eval
 

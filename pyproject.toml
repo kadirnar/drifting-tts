@@ -23,6 +23,8 @@ dependencies = [
     "tensorboard",
     "vocos",
     "pyworld",
+    # pyworld 0.3.5 imports pkg_resources at runtime; setuptools 81 removed it.
+    "setuptools<81",
 ]
 
 [project.optional-dependencies]

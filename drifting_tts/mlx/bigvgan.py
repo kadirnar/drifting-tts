@@ -33,6 +33,34 @@ def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return (kernel_size * dilation - dilation) // 2
 
 
+def vocoder_context_frames(hparams: dict) -> int:
+    """Mel context on each side needed to decode a chunk without artificial boundary padding.
+
+    Trace one complete output hop backwards through the network. Each anti-aliased activation has
+    radius five; residual branches contribute the largest summed radius. Transposed convolutions
+    map an output interval to input indices with integer ceil/floor, preserving all output phases.
+    The standard 24 kHz / 256x BigVGAN-v2 needs 38 mel frames on either side.
+    """
+    rates, kernels = hparams["upsample_rates"], hparams["upsample_kernel_sizes"]
+    if len(rates) != len(kernels) or any((k - u) % 2 for u, k in zip(rates, kernels)):
+        raise ValueError("chunked BigVGAN requires matched upsampling stages with an exact integer hop")
+    if str(hparams.get("resblock", "1")) != "1":
+        raise NotImplementedError("only AMPBlock1 (resblock '1') is supported")
+    block_radius = max(
+        sum(10 + get_padding(k, d) + get_padding(k) for d in dilations)
+        for k, dilations in zip(hparams["resblock_kernel_sizes"], hparams["resblock_dilation_sizes"])
+    )
+    # conv_post (radius 3) and activation_post (radius 5), around a complete output hop.
+    lo, hi = -8, math.prod(rates) - 1 + 8
+    for stride, kernel in reversed(list(zip(rates, kernels))):
+        lo, hi = lo - block_radius, hi + block_radius
+        padding = (kernel - stride) // 2
+        lo = -(-(lo + padding - kernel + 1) // stride)
+        hi = (hi + padding) // stride
+    # conv_pre has radius three in mel frames.
+    return max(3 - lo, hi + 3)
+
+
 def _snake(x: mx.array, alpha: mx.array, inv_beta: mx.array) -> mx.array:
     return x + inv_beta * mx.square(mx.sin(x * alpha))
 
@@ -64,6 +92,9 @@ class SnakeBeta(nn.Module):
     def coefficients(self) -> tuple[mx.array, mx.array]:
         """``alpha`` and ``1 / (beta + 1e-9)``."""
         alpha, beta = self.alpha, self.get("beta", self.alpha)
+        cached = self.get("_inference_coefficients")
+        if cached is not None and cached[0] is alpha and cached[1] is beta:
+            return cached[2], cached[3]
         if self.logscale:
             alpha, beta = mx.exp(alpha), mx.exp(beta)
         return alpha, 1.0 / (beta + 1e-9)
@@ -112,6 +143,9 @@ class ConvTranspose1d(nn.Module):
 
     def _polyphase(self) -> mx.array:
         """``[stride * out, taps, in]`` weight of the equivalent stride-1 convolution."""
+        cached = self.get("_inference_weight")
+        if cached is not None and cached[0] is self.weight:
+            return cached[1]
         o, k, i = self.weight.shape
         u, n = self.stride, self.taps
         w = mx.pad(self.weight, [(0, 0), (self.offset, u * n - k - self.offset), (0, 0)])
@@ -156,6 +190,8 @@ class BigVGAN(nn.Module):
             raise NotImplementedError("only AMPBlock1 (resblock '1') is supported")
         if h["activation"] not in ("snake", "snakebeta"):
             raise ValueError(f"unknown activation {h['activation']!r}")
+        self.hop_length = math.prod(h["upsample_rates"])
+        self.context_frames = vocoder_context_frames(h)
         logscale, beta = h["snake_logscale"], h["activation"] == "snakebeta"
         self.num_kernels = len(h["resblock_kernel_sizes"])
         ch = h["upsample_initial_channel"]
@@ -169,6 +205,25 @@ class BigVGAN(nn.Module):
         self.activation_post = Activation1d(ch, logscale, beta)
         self.conv_post = nn.Conv1d(ch, 1, 7, padding=3, bias=h.get("use_bias_at_final", True))
         self.use_tanh_at_final = h.get("use_tanh_at_final", True)
+
+    def prepare_for_inference(self) -> BigVGAN:
+        """Materialize constant inference transforms without adding checkpoint parameters.
+
+        Cached values are private, and source identity checks invalidate them after weight replacement.
+        Call again after loading new weights to regain the optimization.
+        """
+        constants = []
+        for module in self.modules():
+            if isinstance(module, ConvTranspose1d):
+                weight = module._polyphase()
+                module._inference_weight = (module.weight, weight)
+                constants.append(weight)
+            elif isinstance(module, SnakeBeta):
+                alpha, inv_beta = module.coefficients()
+                module._inference_coefficients = (module.alpha, module.get("beta", module.alpha), alpha, inv_beta)
+                constants.extend((alpha, inv_beta))
+        mx.eval(constants)
+        return self
 
     def __call__(self, mel: mx.array) -> mx.array:
         """Log-mel ``[B, num_mels, T]`` -> waveform ``[B, T * prod(upsample_rates)]``."""
@@ -211,4 +266,4 @@ def load_bigvgan(weights: str, hparams: dict, dtype: mx.Dtype = mx.float32) -> B
     model = BigVGAN(hparams)
     model.load_weights([(k, v.astype(dtype)) for k, v in mx.load(weights).items()])
     mx.eval(model.parameters())
-    return model
+    return model.prepare_for_inference()
