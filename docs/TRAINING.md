@@ -78,6 +78,39 @@ BigVGAN mel frames are uncentred: `F` frames correspond to `F·256` samples star
 builds BigVGAN's fused activation for the local GPU. It is 2.4–2.9× faster at inference, with SNR ≥ 51.6 dB against
 the PyTorch path.
 
+## GAN-free vocoder fine-tuning (drifting, experimental)
+
+`vocoder.objective: drift` fine-tunes a Vocos or a BigVGAN-base **without a discriminator**. The drifting field in a
+frozen feature space replaces the adversarial loss ([DESIGN.md §8](DESIGN.md#8-a-gan-free-vocoder-experimental)):
+
+```bash
+drifting-tts finetune-vocoder --config configs/vocoder_drift_vocos.yaml --workdir runs/vocoder_drift_vocos \
+    tts.path=runs/tts_v3/model_ema.pt
+drifting-tts finetune-vocoder --config configs/vocoder_drift_bigvgan_base.yaml --workdir runs/vocoder_drift_base \
+    tts.path=runs/tts_v3/model_ema.pt
+```
+
+- **Generator:** `G(mel, z)`. `vocoder.noise_channels` Gaussian channels are appended to the mel; their input weights
+  start at zero. `drift.samples` waveforms are drawn per mel segment.
+- **Feature space** (`features`, frozen): the released BigVGAN-v2 MPD and CQT-D (every layer), log-|STFT| patches,
+  optionally an SSL encoder (`features.ssl`).
+- **Loss:** `mel_loss_coeff` × multi-scale mel L1 + `drift_coeff` × drift loss, with the `conditional` and `pooled`
+  pairings weighted by `drift.pairing`. `mel_loss_coeff: 0` gives a pure-drift ablation.
+- **Inference:** `z = 0`. The export (`vocos_ft.pt` / `bigvgan_ft.pt`) has the GAN fine-tunes' layout plus
+  `noise_channels`. `Vocoder` and `load_bigvgan` fold the noise channels away, so it loads and streams like any
+  fine-tuned vocoder. `Vocoder(noise_seed=…)` uses fixed noise instead (evaluation only).
+- **What to watch:** `mel`; `spread`, the across-sample std of the log-mel (it starts at 0 and must grow, otherwise
+  the noise is ignored); `pool_force_*` / `cond_force_*`, the raw drift norms (the drift loss itself is near-constant).
+
+Measured on an RTX 5090 that was shared with two other training runs (so the throughput is a lower bound):
+
+| config | samples per step | memory | throughput |
+|---|---|---|---|
+| Vocos (`vocoder_drift_vocos.yaml`) | 4 segments × 4 samples × 16384 | 4.0 GB | ~1.0 it/s |
+| BigVGAN-base, compiled (`vocoder_drift_bigvgan_base.yaml`, `train.batch_size=2`) | 2 × 4 × 8192 | 5.7 GB | 0.7–1.2 it/s |
+
+The drift computation (51 feature maps × 2 pairings per step) takes about half of the step.
+
 ## What to look at while training
 
 - **`train/centroid_mse`** should keep decreasing.

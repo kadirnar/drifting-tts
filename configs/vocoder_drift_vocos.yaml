@@ -1,0 +1,65 @@
+# GAN-free Vocos fine-tuning with the drifting objective (issue #18, drifting_tts/drift_vocoder.py). No discriminator
+# is trained: S noise-conditioned samples G(mel, z) per mel segment are drifted towards the real waveform in a frozen
+# feature space (every layer of NVIDIA's released BigVGAN-v2 discriminators + multi-resolution log-STFT patches), plus
+# the multi-scale mel L1. On BigVGAN mels the ISTFT head uses `same` padding (as configs/vocoder_vocos_bigvgan.yaml).
+# The export (vocos_ft.pt) runs at z = 0: drifting_tts.vocoder.Vocoder folds the noise channels away.
+data:
+  root: data/train          # needs `drifting-tts prepare --backend bigvgan --save-audio`
+  min_quality: 60
+  max_frames: 1500
+
+tts:
+  path: runs/tts_v3/model_ema.pt   # trained on bigvgan mels
+
+vocoder:
+  objective: drift                 # gan (default): the GAN recipes of the other vocoder configs
+  arch: vocos
+  init: charactr/vocos-mel-24khz   # pretrained Vocos; its input layer adapts to our mels
+  noise_channels: 8                # Gaussian channels at the frame rate appended to the mel (zero-initialised weights)
+
+features:                          # frozen; every map gives locations x channels; null disables a family
+  dtype: fp32                      # bf16: autocast the feature nets (less memory, coarser gradients)
+  global_stats: false              # also every map's mean / std over its locations (one location)
+  discriminators:                  # every layer of the released MPD and sub-band CQT-D (1.4 GB download)
+    repo: nvidia/bigvgan_v2_24khz_100band_256x
+    mpd: true
+    spectral: true                 # the CQT-D (v2 repos) or the MRD (v1 / base repos)
+  stft:                            # log |STFT| tiles of (bins, frames), Hann window, hop n_fft / 4
+    n_ffts: [512, 1024, 2048]
+    patch: [16, 4]
+  ssl: null                        # e.g. {name: microsoft/wavlm-base-plus, layers: [3, 6, 9, 12]} (16 kHz input)
+
+drift:
+  samples: 4                       # S waveforms per mel segment
+  pairing:                         # weights of the two drift problems (0 disables one)
+    conditional: 1.0               # per (segment, location): the real waveform's features there vs the S samples
+    pooled: 1.0                    # per map: all generated vs all real patches of the batch (a patch discriminator)
+  mode: official                   # official: fixed temperatures; kyutai: one learned temperature per pairing
+  temperatures: [0.02, 0.05, 0.2]  # in units of the mean distance (official)
+  kyutai: {tau_init: 1.0}
+  reduce: mean                     # mean over feature maps (sum: the official code)
+  max_locations: 1024              # conditional: random locations per map and step
+  pooled_locations: 128            # pooled: random locations per map and step (x B x S generated patches)
+  pos_shifts: []                   # extra positives: the real segment delayed by these many samples, e.g. [-2, 2]
+  affinity_floor: 1.0e-6
+  key_weights: {}                  # per-map weights by name or glob, e.g. {"stft*": 0.5, "cqtd*": 1.0}; 0 skips
+
+train:
+  seed: 0
+  steps: 20000
+  batch_size: 4                    # mel segments per step: B x S = 16 generated waveforms
+  batch_frames: 24000
+  segment_frames: 64               # 64 mel frames <-> 16384 samples
+  gta_prob: 0.8                    # fraction of batches with generated mels (the rest: recorded mels)
+  gta_temperature: 0.3             # noise temperature of the generated mels (the released model's)
+  lr: 0.0001
+  betas: [0.8, 0.99]
+  lr_decay: 1.0                    # per step
+  grad_clip: 10.0
+  mel_loss_coeff: 15.0             # x multi-scale mel L1 of every sample (0: a pure-drift ablation)
+  drift_coeff: 1.0
+  num_workers: 4
+  log_every: 100
+  sample_every: 5000               # TensorBoard audio of validation utterances at z = 0
+  num_samples: 2
+  save_every: 2500

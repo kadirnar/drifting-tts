@@ -12,6 +12,8 @@ GAN objective:
 - ``bigvgan``: resumes NVIDIA's released generator *and* discriminators (MPD + multi-scale sub-band
   CQT) with their AdamW states, as the official recipe does; LSGAN, feature matching and the
   multi-scale mel L1 (x15), at the learning rate where the released schedule ended.
+
+``vocoder.objective: drift`` trains either architecture without a GAN (:class:`DriftVocoder`, ``drift_vocoder.py``).
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from .models import bigvgan_disc as bd
 from .models.text_encoder import align, token_pitch
 from .utils import count_params, infinite, save_checkpoint, seed_everything
 from .vocoder import BIGVGAN_REPO, build_bigvgan, build_vocos
+
+OBJECTIVES = ("gan", "drift")
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -256,6 +260,150 @@ class BigVGANGAN:
         save_checkpoint(path, generator=self.gen.state_dict(), hparams=h, repo=self.repo, step=step)
 
 
+class DriftVocoder:
+    """A vocoder trained without a discriminator (``vocoder.objective: drift``, ``drift_vocoder.py``).
+
+    ``S = drift.samples`` waveforms ``G(mel, z)`` per mel segment, ``z`` Gaussian noise channels at the frame rate, are
+    drifted towards the real segment in a frozen feature space (``features``), plus ``mel_loss_coeff`` x the multi-scale
+    mel L1 of every sample. ``vocoder.arch``: Vocos (pretrained ``vocoder.init``; ``same`` ISTFT padding on bigvgan
+    mels) or a BigVGAN generator (``vocoder.repo``). AdamW, per-step exponential LR decay, one clipped gradient.
+    ``generate`` and the export run at ``z = 0``, so the exported vocoder is deterministic and streams like a GAN one.
+    """
+
+    disc_label = "frozen feature nets"
+
+    def __init__(self, cfg, device, mel: str = "bigvgan", arch: str = "vocos"):
+        from .drift_vocoder import PAIRINGS, NoisyVocoder, build_feature_space
+
+        self.cfg, vc, tc, dc = cfg, cfg.vocoder, cfg.train, cfg.drift
+        self.mel, self.backend = mel, arch
+        self.export_name = "vocos_ft.pt" if arch == "vocos" else "bigvgan_ft.pt"
+        if arch == "vocos":
+            net = build_vocos(vc.init)
+            if mel == "bigvgan":  # F frames <-> F * hop samples, frame i centred on i * hop + hop / 2
+                net.head.istft.padding = "same"
+        else:
+            self.repo = vc.get("repo", BIGVGAN_REPO)
+            net = build_bigvgan(self.repo, vc.get("hparams"), pretrained=vc.get("pretrained", True))
+            if tc.get("compile", False):
+                for m in net.modules():
+                    if type(m).__name__ == "Activation1d":
+                        m.compile()
+        self.gen = NoisyVocoder(net, vc.get("noise_channels", 8)).to(device).train()
+        self.features = build_feature_space(cfg.features).to(device)
+        self.mel_loss = bd.MultiScaleMelLoss(SAMPLE_RATE).to(device)
+        self.pairing = {k: float(w) for k, w in dc.get("pairing", {"conditional": 1.0}).items()}
+        mode = dc.get("mode", "official")
+        if mode not in ("official", "kyutai"):
+            raise ValueError(f"drift.mode must be official or kyutai, got {mode!r}")
+        self.taus = None
+        groups = [{"params": list(self.gen.parameters())}]
+        if mode == "kyutai":  # one learned temperature per pairing, no weight decay (as in train.py)
+            init = float(dc.get("kyutai", {}).get("tau_init", 1.0))
+            self.taus = torch.nn.ParameterDict({k: torch.nn.Parameter(torch.tensor(init, device=device))
+                                                for k in PAIRINGS if self.pairing.get(k)})
+            groups.append({"params": list(self.taus.parameters()), "weight_decay": 0.0})
+        self.opt = torch.optim.AdamW(groups, tc.lr, betas=tuple(tc.get("betas", (0.8, 0.99))))
+        self.sched = torch.optim.lr_scheduler.ExponentialLR(self.opt, tc.get("lr_decay", 1.0))
+        self.n_gen, self.n_disc = count_params(self.gen), count_params(self.features)
+        # cuDNN autotuning over the ~50 frozen conv shapes: a 12 GB workspace spike and a slower step (RTX 5090)
+        self.cudnn_benchmark = tc.get("cudnn_benchmark", False)
+
+    def generate(self, mel: torch.Tensor) -> torch.Tensor:
+        """``z = 0`` (the exported vocoder); eager, so variable lengths do not trigger recompilation."""
+        with torch.compiler.set_stance("force_eager") if self.cfg.train.get("compile") else nullcontext():
+            return self.gen(mel)
+
+    def drift_grad(self, wave: torch.Tensor, audio: torch.Tensor, B: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Gradient of the drift loss w.r.t. the waveforms ``[B * S, n]`` (and the temperatures' ``.grad``), one
+        feature-space part at a time: only one part's graph is alive. Returns the gradient, the loss and its info."""
+        from .drift_vocoder import map_weight_sum, shifted_views, split_samples, vocoder_drift_loss
+
+        dc = self.cfg.drift
+        reduce, kw = dc.get("reduce", "mean"), dc.get("key_weights")
+        x = wave.detach().requires_grad_()
+        with torch.no_grad():
+            views = shifted_views(audio, dc.get("pos_shifts") or ()).flatten(0, 1)
+        total, weights, info = 0.0, 0.0, {}
+        for part in self.features.parts():
+            with torch.no_grad():
+                pos = split_samples(part(views), B)
+            gen = split_samples(part(x), B)
+            loss, inf = vocoder_drift_loss(gen, pos, self.pairing, dc.get("temperatures", (0.02, 0.05, 0.2)), kw,
+                                           "sum", dc.get("max_locations"), dc.get("pooled_locations", 128),
+                                           self.taus, dc.get("affinity_floor", 1e-6))
+            loss.backward()
+            total, weights = total + loss.detach(), weights + map_weight_sum(gen, kw)
+            for k, v in inf.items():  # per-map stats; the temperature losses (one per pairing) add up over the parts
+                info[k] = info[k] + v if k.endswith("tau_loss") and k in info else v
+        norm = weights if reduce == "mean" else 1.0
+        for t in [] if self.taus is None else self.taus.values():
+            t.grad = t.grad * self.cfg.train.drift_coeff / norm
+        info.update({k: v / norm for k, v in info.items() if k.endswith("tau_loss")})
+        return x.grad / norm, total / norm, info
+
+    def step(self, mel: torch.Tensor, audio: torch.Tensor, step: int) -> dict:
+        from .drift_vocoder import summarize
+
+        tc, dc = self.cfg.train, self.cfg.drift
+        B, S = mel.shape[0], dc.samples
+        z = torch.randn(B * S, self.gen.noise_channels, mel.shape[-1], device=mel.device)
+        wave = self.gen(mel.repeat_interleave(S, 0), z)  # [B * S, n], segment-major
+        n = min(wave.shape[-1], audio.shape[-1])
+        wave, audio = wave[:, :n], audio[:, :n]
+        self.opt.zero_grad(set_to_none=True)
+        grad, l_drift, info = self.drift_grad(wave, audio, B)
+        with nullcontext() if tc.mel_loss_coeff > 0 else torch.no_grad():
+            l_mel = self.mel_loss(wave, audio.repeat_interleave(S, 0))
+        # d/dwave of drift_coeff * drift loss is drift_coeff * grad: one backward through the generator
+        surrogate = tc.drift_coeff * (wave * grad).sum() + (tc.mel_loss_coeff * l_mel if tc.mel_loss_coeff > 0 else 0)
+        surrogate.backward()
+        loss = tc.drift_coeff * l_drift + tc.mel_loss_coeff * l_mel.detach()
+        gn = torch.nn.utils.clip_grad_norm_(self.gen.parameters(), tc.grad_clip)
+        self.opt.step()
+        self.sched.step()
+        with torch.no_grad():  # across-sample std of the log-mel: 0 = the noise is ignored (collapse)
+            lm = self.mel_loss.log_mel(wave.detach().float(), 1024)
+            spread = lm.view(B, S, *lm.shape[1:]).std(1).mean()
+        metrics = {"loss": loss.item(), "drift": l_drift.item(), "mel": l_mel.item(), "spread": spread.item(),
+                   "grad": gn.item(), "lr": self.sched.get_last_lr()[0]}
+        metrics.update(summarize(info))
+        return metrics
+
+    def state_dict(self) -> dict:
+        return dict(generator=self.gen.net.state_dict(), opt=self.opt.state_dict(), sched=self.sched.state_dict(),
+                    taus=None if self.taus is None else self.taus.state_dict())
+
+    def load_state_dict(self, ck: dict) -> None:
+        self.gen.net.load_state_dict(ck["generator"])
+        self.opt.load_state_dict(ck["opt"])
+        self.sched.load_state_dict(ck["sched"])
+        if self.taus is not None and ck.get("taus"):
+            self.taus.load_state_dict(ck["taus"])
+
+    def export(self, path: Path, step: int) -> None:
+        """The GAN fine-tunes' layouts (Vocos: ``vocos``, ``init``, ``mel``, ``head_padding``; BigVGAN: ``generator``,
+        ``repo``, ``hparams``) plus ``noise_channels``: :class:`~drifting_tts.vocoder.Vocoder` runs it at ``z = 0``."""
+        net, k = self.gen.net, self.gen.noise_channels
+        if self.backend == "vocos":
+            save_checkpoint(path, vocos=net.state_dict(), init=self.cfg.vocoder.init, step=step, mel=self.mel,
+                            head_padding=net.head.istft.padding, noise_channels=k, objective="drift")
+        else:
+            h = {key: v for key, v in net.h.items() if key != "use_cuda_kernel"}
+            save_checkpoint(path, generator=net.state_dict(), hparams=h, repo=self.repo, step=step, noise_channels=k,
+                            objective="drift")
+
+
+def build_trainer(cfg, device, arch: str, mel: str):
+    """``vocoder.objective``: ``gan`` (default: :class:`VocosGAN` / :class:`BigVGANGAN`) or ``drift``."""
+    objective = cfg.vocoder.get("objective", "gan")
+    if objective not in OBJECTIVES:
+        raise ValueError(f"vocoder.objective must be one of {OBJECTIVES}, got {objective!r}")
+    if objective == "drift":
+        return DriftVocoder(cfg, device, mel=mel, arch=arch)
+    return BigVGANGAN(cfg, device) if arch == "bigvgan" else VocosGAN(cfg, device, mel=mel)
+
+
 @torch.no_grad()
 def log_samples(gan, tts, batch: dict, stats: dict, tc, writer, step: int, device) -> None:
     """Full validation utterances: the vocoder on GTA mels and on recorded mels, plus the real audio."""
@@ -299,9 +447,9 @@ def run(args) -> None:
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=tc.num_workers,
                         pin_memory=True, persistent_workers=tc.num_workers > 0)
 
-    gan = BigVGANGAN(cfg, device) if arch == "bigvgan" else VocosGAN(cfg, device, mel=backend)
-    print(f"{arch} vocoder on {backend} mels {gan.n_gen:.1f}M, discriminators {gan.n_disc:.1f}M, "
-          f"{len(ds)} utterances", flush=True)
+    gan = build_trainer(cfg, device, arch, backend)
+    print(f"{arch} vocoder on {backend} mels {gan.n_gen:.1f}M, {getattr(gan, 'disc_label', 'discriminators')} "
+          f"{gan.n_disc:.1f}M, {len(ds)} utterances", flush=True)
     writer = SummaryWriter(work / "tb")
     samples = None
     if tc.get("sample_every", 0) > 0:
@@ -326,7 +474,8 @@ def run(args) -> None:
         mel = gta_mels(tts, batch, tc.gta_temperature, device) if use_gta else batch["mel"].to(device)
         mel = mel * stats["std"] + stats["mean"]  # back to log-mel, the vocoder's input
         mel, audio = random_segments(mel, batch["audio"].to(device), batch["mel_len"], tc.segment_frames, backend)
-        with torch.backends.cudnn.flags(enabled=True, benchmark=True):  # fixed segment shapes: faster convolutions
+        # fixed segment shapes: faster convolutions (GAN; the drift trainer opts out, see DriftVocoder)
+        with torch.backends.cudnn.flags(enabled=True, benchmark=getattr(gan, "cudnn_benchmark", True)):
             metrics = gan.step(mel, audio, step)
         step += 1
         for k, v in metrics.items():

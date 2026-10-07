@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from .audio import HOP_LENGTH, N_FFT
 
@@ -79,6 +79,28 @@ def load_vocos(init: str = VOCOS_REPO, state: dict | None = None, device: str = 
     return model.to(device).eval()
 
 
+def input_conv(model: nn.Module) -> nn.Conv1d:
+    """The first convolution, which reads the mel: ``backbone.embed`` (Vocos) or ``conv_pre`` (BigVGAN)."""
+    return model.backbone.embed if hasattr(model, "backbone") else model.conv_pre
+
+
+def extend_input_conv(conv: nn.Conv1d, extra: int) -> None:
+    """Append ``extra`` zero-initialised input channels to ``conv`` in place (plain or ``weight_g`` / ``weight_v``
+    weight norm), so the pretrained mapping is unchanged until the new weights learn (noise-conditioned vocoders)."""
+    name = "weight_v" if hasattr(conv, "weight_v") else "weight"
+    w = getattr(conv, name)
+    setattr(conv, name, nn.Parameter(torch.cat([w.data, w.data.new_zeros(w.shape[0], extra, *w.shape[2:])], 1)))
+    conv.in_channels += extra
+
+
+def fold_noise_channels(conv: nn.Conv1d, extra: int) -> None:
+    """Drop the last ``extra`` input channels: exact for input noise ``z = 0``. Weight norm must be removed first."""
+    if hasattr(conv, "weight_v"):
+        raise ValueError("remove the weight norm before folding the noise channels")
+    conv.weight = nn.Parameter(conv.weight.data[:, : conv.in_channels - extra].clone())
+    conv.in_channels -= extra
+
+
 def bigvgan_snapshot(repo: str = BIGVGAN_REPO, weights: bool = True) -> tuple[types.ModuleType, str]:
     """NVIDIA BigVGAN (MIT): its code ships with each HF repo (``pip install drifting-tts[bigvgan]``; the v1 and v2
     repos ship the same code). Returns the imported ``bigvgan`` module and the snapshot path (with the generator
@@ -138,18 +160,25 @@ def build_bigvgan(repo: str = BIGVGAN_REPO, hparams: dict | None = None, pretrai
 
 
 def load_bigvgan(repo: str = BIGVGAN_REPO, device: str = "cuda", finetuned: str | dict | None = None,
-                 cuda_kernel: bool = False):
+                 cuda_kernel: bool = False, fold_noise: bool = True):
     """Inference generator (weight norm removed): the released weights, or a ``bigvgan_ft.pt`` written by
     ``drifting-tts finetune-vocoder`` (same ``{"generator": ...}`` layout as ``bigvgan_generator.pt``; a path or the
-    loaded dict)."""
+    loaded dict). A generator trained with ``noise_channels`` input noise (``vocoder.objective: drift``) runs at
+    ``z = 0``: those channels are folded away (``fold_noise``), which leaves a standard BigVGAN; otherwise they stay
+    and the caller appends ``z``."""
     if finetuned:
         ck = finetuned if isinstance(finetuned, dict) else torch.load(finetuned, map_location="cpu",
                                                                        weights_only=False)
         model = build_bigvgan(ck.get("repo", repo), ck.get("hparams"), pretrained=False, cuda_kernel=cuda_kernel)
+        noise = int(ck.get("noise_channels", 0))
+        if noise:
+            extend_input_conv(model.conv_pre, noise)
         model.load_state_dict(ck["generator"])
     else:
-        model = build_bigvgan(repo, cuda_kernel=cuda_kernel)
+        model, noise = build_bigvgan(repo, cuda_kernel=cuda_kernel), 0
     model.remove_weight_norm()
+    if noise and fold_noise:
+        fold_noise_channels(model.conv_pre, noise)
     return model.to(device).eval()
 
 
@@ -229,12 +258,13 @@ class Vocoder:
     (whether fixed-size windows may run as CUDA graphs). Build one with :func:`load_vocoder`."""
 
     def __init__(self, device: str = "cuda", repo: str = VOCOS_REPO, finetuned: str | None = None,
-                 backend: str = "vocos", cuda_kernel: bool = False):
+                 backend: str = "vocos", cuda_kernel: bool = False, noise_seed: int | None = None):
         """``backend``: ``vocos`` or ``bigvgan`` (must match the mels the model was trained on).
         ``finetuned``: a ``vocos_ft.pt`` / ``bigvgan_ft.pt`` written by ``drifting-tts finetune-vocoder``.
-        ``cuda_kernel``: BigVGAN's fused CUDA activation (~3x faster inference; built with nvcc on first use)."""
+        ``cuda_kernel``: BigVGAN's fused CUDA activation (~3x faster inference; built with nvcc on first use).
+        ``noise_seed``: see :func:`load_vocoder`."""
         if finetuned or backend == "bigvgan":
-            v = load_vocoder(finetuned, device, cuda_kernel, backend)
+            v = load_vocoder(finetuned, device, cuda_kernel, backend, noise_seed=noise_seed)
         else:
             v = Vocoder.wrap(load_vocos(repo, device=device), "vocos", device, "vocos", repo, VOCODERS["vocos"].context)
         self.__dict__.update(v.__dict__)
@@ -243,6 +273,7 @@ class Vocoder:
     def wrap(cls, model, kind: str, device: str, mel: str = "bigvgan", name: str = "", context: int | None = 32):
         self = cls.__new__(cls)
         self.model, self.kind, self.device, self.mel, self.name, self.context = model, kind, device, mel, name, context
+        self.noise, self.noise_seed = 0, None  # input-noise channels left unfolded (vocoder.objective: drift)
         return self
 
     @property
@@ -257,6 +288,9 @@ class Vocoder:
     def __call__(self, log_mel: Tensor) -> Tensor:
         """Unnormalised log-mel ``[B, 100, T]`` -> waveform ``[B, samples]`` at 24 kHz."""
         x = log_mel.to(self.device).float()
+        if self.noise:
+            g = torch.Generator(device=self.device).manual_seed(self.noise_seed)
+            x = torch.cat([x, torch.randn(x.shape[0], self.noise, x.shape[-1], generator=g, device=self.device)], 1)
         if self.kind == "bigvgan":
             wav = self.model(x)[:, 0]
         elif self.kind == "vocos" and self.mel == "bigvgan":
@@ -287,18 +321,35 @@ def checkpoint_kind(ck: dict) -> str:
                      "'vocos' state dict")
 
 
-def _from_checkpoint(ck: dict, device: str, cuda_kernel: bool, name: str, context: int | None = None) -> Vocoder:
+def _from_checkpoint(ck: dict, device: str, cuda_kernel: bool, name: str, context: int | None = None,
+                     noise_seed: int | None = None) -> Vocoder:
+    noise = int(ck.get("noise_channels", 0))  # drift-trained: folded away at z = 0 unless noise_seed
     if checkpoint_kind(ck) == "bigvgan":
         repo = ck.get("repo", BIGVGAN_REPO)  # the context of this repo's fine-tune entry, else of the stock one
         same = sorted((e for e in VOCODERS.values() if e.repo == repo), key=lambda e: not e.hub_file)
         base = same[0] if same else VOCODERS["bigvgan-v2-ft"]
-        model = load_bigvgan(repo, device, finetuned=ck, cuda_kernel=cuda_kernel)
-        return Vocoder.wrap(model, "bigvgan", device, "bigvgan", name, context or base.context)
+        model = load_bigvgan(repo, device, finetuned=ck, cuda_kernel=cuda_kernel, fold_noise=noise_seed is None)
+        return _with_noise(Vocoder.wrap(model, "bigvgan", device, "bigvgan", name, context or base.context), noise,
+                           noise_seed)
     # a Vocos fine-tune: "mel": "bigvgan" when trained on BigVGAN-style mels (with "head_padding": "same", BigVGAN's
     # framing), else Vocos's own mels
-    model = load_vocos(ck.get("init", VOCOS_REPO), ck["vocos"], device)
+    model = build_vocos(ck.get("init", VOCOS_REPO))
     model.head.istft.padding = ck.get("head_padding", model.head.istft.padding)
-    return Vocoder.wrap(model, "vocos", device, ck.get("mel", "vocos"), name, context or VOCODERS["vocos-ft"].context)
+    if noise:
+        extend_input_conv(model.backbone.embed, noise)
+    model.load_state_dict(ck["vocos"])
+    if noise and noise_seed is None:
+        fold_noise_channels(model.backbone.embed, noise)
+    v = Vocoder.wrap(model.to(device).eval(), "vocos", device, ck.get("mel", "vocos"), name,
+                     context or VOCODERS["vocos-ft"].context)
+    return _with_noise(v, noise, noise_seed)
+
+
+def _with_noise(v: Vocoder, noise: int, noise_seed: int | None) -> Vocoder:
+    """Keep a drift-trained vocoder's input-noise channels and feed them fixed noise (``noise_seed``)."""
+    if noise and noise_seed is not None:
+        v.noise, v.noise_seed = noise, noise_seed
+    return v
 
 
 def _hub_checkpoint(name: str, filename: str) -> str:
@@ -313,13 +364,15 @@ def _hub_checkpoint(name: str, filename: str) -> str:
 
 
 def load_vocoder(spec: str | None = None, device: str = "cuda", cuda_kernel: bool = False,
-                 backend: str = "bigvgan") -> Vocoder:
+                 backend: str = "bigvgan", noise_seed: int | None = None) -> Vocoder:
     """A registry name (:data:`VOCODERS`), a checkpoint path, or ``None`` for the stock vocoder of ``backend`` (the
     mel front end of the TTS model: ``bigvgan`` or ``vocos``; it also picks Griffin-Lim's filterbank).
 
     Checkpoints are recognised by their keys: ``{"generator", "repo"?, "hparams"?}`` is a BigVGAN-family fine-tune,
     ``{"vocos", "init"?, "mel"?}`` a Vocos fine-tune (``mel: "bigvgan"``: trained on BigVGAN-style mels).
-    ``cuda_kernel``: BigVGAN's fused activation kernel (ignored by the others)."""
+    ``cuda_kernel``: BigVGAN's fused activation kernel (ignored by the others). A vocoder trained with input noise
+    (``vocoder.objective: drift``) runs at ``z = 0`` (the noise channels folded away, a standard network), or with
+    fixed Gaussian noise from ``noise_seed``."""
     if spec is None:
         spec = "bigvgan-v2" if backend == "bigvgan" else "vocos"
     if spec in VOCODERS:
@@ -329,11 +382,12 @@ def load_vocoder(spec: str | None = None, device: str = "cuda", cuda_kernel: boo
         if e.hub_file:
             path = e.local if e.local and Path(e.local).is_file() else _hub_checkpoint(spec, e.hub_file)
             ck = torch.load(path, map_location="cpu", weights_only=False)
-            return _from_checkpoint(ck, device, cuda_kernel, spec, e.context)
+            return _from_checkpoint(ck, device, cuda_kernel, spec, e.context, noise_seed)
         if e.kind == "bigvgan":
             return Vocoder.wrap(load_bigvgan(e.repo, device, cuda_kernel=cuda_kernel), e.kind, device, e.mel, spec,
                                 e.context)
         return Vocoder.wrap(load_vocos(e.repo, device=device), e.kind, device, e.mel, spec, e.context)
     if not Path(spec).is_file():
         raise ValueError(f"unknown vocoder {spec!r}: expected a checkpoint path or one of {', '.join(VOCODERS)}")
-    return _from_checkpoint(torch.load(spec, map_location="cpu", weights_only=False), device, cuda_kernel, spec)
+    return _from_checkpoint(torch.load(spec, map_location="cpu", weights_only=False), device, cuda_kernel, spec,
+                            noise_seed=noise_seed)
