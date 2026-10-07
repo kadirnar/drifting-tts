@@ -4,7 +4,7 @@ import { DriftingTTS, SAMPLE_RATE, toWav } from "./tts.js";
 const params = new URLSearchParams(location.search);
 // pinned to a revision: the browser cache is keyed by URL, so a model update must change the URL
 const MODELS = params.get("models") ??
-  "https://huggingface.co/Vyvo/drifting-tts-tr/resolve/98b91956593c5c0a3303fba5ee3414ab6762e20c/onnx";
+  "https://huggingface.co/Vyvo/drifting-tts-tr/resolve/501190557dec33d0127187b1f40cb3c698c27a35/onnx";
 const EXAMPLES = [
   "Merhaba, nasılsınız? Bugün hava çok güzel.",
   "İstanbul'dan Ankara'ya giden hızlı tren saat 09.15'te kalkıyor.",
@@ -89,9 +89,9 @@ async function speak() {
       if (firstMs === null) firstMs = performance.now() - t0;
       acoustic += r.acousticMs;
       vocoder += r.vocoderMs;
-      const chunk = parts.length ? concat([pause, r.audio]) : r.audio;
+      const chunk = r.index > 0 && r.piece === 0 ? concat([pause, r.audio]) : r.audio;
       parts.push(chunk);
-      // stream: play every sentence as soon as it is ready, back to back
+      // stream: play every piece as soon as it is ready, back to back
       const buf = audioCtx.createBuffer(1, chunk.length, SAMPLE_RATE);
       buf.copyToChannel(chunk, 0);
       const src = audioCtx.createBufferSource();
