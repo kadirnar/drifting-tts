@@ -44,6 +44,12 @@ jobs:
       - name: Verify Apple toolchain
         run: |
           test "$(uname -m)" = arm64
+          # XCTest's JIT compiler subprocesses may not inherit DEVELOPER_DIR.
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcrun --kill-cache
+          test "$(env -u DEVELOPER_DIR xcode-select --print-path)" = "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcrun --find clang++
+          env -u DEVELOPER_DIR /usr/bin/g++ --version
           xcodebuild -version
           xcrun swift --version
           python3 - <<'PY'
@@ -83,6 +89,50 @@ jobs:
             -only-testing:DriftingTTSTests \
             -jobs 3 | tee "$RUNNER_TEMP/native-parity.log"
 
+      - name: Save native build and test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-native-diagnostics
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/native-parity.log
+            ${{ runner.temp }}/native-parity.xcresult
+
+  ios-build:
+    # Run independently so a host CPU runtime failure cannot hide iOS compiler errors.
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.1.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Apple toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcrun --kill-cache
+          test "$(env -u DEVELOPER_DIR xcode-select --print-path)" = "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcrun --find clang++
+          env -u DEVELOPER_DIR /usr/bin/g++ --version
+          xcodebuild -version
+          xcrun swift --version
+          python3 - <<'PY'
+          import re
+          import subprocess
+          version = subprocess.check_output(["xcrun", "swift", "--version"], text=True)
+          match = re.search(r"Swift version (\d+)\.(\d+)", version)
+          assert match and tuple(map(int, match.groups())) >= (6, 3), version
+          PY
+          if ! xcrun metal -v; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal -v
+          fi
+
       - name: Generate iOS project with pinned packages
         run: |
           if ! command -v xcodegen >/dev/null; then
@@ -120,13 +170,10 @@ jobs:
           assert pins(original) == pins(app), "Xcode changed a pinned dependency revision"
           PY
 
-      - name: Save native build and test diagnostics
+      - name: Save iOS build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apple-native-diagnostics
+          name: apple-ios-build-diagnostics
           if-no-files-found: ignore
-          path: |
-            ${{ runner.temp }}/native-parity.log
-            ${{ runner.temp }}/native-parity.xcresult
-            ${{ runner.temp }}/ios-build.log
+          path: ${{ runner.temp }}/ios-build.log
