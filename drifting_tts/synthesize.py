@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import soundfile as sf
@@ -52,7 +53,11 @@ def preferred_temperature(model) -> float:
 
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
-                 cuda_kernel: bool = False):
+                 cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False):
+        """``fast`` (CUDA): the acoustic model and the streaming vocoder's windows run as CUDA graphs
+        (:mod:`drifting_tts.fast`), captured here (about 2 s); the output is the same as without it. ``compile`` also
+        fuses the DiT with ``torch.compile`` (about 20 s the first time) and ``tf32`` uses TF32 matmuls: both are
+        faster but change the output slightly (0.4-0.7 dB log-spectral distance with TF32)."""
         from .train import load_tts
         from .vocoder import Vocoder
 
@@ -64,6 +69,17 @@ class Synthesizer:
         self.default_temperature = preferred_temperature(self.model)
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
+        self.acoustic, self.vocoder_graphs = None, None
+        if fast:
+            from .fast import GraphedAcoustic, stream_vocoder
+
+            self.acoustic = GraphedAcoustic(self.model, compile=compile, tf32=tf32)
+            self.acoustic.warmup()
+            self.vocoder_graphs = {"pool": torch.cuda.graph_pool_handle()}
+            with torch.no_grad():  # capture the two window sizes of the streaming vocoder
+                for _ in stream_vocoder(self.vocoder, torch.full((1, 100, 384), self.stats.mean, device=device),
+                                        graphs=self.vocoder_graphs):
+                    pass
 
     def speaker_id(self, speaker: str | int) -> int:
         """A voice name (``male`` / ``female``), a training speaker ID, or a dataset speaker name."""
@@ -71,27 +87,40 @@ class Synthesizer:
             return self.speakers[speaker]
         return voice_id(speaker)
 
+    def _speaker(self, speaker: str | int) -> tuple[torch.Tensor, float]:
+        """Speaker id tensor and the voice's duration factor."""
+        spk_id = self.speaker_id(speaker)
+        if spk_id >= self.model.encoder.spk.num_embeddings:
+            raise ValueError(f"speaker {speaker!r} ({spk_id}) is not in this checkpoint")
+        tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
+        return torch.tensor([spk_id], device=self.device), tempo
+
+    def _mel(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
+             length_scale: float, attn_window: int | None = None, pitch_shift: float = 0.0,
+             steps: int | None = None) -> torch.Tensor:
+        """One normalised sentence -> normalised mel ``[1, n_mels, T]`` (CUDA graphs when ``fast`` allows it)."""
+        ids = torch.tensor([text_to_ids(sentence, normalized=True)], device=self.device)
+        if self.acoustic is not None and attn_window is None and not pitch_shift and steps in (None, 1):
+            return self.acoustic(ids, spk, cfg_scale, temperature, length_scale, generator=g)
+        mel, _ = self.model.synthesize(ids, torch.tensor([ids.shape[1]], device=self.device), spk,
+                                       cfg_scale=cfg_scale, temperature=temperature, length_scale=length_scale,
+                                       generator=g, attn_window=attn_window, pitch_shift=pitch_shift, steps=steps)
+        return mel
+
     @torch.no_grad()
     def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0,
                  temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0, pause: float = 0.15,
                  attn_window: int | None = None, pitch_shift: float = 0.0,
                  steps: int | None = None) -> tuple[torch.Tensor, dict]:
-        spk_id = self.speaker_id(speaker)
-        if spk_id >= self.model.encoder.spk.num_embeddings:
-            raise ValueError(f"speaker {speaker!r} ({spk_id}) is not in this checkpoint")
-        spk = torch.tensor([spk_id], device=self.device)
-        tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
+        spk, tempo = self._speaker(speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
         wavs, t_acoustic, t_vocoder = [], 0.0, 0.0
         silence = torch.zeros(int(pause * SAMPLE_RATE))
         for sentence in split_sentences(normalize(text)):
-            ids = torch.tensor([text_to_ids(sentence, normalized=True)], device=self.device)
             self._sync()
             t0 = time.perf_counter()
-            mel, _ = self.model.synthesize(ids, torch.tensor([ids.shape[1]], device=self.device), spk,
-                                           cfg_scale=cfg_scale, temperature=temperature,
-                                           length_scale=length_scale * tempo, generator=g,
-                                           attn_window=attn_window, pitch_shift=pitch_shift, steps=steps)
+            mel = self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo, attn_window,
+                            pitch_shift, steps)
             self._sync()
             t1 = time.perf_counter()
             wav = self.vocoder(self.stats.denormalize(mel))[0].cpu()
@@ -102,6 +131,26 @@ class Synthesizer:
         wav = torch.cat(wavs[:-1]) if wavs else torch.zeros(0)
         dur = max(wav.numel() / SAMPLE_RATE, 1e-6)
         return wav, {"seconds": dur, "rtf_acoustic": t_acoustic / dur, "rtf_total": (t_acoustic + t_vocoder) / dur}
+
+    @torch.no_grad()
+    def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
+               length_scale: float = 1.0, seed: int = 0, pause: float = 0.15, first: int = 32,
+               chunk: int = 256) -> Iterator[torch.Tensor]:
+        """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
+
+        Each sentence is generated in one pass. The vocoder then streams: the first ``first`` mel frames (0.34 s), then
+        ``chunk``-frame windows, each with 32 frames of context (see :func:`drifting_tts.fast.stream_vocoder`)."""
+        from .fast import stream_vocoder
+
+        spk, tempo = self._speaker(speaker)
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        silence = torch.zeros(int(pause * SAMPLE_RATE))
+        for k, sentence in enumerate(split_sentences(normalize(text))):
+            mel = self.stats.denormalize(self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo))
+            if k:
+                yield silence
+            for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, graphs=self.vocoder_graphs):
+                yield piece.cpu()
 
     def _sync(self) -> None:
         if self.device.startswith("cuda"):

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--mos", default="utmosv2", choices=["utmosv2", "utmos22", "none"])
     p.add_argument("--save-wavs", type=int, default=20)
     p.add_argument("--cuda-kernel", action="store_true")
+    p.add_argument("--stream", action="store_true", help="synthesise with Synthesizer.stream (streaming vocoder)")
+    p.add_argument("--fast", action="store_true", help="CUDA graphs, Synthesizer(fast=True); implies --stream")
     p.add_argument("--out", default="outputs/benchmark")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -80,15 +83,24 @@ def run(args) -> None:
     (out / "wav").mkdir(parents=True, exist_ok=True)
     items = load_texts(args.texts)
     items = items[: args.num] if args.num else items
-    synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel)
+    synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel, fast=args.fast)
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
-    synth("Merhaba.", speaker=args.speaker[0], cfg_scale=args.cfg, temperature=temperature)  # warm-up for the RTF
+
+    def generate(text: str, speaker: str, seed: int) -> tuple[torch.Tensor, dict]:
+        if not (args.stream or args.fast):
+            return synth(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature, seed=seed)
+        t0 = time.perf_counter()
+        wav = torch.cat(list(synth.stream(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature,
+                                          seed=seed)))
+        return wav, {"rtf_total": (time.perf_counter() - t0) / max(wav.numel() / SAMPLE_RATE, 1e-6)}
+
+    generate("Merhaba.", args.speaker[0], 0)  # warm-up for the RTF
 
     rows = []
     for i, item in enumerate(items):
         spk = args.speaker[i % len(args.speaker)]
-        wav, info = synth(item["text"], speaker=spk, cfg_scale=args.cfg, temperature=temperature, seed=i)
+        wav, info = generate(item["text"], spk, i)
         ref = _plain(item["text"])
         row = {"id": item.get("id", i), "speaker": spk, "ref": ref, "rtf": info["rtf_total"]}
         if judges.asr is not None:
@@ -105,6 +117,7 @@ def run(args) -> None:
     res = {"system": "drifting_tts", "temperature": temperature, "cfg": args.cfg, **summarize(rows),
            "rtf": float(np.mean([r["rtf"] for r in rows]))}
     results = {"texts": args.texts, "sentences": len(rows), "band_hz": args.band, "voices": args.speaker,
+               "stream": args.stream or args.fast, "fast": args.fast,
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res]}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")

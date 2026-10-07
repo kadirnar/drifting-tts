@@ -149,8 +149,17 @@ export class DriftingTTS {
     return new this.ort.Tensor(type, data, dims);
   }
 
-  // One sentence (already normalised) -> Float32Array audio. `random` is shared across the sentences of a text.
-  async sentence(text, speaker, { temperature, cfgScale, lengthScale, random, noise = null }) {
+  // One sentence (already normalised) -> Float32Array audio, vocoded whole. `random` is shared across the sentences.
+  async sentence(text, speaker, opts) {
+    const m = await this.mel(text, speaker, opts);
+    const t1 = performance.now();
+    const voc = await this.sessions.vocoder.run({ mel: m.mel });
+    const audio = voc.audio.data instanceof Float32Array ? voc.audio.data : Float32Array.from(voc.audio.data);
+    return { audio, acousticMs: m.acousticMs, vocoderMs: performance.now() - t1, frames: m.frames };
+  }
+
+  // One sentence -> log-mel tensor [1, n_mels, T] (one generator pass).
+  async mel(text, speaker, { temperature, cfgScale, lengthScale, random, noise = null }) {
     const cfg = this.config;
     const ids = textToIds(text, { normalized: true });
     const spk = this.tensor("int64", BigInt64Array.from([BigInt(speaker)]), [1]);
@@ -178,21 +187,47 @@ export class DriftingTTS {
       cfg_scale: this.tensor("float32", Float32Array.from([cfgScale]), [1]),
       noise_labels: this.tensor("int64", labels, [1, cfg.noise_coords]),
     });
-    const t1 = performance.now();
-    const voc = await this.sessions.vocoder.run({ mel: gen.mel });
-    const audio = voc.audio.data instanceof Float32Array ? voc.audio.data : Float32Array.from(voc.audio.data);
-    return { audio, acousticMs: t1 - t0, vocoderMs: performance.now() - t1, frames: T };
+    return { mel: gen.mel, frames: T, acousticMs: performance.now() - t0 };
   }
 
-  // Sentence by sentence: yields each sentence's audio as soon as it is ready (streaming playback).
+  // Streaming vocoder, as drifting_tts/fast.py: the first `first` frames with `context` frames of right context,
+  // then windows of `chunk` frames with `context` frames on each side. BigVGAN-v2's receptive field is about 24
+  // frames, so the pieces join into what vocoding the whole sentence gives. Yields Float32Array pieces.
+  async *vocodeStream(mel, T, { first = 32, chunk = 256, context = 32 } = {}) {
+    const hop = this.config.hop_length, n = this.config.n_mels, data = mel.data;
+    const run = async (a, b) => {
+      const w = b - a, x = new Float32Array(n * w);
+      for (let c = 0; c < n; c++) x.set(data.subarray(c * T + a, c * T + b), c * w);
+      return (await this.sessions.vocoder.run({ mel: this.tensor("float32", x, [1, n, w]) })).audio.data;
+    };
+    if (T <= first + context) {
+      yield await run(0, T);
+      return;
+    }
+    yield (await run(0, first + context)).slice(0, first * hop);
+    for (let s = first; s < T; s += chunk) {
+      const a = Math.max(0, s - context), b = Math.min(T, s + chunk + context);
+      yield (await run(a, b)).slice((s - a) * hop, (s - a + Math.min(chunk, T - s)) * hop);
+    }
+  }
+
+  // Streaming: each sentence is generated in one pass, then vocoded in pieces; yields every piece as soon as it is
+  // ready ({audio, index: sentence, count, piece, acousticMs, vocoderMs}). The first piece is 0.34 s of audio.
   async *stream(text, { voice = this.config.default_voice, temperature = this.config.temperature ?? 0.3,
                        cfgScale = 2.0, lengthScale = 1.0, seed = 0 } = {}) {
     const speaker = typeof voice === "number" ? voice : this.voiceId(voice);
     const random = makeRandom(seed);
     const sentences = splitSentences(normalize(text));
     for (let i = 0; i < sentences.length; i++) {
-      const r = await this.sentence(sentences[i], speaker, { temperature, cfgScale, lengthScale, random });
-      yield { ...r, index: i, count: sentences.length, text: sentences[i] };
+      const m = await this.mel(sentences[i], speaker, { temperature, cfgScale, lengthScale, random });
+      let piece = 0, t = performance.now();
+      for await (const audio of this.vocodeStream(m.mel, m.frames)) {
+        const now = performance.now();
+        yield { audio, index: i, count: sentences.length, piece, acousticMs: piece ? 0 : m.acousticMs,
+                vocoderMs: now - t, text: sentences[i] };
+        piece++;
+        t = performance.now();
+      }
     }
   }
 
@@ -206,7 +241,7 @@ export class DriftingTTS {
       if (stats.firstAudioMs === null) stats.firstAudioMs = performance.now() - t0;
       stats.acousticMs += r.acousticMs;
       stats.vocoderMs += r.vocoderMs;
-      if (parts.length) parts.push(pause);
+      if (r.index > 0 && r.piece === 0) parts.push(pause);
       parts.push(r.audio);
     }
     const audio = new Float32Array(parts.reduce((s, p) => s + p.length, 0));
