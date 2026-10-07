@@ -31,6 +31,7 @@ from .alignment import sequence_mask
 from .config import Config, load_config, save_config
 from .data import BucketBatchSampler, MelDataset, collate
 from .drift import feature_drift_loss
+from .latents import VAE_BACKENDS
 from .models.text_encoder import align, duration_loss, expand, prior_loss, token_pitch
 from .models.tts import DriftingTTS
 from .train_mae import load_mae
@@ -215,9 +216,15 @@ def training_step(
     return loss, metrics, info
 
 
+def dataset_stats(ds: MelDataset) -> dict:
+    """What inference needs to turn the model's normalised frames into audio (stored in the exported checkpoint)."""
+    return {**ds.stats.to_dict(), "backend": ds.backend, "dim": ds.dim, "frame_rate": ds.frame_rate,
+            "latent_repeat": ds.latent_repeat}
+
+
 def feature_keys(mae, cfg: Config, device) -> list[str]:
     with torch.no_grad():
-        mel = torch.zeros(1, 100, cfg.drift.crop_frames, device=device)
+        mel = torch.zeros(1, mae.n_mels, cfg.drift.crop_frames, device=device)
         return list(mae.get_activations(mel, **activation_kwargs(cfg)))
 
 
@@ -276,7 +283,7 @@ def run(args) -> None:
 
     ds, loader = build_loader(cfg)
     val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9, filters=cfg.data.get("filters"))
-    model = DriftingTTS(cfg.model, num_speakers=ds.num_speakers).to(device)
+    model = DriftingTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
     if model.pitch_enabled:
         st = json.loads((Path(cfg.data.root) / "stats.json").read_text())
         model.lf0_stats.copy_(torch.tensor([st["lf0_mean"], st["lf0_std"]]))
@@ -303,7 +310,7 @@ def run(args) -> None:
     ema = EMA(model, tc.ema_decay)  # a deep copy made before compiling: sampling and export stay eager
     if tc.get("compile", False):  # in place, so state_dict keys are unchanged; the training shapes are static
         model.generator.compile()
-    bank = CropBank(cfg.drift.uncond_bank, 100, cfg.drift.crop_frames, device)
+    bank = CropBank(cfg.drift.uncond_bank, ds.dim, cfg.drift.crop_frames, device)
     writer = SummaryWriter(work / "tb")
     step, rng = 0, None
     if (work / "last.pt").exists():
@@ -343,9 +350,14 @@ def run(args) -> None:
 
     vocoder = None
     if tc.sample_every > 0 and device == "cuda":
-        from .vocoder import Vocoder
+        if ds.backend in VAE_BACKENDS:
+            from .latents.vocoder import LatentVocoder
 
-        vocoder = Vocoder(device, backend=ds.backend)
+            vocoder = LatentVocoder(ds.backend, device, repeat=ds.latent_repeat)
+        else:
+            from .vocoder import Vocoder
+
+            vocoder = Vocoder(device, backend=ds.backend)
 
     model.train()
     if rng is not None:
@@ -393,7 +405,7 @@ def run(args) -> None:
                             config=cfg.to_dict(), num_speakers=ds.num_speakers)
             save_checkpoint(work / "model_ema.pt", ema=ema.model.state_dict(), config=cfg.to_dict(),
                             num_speakers=ds.num_speakers, step=step, taus=None if taus is None else taus.state_dict(),
-                            stats={"mean": ds.stats.mean, "std": ds.stats.std, "backend": ds.backend}, **calib)
+                            n_mels=ds.dim, stats=dataset_stats(ds), **calib)
     stale = "" if duration_scale is None else " (stale duration_scale: re-run `drifting-tts calibrate-durations`)"
     print(f"done: {work / 'model_ema.pt'}{stale}", flush=True)
 
@@ -419,7 +431,7 @@ def load_tts(path: str | Path, device="cpu") -> tuple[DriftingTTS, Config, dict]
     """Load an exported (EMA) model: returns the model, its config and the mel statistics."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     cfg = Config(ck["config"])
-    model = DriftingTTS(cfg.model, num_speakers=ck["num_speakers"])
+    model = DriftingTTS(cfg.model, num_speakers=ck["num_speakers"], n_mels=ck.get("n_mels", 100))
     model.load_state_dict(ck["ema"])
     model.duration_scale = float(ck.get("duration_scale", 1.0))  # set by `drifting-tts calibrate-durations`
     model.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}  # per voice

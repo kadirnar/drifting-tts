@@ -18,6 +18,7 @@ COMMANDS: dict[str, str] = {
     "merge-data": "drifting_tts.merge_data",
     "calibrate-durations": "drifting_tts.calibrate",
     "finetune-vocoder": "drifting_tts.finetune_vocoder",
+    "extract-latents": "drifting_tts.extract_latents",
 }
 
 
