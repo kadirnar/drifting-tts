@@ -47,7 +47,8 @@ wav, info = tts("Merhaba, bu cümle tek adımda üretildi.", speaker="studio", c
 sf.write("merhaba.wav", wav.numpy(), 24000)
 ```
 
-- `speaker`: `"studio"` (default, the clearest voice), `"male"` or `"female"`.
+- `speaker`: `"studio"` (default, the clearest voice), `"male"` or `"female"`. Any of the model's 723 speaker
+  IDs also works, e.g. `speaker=17`; [docs/SPEAKERS.md](docs/SPEAKERS.md) scores every one of them.
 - `temperature`: the noise level. 0.3 sounds clearest; higher values give more variety.
 - `cfg_scale`: the guidance strength, learned during training, so it costs nothing at inference.
 - Numbers, dates, times, units, currencies and common abbreviations are read out in Turkish automatically.
@@ -155,6 +156,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | | |
 |---|---|
 | [docs/RESULTS.md](docs/RESULTS.md) | benchmark details, voices, latency and parameter counts |
+| [docs/SPEAKERS.md](docs/SPEAKERS.md) | WER, CER, DNSMOS, UTMOSv2, pitch and speaking rate of all 723 speaker IDs |
 | [docs/TRAINING.md](docs/TRAINING.md) | the training recipe, the evidence behind each choice, adding a voice |
 | [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |

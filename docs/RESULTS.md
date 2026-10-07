@@ -41,6 +41,7 @@ from a listening study, so it is not comparable with UTMOSv2.
 - **Selection:** `male` and `female` were picked by measurement among the best-covered training speakers.
   `scripts/select_voices.py` scored each candidate on 30 held-out dev sentences with UTMOSv2 and Whisper CER.
 - **`studio`:** added by fine-tuning (next section).
+- **All speaker IDs:** [SPEAKERS.md](SPEAKERS.md) scores every one of the 723 IDs on 50 Freya sentences.
 - **Duration factors:** each voice has its own factor from `calibrate-durations`. A single global factor had made
   some voices speak 7–17% faster than their recordings.
 
