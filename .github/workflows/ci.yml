@@ -22,3 +22,8 @@ jobs:
         run: uv run --no-sync ruff check .
       - name: Test
         run: uv run --no-sync pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test the JavaScript text frontend
+        run: node web/tests/text.test.mjs

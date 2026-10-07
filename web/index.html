@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drifting TTS WebGPU</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="One-step Turkish text-to-speech running entirely in the browser with WebGPU.">
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --ink: #1d1d1b; --muted: #5f5f5a; --line: #e2e2dc;
+    --accent: #2f5bd3; --accent-ink: #ffffff; --warn: #8a5300; --warn-bg: #fff4e0; --bar: #2f5bd3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413; --card: #1e1e1c; --ink: #ececea; --muted: #a3a39c; --line: #33332f;
+      --accent: #7c9cf0; --accent-ink: #10131c; --warn: #f2c27b; --warn-bg: #2d2416; --bar: #7c9cf0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .lede { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 0.92rem; }
+  .badge { font-weight: 600; font-size: 0.8rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+  .progress > div { height: 100%; width: 0; background: var(--bar); transition: width 0.2s; }
+  .warn { background: var(--warn-bg); color: var(--warn); border-radius: 8px; padding: 10px 12px; margin-top: 12px; font-size: 0.9rem; }
+  textarea { width: 100%; min-height: 120px; resize: vertical; padding: 12px; border-radius: 8px;
+             border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+  .examples { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
+  .examples button { font: inherit; font-size: 0.85rem; border: 1px solid var(--line); background: transparent;
+                     color: var(--muted); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-top: 14px; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
+  label output { float: right; color: var(--ink); font-variant-numeric: tabular-nums; }
+  select, input[type=number] { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid var(--line);
+                               background: var(--bg); color: var(--ink); font: inherit; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .speak { margin-top: 16px; width: 100%; padding: 12px; font: inherit; font-weight: 600; border: 0; border-radius: 8px;
+           background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+  .speak:disabled { opacity: 0.5; cursor: default; }
+  audio { width: 100%; margin-top: 4px; }
+  .stats { font-size: 0.88rem; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 8px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+  a { color: var(--accent); }
+  footer { color: var(--muted); font-size: 0.85rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Drifting TTS · Turkish, in your browser</h1>
+  <p class="lede">One-step Turkish speech synthesis with WebGPU. The text never leaves your device. The first visit
+    downloads the model (≈370 MB) once; later visits load it from the browser cache.</p>
+
+  <section class="card">
+    <div class="status">
+      <span class="badge" id="backend">…</span>
+      <span id="status">Loading…</span>
+    </div>
+    <div class="progress" id="progress" aria-hidden="true"><div id="bar"></div></div>
+    <div class="warn" id="warn" hidden></div>
+  </section>
+
+  <section class="card">
+    <label for="text">Text (Turkish)</label>
+    <textarea id="text">Merhaba! Bu ses, tarayıcınızda WebGPU ile tek adımda üretildi. Toplantı saat 14.30'da başlıyor.</textarea>
+    <div class="examples" id="examples"></div>
+    <label for="voice">Voice</label>
+    <select id="voice">
+      <option value="studio">Studio male voice (recommended)</option>
+      <option value="male">Male voice</option>
+      <option value="female">Female voice</option>
+    </select>
+    <div class="grid">
+      <div>
+        <label for="temperature">Temperature <output id="temperatureOut">0.30</output></label>
+        <input type="range" id="temperature" min="0.1" max="1" step="0.05" value="0.3">
+      </div>
+      <div>
+        <label for="cfg">Guidance <output id="cfgOut">2.00</output></label>
+        <input type="range" id="cfg" min="1" max="4" step="0.25" value="2">
+      </div>
+      <div>
+        <label for="speed">Speed <output id="speedOut">1.00</output></label>
+        <input type="range" id="speed" min="0.7" max="1.3" step="0.05" value="1">
+      </div>
+      <div>
+        <label for="seed">Seed</label>
+        <input type="number" id="seed" value="0" min="0" step="1">
+      </div>
+    </div>
+    <button class="speak" id="speak" disabled>Speak</button>
+  </section>
+
+  <section class="card" id="result" hidden>
+    <div class="row">
+      <strong>Result</strong>
+      <a id="download" download="drifting-tts.wav" href="#">Download WAV</a>
+    </div>
+    <audio id="audio" controls></audio>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <footer>
+    <a href="https://huggingface.co/Vyvo/drifting-tts-tr">Model</a> ·
+    <a href="https://github.com/kadirnar/drifting-tts">Code</a> ·
+    <a href="https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo">GPU demo</a> ·
+    runs on <a href="https://onnxruntime.ai/docs/tutorials/web/">ONNX Runtime Web</a>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

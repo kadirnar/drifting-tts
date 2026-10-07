@@ -93,6 +93,37 @@ streams sentence by sentence, so later sentences are generated while the first o
 
 The 2-D Mel-MAE feature encoder (4.4 M) is used only during training.
 
+## In the browser (WebGPU)
+
+`scripts/export_onnx.py` exports three graphs: the text encoder, the generator and the vocoder. Between them,
+JavaScript repeats each token's features for its predicted duration. Each graph matches PyTorch to a relative error
+below 4e-5. The whole JavaScript pipeline in `web/tts.js` was also run under onnxruntime-node with the noise of a
+PyTorch run. Its text normalisation, token IDs and frame counts were identical, and the audio matched at an SNR of
+80–84 dB.
+
+The web demo loads the `*_fp16.onnx` graphs. They store their weights in fp16, which halves the download to 368 MB, and
+compute in fp32:
+
+| graphs | download | audio vs PyTorch |
+|---|---|---|
+| fp32 | 729 MB | SNR 91 dB |
+| fp16 weights, fp32 compute (web demo) | 368 MB | SNR 35 dB, log-spectral distance 0.9 dB |
+
+**Setup:** RTX 5090, headless Chrome 153, onnxruntime-web 1.30 WebGPU, fp16-weight graphs. Each value is a single
+run after the warm-up pass:
+
+| input | audio | first audio | total | acoustic model | vocoder |
+|---|---|---|---|---|---|
+| "Merhaba, nasılsınız? Bugün hava çok güzel." (2 sentences) | 2.9 s | 182 ms | 297 ms | 139 ms | 154 ms |
+| 2-sentence train announcement (female voice) | 7.8 s | 240 ms | 392 ms | 133 ms | 257 ms |
+| one sentence | 3.7 s | 185 ms | 186 ms | 77 ms | 108 ms |
+
+- **Download:** loading the 368 MB of graphs from the Hub took 8 s here, plus 0.9 s of warm-up for shader
+  compilation. Later visits load the graphs from the browser cache.
+- **Intelligibility:** Whisper large-v3 transcribed all three browser outputs with 0% CER.
+- **Other devices:** laptop and integrated GPUs will be slower. Without WebGPU the page falls back to WASM on the
+  CPU, which is far slower than real time.
+
 ## Spectral detail
 
 The first version (v1) sounded muffled. Its harmonic peaks and valleys along frequency were only 32–56% as deep as
