@@ -49,7 +49,9 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
     stock = "the stock vocoder of the model's mel front end (BigVGAN-v2 or Vocos)"
     p.add_argument("--vocoder", default=default,
                    help=f"{' | '.join(VOCODERS)} or a checkpoint (bigvgan_ft.pt / vocos_ft.pt from finetune-vocoder); "
-                        f"default: {default or stock}")
+                        "revox[:<F0 source>[:dio|harvest]] is Minori Live - Revox Vocoder 1.0 "
+                        "(https://huggingface.co/minori-live/revox-vocoder-1), CC BY-NC-SA 4.0: non-commercial use "
+                        f"only; default: {default or stock}")
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
 

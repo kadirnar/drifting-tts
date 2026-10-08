@@ -23,16 +23,19 @@ from .audio import HOP_LENGTH, N_FFT
 VOCOS_REPO = "charactr/vocos-mel-24khz"
 BIGVGAN_REPO = "nvidia/bigvgan_v2_24khz_100band_256x"
 HUB_REPO = "Vyvo/drifting-tts-tr"
+REVOX_REPO, REVOX_REVISION = "minori-live/revox-vocoder-1", "025862deee2003230d9d0fd8f3ad56a5bc09d31c"
+REVOX_CREDIT = (f"Minori Live — Revox Vocoder 1.0 (https://huggingface.co/{REVOX_REPO}), CC BY-NC-SA 4.0: "
+                "non-commercial use only")
 
 
 @dataclass(frozen=True)
 class VocoderEntry:
-    """``kind``: ``bigvgan``, ``vocos`` or ``griffin-lim``; ``repo``: the NVIDIA repo (code, config, weights) or the
-    Vocos init; ``hub_file``: a fine-tuned checkpoint in :data:`HUB_REPO`, read from ``local`` instead when that file
-    exists (a ``finetune-vocoder`` output not yet on the Hub); ``context``: frames of context on each side of a
-    streaming window, the smallest multiple of 8 at which streamed audio matches whole-utterance vocoding to the fp32
-    noise floor (> 90 dB SNR, docs/VOCODERS.md; ``None``: one piece per sentence); ``mel``: the mel front end it
-    expects (``None``: the model's)."""
+    """``kind``: ``bigvgan``, ``vocos``, ``griffin-lim`` or ``revox``; ``repo``: the NVIDIA repo (code, config,
+    weights), the Vocos init or Revox's repo; ``hub_file``: a fine-tuned checkpoint in :data:`HUB_REPO`, read from
+    ``local`` instead when that file exists (a ``finetune-vocoder`` output not yet on the Hub); ``context``: frames of
+    context on each side of a streaming window, the smallest multiple of 8 at which streamed audio matches
+    whole-utterance vocoding to the fp32 noise floor (> 90 dB SNR, docs/VOCODERS.md; ``None``: one piece per
+    sentence); ``mel``: the mel front end it expects (``None``: the model's)."""
 
     kind: str
     about: str
@@ -59,6 +62,9 @@ VOCODERS: dict[str, VocoderEntry] = {
                           context=32, mel="vocos"),
     "griffin-lim": VocoderEntry("griffin-lim", "mel pseudo-inverse + NNLS, then fast Griffin-Lim (no weights)",
                                 context=None, mel=None),
+    "revox": VocoderEntry("revox", f"{REVOX_CREDIT}; 48 kHz, F0 from the Griffin-Lim audio of the mel "
+                          "('revox:<F0 source>[:dio|harvest]': griffin-lim, none or a registry vocoder)", REVOX_REPO,
+                          context=None),
 }
 
 
@@ -210,7 +216,10 @@ class GriffinLim(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, log_mel: Tensor) -> Tensor:
-        mag = self.magnitude(log_mel.float())
+        return self.reconstruct(self.magnitude(log_mel.float()))
+
+    def reconstruct(self, mag: Tensor) -> Tensor:
+        """Linear magnitude ``[B, n_fft // 2 + 1, T]`` -> waveform, phase by fast Griffin-Lim."""
         g = torch.Generator().manual_seed(self.seed)
         angles = torch.polar(torch.ones(mag.shape), 2 * math.pi * torch.rand(mag.shape, generator=g)).to(mag.device)
         prev = torch.zeros_like(angles)
@@ -221,12 +230,148 @@ class GriffinLim(torch.nn.Module):
         return self.istft(mag * angles)
 
 
+REVOX_RATE, REVOX_FFT, REVOX_HOP, REVOX_MELS = 48_000, 2048, 480, 128
+
+
+def revox_frames(t: int) -> int:
+    """Revox frames (10 ms, ``ceil(samples / 480)`` at 48 kHz) of the audio of ``t`` BigVGAN frames."""
+    return -(-t * 2 * HOP_LENGTH // REVOX_HOP)
+
+
+def to_revox_frames(x: Tensor) -> Tensor:
+    """``[..., T]`` on BigVGAN frames (centred at ``(i + 1/2) * 256 / 24000`` s) -> ``[..., revox_frames(T)]`` on
+    Revox frames (centred at ``k / 100`` s), by linear interpolation; frames outside the first / last centre are
+    held."""
+    t = x.shape[-1]
+    pos = (torch.arange(revox_frames(t), device=x.device) * (REVOX_HOP / 2 / HOP_LENGTH) - 0.5).clamp(0, t - 1)
+    lo = pos.floor().long()
+    w = pos - lo
+    return x[..., lo] * (1 - w) + x[..., (lo + 1).clamp(max=t - 1)] * w
+
+
+def resample_sharp(wav: Tensor, sr: int, target: int) -> Tensor:
+    """Kaiser-windowed sinc resampling, flat to 11.5 kHz between 24 and 48 kHz (torchaudio's default rolls off
+    above 8 kHz)."""
+    import torchaudio
+
+    return torchaudio.functional.resample(wav, sr, target, lowpass_filter_width=64, rolloff=0.995,
+                                          resampling_method="sinc_interp_kaiser", beta=14.77)
+
+
+class RevoxLogMel(torch.nn.Module):
+    """Revox's mel front end on 48 kHz audio: centred, zero-padded STFT (periodic Hann 2048, hop 480), magnitude,
+    128 Slaney filters (area norm, 0-24 kHz), ``ln(max(., 1e-5))``, ``ceil(samples / 480)`` frames at ``k * 10`` ms."""
+
+    def __init__(self):
+        import torchaudio
+
+        super().__init__()
+        fb = torchaudio.functional.melscale_fbanks(REVOX_FFT // 2 + 1, 0.0, REVOX_RATE / 2, REVOX_MELS, REVOX_RATE,
+                                                   norm="slaney", mel_scale="slaney")
+        self.register_buffer("fb", fb.T.contiguous(), persistent=False)
+        self.register_buffer("window", torch.hann_window(REVOX_FFT), persistent=False)
+
+    @torch.no_grad()
+    def forward(self, wav: Tensor) -> Tensor:
+        """``[B, samples]`` at 48 kHz -> ``[B, 128, ceil(samples / 480)]``."""
+        spec = torch.stft(wav, REVOX_FFT, REVOX_HOP, REVOX_FFT, self.window, center=True, pad_mode="constant",
+                          return_complex=True)
+        return (self.fb @ spec.abs())[..., : -(-wav.shape[-1] // REVOX_HOP)].clamp_min(1e-5).log()
+
+    def convert(self, mag: Tensor) -> Tensor:
+        """24 kHz linear magnitude on BigVGAN frames ``[B, 513, T]`` -> Revox log-mel ``[B, 128, revox_frames(T)]``.
+
+        Doubled, it is the 48 kHz magnitude of the audio upsampled x2 (same 23.4375 Hz bins, a window as long), empty
+        above 12 kHz. Time is interpolated in the linear domain, where it commutes with the filters (the geometric
+        mean of log-domain interpolation is biased low at onsets)."""
+        return to_revox_frames(self.fb[:, : mag.shape[1]] @ (2 * mag)).clamp_min(1e-5).log()
+
+
+def revox_pitch(wav: Tensor, sample_rate: int, frames: int, method: str = "dio") -> tuple[Tensor, Tensor, Tensor]:
+    """``f0_hz``, ``voiced``, ``pitch_valid`` (``[frames]`` each) from WORLD on ``wav`` ``[samples]``, at Revox's
+    frame centres ``k * 10`` ms. WORLD's unvoiced frames are reliable unvoiced decisions (``pitch_valid``). dio runs
+    with a looser voicing threshold (``allowed_range`` 0.2): Revox cannot voice a frame without F0, and dio's default
+    misses voiced frames of Griffin-Lim audio (docs/VOCODERS.md)."""
+    from .audio import world_f0
+
+    f0 = torch.zeros(frames)
+    raw = torch.from_numpy(world_f0(wav.double().cpu().numpy(), sample_rate, 1000 * REVOX_HOP / REVOX_RATE, method,
+                                    allowed_range=0.2))
+    f0[: min(frames, len(raw))] = raw[:frames].float()
+    return f0, f0 > 0, torch.ones(frames, dtype=torch.bool)
+
+
+class Revox(torch.nn.Module):
+    """Revox Vocoder 1.0 by Minori Live (``REVOX_CREDIT``; CC BY-NC-SA 4.0, **non-commercial**): a 4.46 M-parameter
+    48 kHz PC-NSF-Vocos conditioned on a 128-band log-mel and frame-level F0, here on this model's BigVGAN mels. The
+    ONNX graph is downloaded from the original repo at runtime (never redistributed) and runs in ONNX Runtime on the
+    CPU (its CUDA provider was slower on an RTX 5090).
+
+    Mel conversion: :class:`GriffinLim`'s NNLS inverts the 100-band mel to the 513-bin magnitude, which
+    :meth:`RevoxLogMel.convert` turns into Revox's 128 bands on 100 Hz frames centred at ``k * 10`` ms.
+
+    ``f0``: the source of the frame-level F0 (the model predicts pitch per token only): WORLD ``method`` on the
+    Griffin-Lim audio of the same mel (``griffin-lim``, no weights), on the audio of another registry vocoder (e.g.
+    ``bigvgan-v2-ft``), or ``none`` (every frame pitch-invalid, so Revox reads the pitch from the mel). The 48 kHz
+    output is resampled to 24 kHz (the mel carries nothing above 12 kHz); ``seed`` fixes the source noise."""
+
+    num_params = 4_463_874
+
+    def __init__(self, f0: str = "griffin-lim", method: str = "dio", seed: int = 0, path: str | None = None,
+                 device: str = "cpu"):
+        """``path``: a local ``vocoder.onnx`` (default: downloaded, pinned revision); ``device``: the F0 vocoder's."""
+        import onnxruntime as ort
+
+        super().__init__()
+        self.gl, self.front = GriffinLim("bigvgan"), RevoxLogMel()
+        self.f0, self.method, self.seed = f0, method, seed
+        self.f0_vocoder = None if f0 in ("griffin-lim", "none") else load_vocoder(f0, device, backend="bigvgan")
+        if path is None:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(REVOX_REPO, "vocoder.onnx", revision=REVOX_REVISION)
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads, opts.inter_op_num_threads = torch.get_num_threads(), 1
+        self.session = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+
+    def pitch(self, log_mel: Tensor, mag: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """``f0_hz``, ``voiced``, ``pitch_valid`` ``[B, revox_frames(T)]`` from the ``f0`` source."""
+        b, k = log_mel.shape[0], revox_frames(log_mel.shape[-1])
+        if self.f0 == "none":
+            return torch.zeros(b, k), torch.zeros(b, k, dtype=torch.bool), torch.zeros(b, k, dtype=torch.bool)
+        wav = self.gl.reconstruct(mag) if self.f0_vocoder is None else self.f0_vocoder(log_mel)
+        return tuple(torch.stack(x) for x in zip(*(revox_pitch(w, 24_000, k, self.method) for w in wav)))
+
+    @torch.no_grad()
+    def generate(self, mel: Tensor, f0: Tensor, voiced: Tensor, valid: Tensor) -> Tensor:
+        """Revox inputs ``[B, 128, K]`` and ``[B, K]`` -> 48 kHz waveform ``[B, 480 K]`` (centred ISTFT)."""
+        k, wavs = mel.shape[-1], []
+        noise = torch.randn(mel.shape[0], 1, REVOX_HOP * k, generator=torch.Generator().manual_seed(self.seed))
+        for i in range(mel.shape[0]):
+            real, imag = self.session.run(None, {
+                "mel": mel[i: i + 1].float().cpu().numpy(), "f0_hz": f0[i: i + 1].float().cpu().numpy(),
+                "voiced": voiced[i: i + 1].cpu().numpy(), "pitch_valid": valid[i: i + 1].cpu().numpy(),
+                "noise": noise[i].numpy()})
+            spec = torch.complex(torch.from_numpy(real), torch.from_numpy(imag)).to(mel.device)
+            wavs.append(torch.istft(spec, REVOX_FFT, REVOX_HOP, REVOX_FFT, self.front.window, center=True,
+                                    length=REVOX_HOP * k))
+        return torch.cat(wavs)
+
+    @torch.no_grad()
+    def forward(self, log_mel: Tensor) -> Tensor:
+        """BigVGAN log-mel ``[B, 100, T]`` -> 24 kHz waveform ``[B, T * 256]``."""
+        log_mel = log_mel.float()
+        mag = self.gl.magnitude(log_mel)
+        wav = self.generate(self.front.convert(mag), *self.pitch(log_mel, mag))
+        return resample_sharp(wav, REVOX_RATE, 24_000)[..., : log_mel.shape[-1] * HOP_LENGTH]
+
+
 class Vocoder:
     """Unnormalised log-mel ``[B, 100, T]`` -> waveform ``[B, samples]`` at 24 kHz, clamped to [-1, 1].
 
-    Attributes: ``kind`` (``bigvgan`` / ``vocos`` / ``griffin-lim``), ``mel`` (the front end it expects), ``name``,
-    ``context`` (frames of context for streaming windows, ``None``: vocode each sentence whole) and ``graphs``
-    (whether fixed-size windows may run as CUDA graphs). Build one with :func:`load_vocoder`."""
+    Attributes: ``kind`` (``bigvgan`` / ``vocos`` / ``griffin-lim`` / ``revox``), ``mel`` (the front end it expects),
+    ``name``, ``context`` (frames of context for streaming windows, ``None``: vocode each sentence whole) and
+    ``graphs`` (whether fixed-size windows may run as CUDA graphs). Build one with :func:`load_vocoder`."""
 
     def __init__(self, device: str = "cuda", repo: str = VOCOS_REPO, finetuned: str | None = None,
                  backend: str = "vocos", cuda_kernel: bool = False):
@@ -247,11 +392,11 @@ class Vocoder:
 
     @property
     def graphs(self) -> bool:
-        return self.kind != "griffin-lim"
+        return self.kind not in ("griffin-lim", "revox")
 
     @property
     def num_params(self) -> int:
-        return sum(p.numel() for p in self.model.parameters())
+        return getattr(self.model, "num_params", None) or sum(p.numel() for p in self.model.parameters())
 
     @torch.no_grad()
     def __call__(self, log_mel: Tensor) -> Tensor:
@@ -319,9 +464,15 @@ def load_vocoder(spec: str | None = None, device: str = "cuda", cuda_kernel: boo
 
     Checkpoints are recognised by their keys: ``{"generator", "repo"?, "hparams"?}`` is a BigVGAN-family fine-tune,
     ``{"vocos", "init"?, "mel"?}`` a Vocos fine-tune (``mel: "bigvgan"``: trained on BigVGAN-style mels).
+    ``revox:<F0 source>[:<WORLD method>]`` sets the F0 of :class:`Revox` (non-commercial license: :data:`REVOX_CREDIT`).
     ``cuda_kernel``: BigVGAN's fused activation kernel (ignored by the others)."""
     if spec is None:
         spec = "bigvgan-v2" if backend == "bigvgan" else "vocos"
+    name, _, f0 = spec.partition(":")
+    if name in VOCODERS and VOCODERS[name].kind == "revox":
+        f0, _, method = f0.partition(":")
+        model = Revox(f0 or "griffin-lim", method or "dio", device=device)
+        return Vocoder.wrap(model.to(device), "revox", device, "bigvgan", spec, VOCODERS[name].context)
     if spec in VOCODERS:
         e = VOCODERS[spec]
         if e.kind == "griffin-lim":
