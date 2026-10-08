@@ -179,7 +179,6 @@ python scripts/bench_mlx_ttfa.py --dtype float16 --runs 10 --warmup 2 --out fp16
 python scripts/bench_mlx_ttfa.py --quantize 8 --runs 10 --warmup 2 --out q8.json
 ```
 
-Until the small vocoders are on the Hub, pass `--model /path/to/mlx` (a converted folder) to these commands.
 
 ## Reproduce latency measurements
 
