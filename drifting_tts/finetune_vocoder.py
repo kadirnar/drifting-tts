@@ -6,7 +6,9 @@ vocoder is then trained to turn the model's (smoother) mels into the real audio 
 GAN objective:
 
 - ``vocos``: fresh multi-period and multi-resolution discriminators (none were released), hinge
-  loss, feature matching and an L1 log-mel loss, after a discriminator warm-up.
+  loss, feature matching and an L1 log-mel loss, after a discriminator warm-up. A Vocos vocoder can also be
+  trained on BigVGAN mels (``vocoder.arch: vocos`` with a BigVGAN-mel TTS model): its ISTFT head then uses
+  ``same`` padding, which centres frame ``i`` on sample ``i * hop + hop / 2`` as BigVGAN's uncentred STFT does.
 - ``bigvgan``: resumes NVIDIA's released generator *and* discriminators (MPD + multi-scale sub-band
   CQT) with their AdamW states, as the official recipe does; LSGAN, feature matching and the
   multi-scale mel L1 (x15), at the learning rate where the released schedule ended.
@@ -84,12 +86,14 @@ class VocosGAN:
 
     backend, export_name = "vocos", "vocos_ft.pt"
 
-    def __init__(self, cfg, device):
+    def __init__(self, cfg, device, mel: str = "vocos"):
         from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
         from vocos.loss import DiscriminatorLoss, FeatureMatchingLoss, GeneratorLoss, MelSpecReconstructionLoss
 
-        self.cfg, tc = cfg, cfg.train
+        self.cfg, tc, self.mel = cfg, cfg.train, mel
         self.vocos = build_vocos(cfg.vocoder.init).to(device).train()
+        if mel == "bigvgan":  # F frames <-> F * hop samples, frame i centred on i * hop + hop / 2
+            self.vocos.head.istft.padding = "same"
         self.mpd, self.mrd = MultiPeriodDiscriminator().to(device), MultiResolutionDiscriminator().to(device)
         self.gen_params = list(self.vocos.backbone.parameters()) + list(self.vocos.head.parameters())
         self.opt_g = torch.optim.AdamW(self.gen_params, lr=tc.lr, betas=(0.8, 0.9))
@@ -142,7 +146,8 @@ class VocosGAN:
             getattr(self, k).load_state_dict(ck[k])
 
     def export(self, path: Path, step: int) -> None:
-        save_checkpoint(path, vocos=self.vocos.state_dict(), init=self.cfg.vocoder.init, step=step)
+        save_checkpoint(path, vocos=self.vocos.state_dict(), init=self.cfg.vocoder.init, step=step, mel=self.mel,
+                        head_padding=self.vocos.head.istft.padding)
 
 
 class BigVGANGAN:
@@ -161,7 +166,9 @@ class BigVGANGAN:
                     m.compile()
         h = self.gen.h
         self.mpd = bd.MultiPeriodDiscriminator(h).to(device)
-        self.mrd = bd.MultiScaleSubbandCQTDiscriminator(h).to(device)  # "mrd" as in the released checkpoint
+        cqt = h.get("use_cqtd_instead_of_mrd", False) or h.get("discriminator") != "mrd"
+        # stored as "mrd" in the released checkpoints: the sub-band CQT discriminator (v2) or the MRD (v1, base)
+        self.mrd = (bd.MultiScaleSubbandCQTDiscriminator(h) if cqt else bd.MultiResolutionDiscriminator(h)).to(device)
         betas = tuple(tc.get("betas", (h["adam_b1"], h["adam_b2"])))
         self.opt_g = torch.optim.AdamW(self.gen.parameters(), tc.lr, betas=betas)
         # same parameter order as the reference (CQT-D first), so its optimizer state can be loaded
@@ -258,7 +265,7 @@ def log_samples(gan, tts, batch: dict, stats: dict, tc, writer, step: int, devic
         for name, mel in (("gta", gta), ("recorded_mel", rec)):
             wav = gan.generate(mel[i: i + 1, :, :n])[0].clamp(-1, 1).float().cpu()
             writer.add_audio(f"{name}/{i}", wav, step, sample_rate=SAMPLE_RATE)
-        writer.add_audio(f"real/{i}", batch["audio"][i, : segment_samples(n, gan.backend)], step,
+        writer.add_audio(f"real/{i}", batch["audio"][i, : segment_samples(n, getattr(gan, "mel", gan.backend))], step,
                          sample_rate=SAMPLE_RATE)
 
 
@@ -276,10 +283,13 @@ def run(args) -> None:
     device = "cuda" if torch.cuda.is_available() and not tc.get("cpu", False) else "cpu"
 
     tts, tts_cfg, stats = load_tts(cfg.tts.path, device)
-    backend = stats.get("backend", "vocos")
+    backend = stats.get("backend", "vocos")  # the mel type the TTS model was trained on
     if cfg.vocoder.get("backend", backend) != backend:
-        raise ValueError(f"config asks for a {cfg.vocoder.backend} vocoder but the TTS model was trained on "
+        raise ValueError(f"config asks for {cfg.vocoder.backend} mels but the TTS model was trained on "
                          f"{backend} mels (`prepare --backend`)")
+    arch = cfg.vocoder.get("arch", backend)  # the vocoder architecture: a Vocos can also learn BigVGAN mels
+    if arch == "bigvgan" and backend != "bigvgan":
+        raise ValueError("a BigVGAN vocoder needs a TTS model trained on bigvgan mels")
     tts.requires_grad_(False)
     d = cfg.data
     ds = MelDataset(d.root, "train", min_quality=d.min_quality, min_frames=tc.segment_frames, max_frames=d.max_frames,
@@ -289,8 +299,9 @@ def run(args) -> None:
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=tc.num_workers,
                         pin_memory=True, persistent_workers=tc.num_workers > 0)
 
-    gan = (BigVGANGAN if backend == "bigvgan" else VocosGAN)(cfg, device)
-    print(f"{backend} vocoder {gan.n_gen:.1f}M, discriminators {gan.n_disc:.1f}M, {len(ds)} utterances", flush=True)
+    gan = BigVGANGAN(cfg, device) if arch == "bigvgan" else VocosGAN(cfg, device, mel=backend)
+    print(f"{arch} vocoder on {backend} mels {gan.n_gen:.1f}M, discriminators {gan.n_disc:.1f}M, "
+          f"{len(ds)} utterances", flush=True)
     writer = SummaryWriter(work / "tb")
     samples = None
     if tc.get("sample_every", 0) > 0:

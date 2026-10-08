@@ -11,8 +11,8 @@ natural log floored at 1e-5). Any vocoder trained on this mel can turn them into
 | `bigvgan-v2` | NVIDIA BigVGAN-v2, 24 kHz, 100 bands, 256x | `nvidia/bigvgan_v2_24khz_100band_256x` |
 | `bigvgan-v1` | NVIDIA BigVGAN (v1), 24 kHz, 100 bands | `nvidia/bigvgan_24khz_100band` |
 | `bigvgan-base` | NVIDIA BigVGAN-base (v1), 24 kHz, 100 bands | `nvidia/bigvgan_base_24khz_100band` |
-| `bigvgan-base-ft` | BigVGAN-base fine-tuned on this model's mels | `runs/bigvgan_base_ft/bigvgan_ft.pt` until it is on the Hub (`bigvgan_base_ft.pt`) |
-| `vocos-ft` | Vocos fine-tuned on this model's mels | `runs/vocos_bigvgan/vocos_ft.pt` until it is on the Hub (`vocos_ft.pt`) |
+| `bigvgan-base-ft` | BigVGAN-base fine-tuned on this model's mels (14 M parameters) | `Vyvo/drifting-tts-tr`, `bigvgan_base_ft.pt` |
+| `vocos-ft` | Vocos fine-tuned on this model's mels (13.5 M parameters) | `Vyvo/drifting-tts-tr`, `vocos_ft.pt` |
 | `griffin-lim` | mel filterbank inverted by non-negative least squares, then 64 iterations of fast Griffin-Lim | none |
 | `vocos` | `charactr/vocos-mel-24khz`, for models trained on Vocos's own mels | `charactr/vocos-mel-24khz` |
 
@@ -32,35 +32,38 @@ natural log floored at 1e-5). Any vocoder trained on this mel can turn them into
 
 All rows vocode the same v3.1 mels of the 495 sentences (protocol below).
 
-- **Fine-tuning matters most.** The fine-tuned BigVGAN-v2 is the most natural vocoder by a clear margin: UTMOSv2
-  2.94 and DNSMOS OVRL 3.32. The same network with NVIDIA's weights is the least natural neural vocoder on these
-  mels: UTMOSv2 2.40 and DNSMOS OVRL 2.81.
-- **WER does not rank vocoders.** Every row lies between 1.20% and 1.41% WER, and all the intervals overlap. Even
+- **Fine-tuning matters most.** The fine-tuned BigVGAN-v2 is the most natural vocoder: UTMOSv2 2.94 and DNSMOS
+  OVRL 3.32. The same network with NVIDIA's weights is the least natural neural vocoder on these mels: UTMOSv2 2.40
+  and DNSMOS OVRL 2.81.
+- **`bigvgan-base-ft` is the small vocoder to use.** Fine-tuning lifts BigVGAN-base from UTMOSv2 2.79 to 2.91 and
+  DNSMOS OVRL from 3.18 to 3.34, the highest OVRL of all rows. That is within 0.03 UTMOSv2 of `bigvgan-v2-ft` with
+  one eighth of the parameters, half the vocoder time, first audio after 7.8 ms instead of 12.4 ms, and 16 frames of
+  streaming context instead of 32.
+- **`vocos-ft` is the fastest.** Its ISTFT head makes the vocoder 20× faster than BigVGAN-v2 (RTF 0.0003), and the
+  first audio comes after 4.9 ms, most of it the acoustic model. It is less natural than the BigVGAN fine-tunes
+  (UTMOSv2 2.63, DNSMOS OVRL 3.30), with a slightly higher WER (1.56%).
+- **WER does not rank vocoders.** Every row lies between 1.20% and 1.56% WER, and the intervals overlap. Even
   Griffin-Lim reaches 1.20%: Whisper on 8 kHz band-matched audio ignores phase artefacts. UTMOSv2 and DNSMOS are what
   separate the vocoders.
-- **BigVGAN-base is the best stock choice.** At 14 M parameters, one eighth of v1, it is as natural as v1 (UTMOSv2
-  2.79 against 2.76) and more natural than stock v2. It also halves the vocoder time, and it streams with 16 frames of
-  context instead of 32. This makes it the candidate for a smaller fine-tuned vocoder (`bigvgan-base-ft`).
 - **Griffin-Lim** is intelligible, but it sounds clearly synthetic (UTMOSv2 1.77, DNSMOS P.808 3.47). It is the
   floor that needs no weights.
 - **Context.** BigVGAN-v2 needs 28 frames of context for the streamed audio to equal whole-sentence vocoding, v1 needs
-  24 and v1-base 16. The Vocos backbone sees 3 + 8 × 3 frames, plus 2 for the overlap of its ISTFT, so 29 frames are
-  exact; `tests/test_vocoder_registry.py` checks this in float64. A Vocos fine-tuned on these mels (an intermediate
-  checkpoint) passes 55 dB at 24 frames and reaches the fp32 floor at 28.
+  24 and v1-base 16; fine-tuning does not change this. The Vocos backbone sees 3 + 8 × 3 frames, plus 2 for the
+  overlap of its ISTFT, so 29 frames are exact; `tests/test_vocoder_registry.py` checks this in float64. `vocos-ft`
+  passes 55 dB at 24 frames and levels off at 81–82 dB from 28 frames on.
 
-The speed columns were measured while a vocoder fine-tune ran on the same GPU, so they are about 4× the idle values.
-Compare the rows with each other. On an idle GPU, `bigvgan-v2-ft` reaches its first audio after 12.3 ms (short
-sentence) and 13.9 ms (long sentence) ([RESULTS.md](RESULTS.md#latency-and-size)). `vocos-ft` and `bigvgan-base-ft`
-are still training, and `compare_vocoders.py` adds their rows once their checkpoints exist.
+All rows were measured on an idle GPU.
 
 <!-- vocoders:begin -->
 | vocoder | parameters | WER | CER | UTMOSv2 | DNSMOS OVRL | DNSMOS P.808 | vocoder RTF | TTFA short | TTFA long |
 |---|---|---|---|---|---|---|---|---|---|
-| `bigvgan-v2-ft` | 112.4 M | 1.23% [0.82, 1.68] | 0.24% [0.16, 0.33] | 2.935 | 3.324 | 3.960 | 0.0171 | 50.1 ms | 55.9 ms |
-| `bigvgan-v2` | 112.4 M | 1.20% [0.81, 1.65] | 0.24% [0.16, 0.34] | 2.398 | 2.810 | 3.779 | 0.0171 | 49.9 ms | 57.0 ms |
-| `bigvgan-v1` | 112.4 M | 1.36% [0.91, 1.84] | 0.26% [0.17, 0.36] | 2.756 | 3.169 | 3.962 | 0.0171 | 49.8 ms | 55.2 ms |
-| `bigvgan-base` | 14.0 M | 1.41% [0.95, 1.91] | 0.25% [0.17, 0.35] | 2.793 | 3.176 | 3.976 | 0.0088 | 36.9 ms | 43.7 ms |
-| `griffin-lim` | 0 | 1.20% [0.82, 1.63] | 0.24% [0.16, 0.34] | 1.772 | 3.127 | 3.465 | 0.0084 | 50.3 ms | 61.3 ms |
+| `bigvgan-v2-ft` | 112.4 M | 1.23% [0.82, 1.68] | 0.24% [0.16, 0.33] | 2.935 | 3.324 | 3.960 | 0.0058 | 12.4 ms | 14.0 ms |
+| `bigvgan-v2` | 112.4 M | 1.20% [0.81, 1.65] | 0.24% [0.16, 0.34] | 2.398 | 2.810 | 3.779 | 0.0058 | 12.4 ms | 14.0 ms |
+| `bigvgan-v1` | 112.4 M | 1.36% [0.91, 1.84] | 0.26% [0.17, 0.36] | 2.756 | 3.169 | 3.962 | 0.0058 | 12.2 ms | 13.7 ms |
+| `bigvgan-base-ft` | 14.0 M | 1.33% [0.90, 1.80] | 0.26% [0.17, 0.36] | 2.906 | 3.335 | 3.959 | 0.0031 | 7.8 ms | 9.4 ms |
+| `bigvgan-base` | 14.0 M | 1.41% [0.95, 1.91] | 0.25% [0.17, 0.35] | 2.793 | 3.176 | 3.976 | 0.0032 | 7.8 ms | 9.4 ms |
+| `vocos-ft` | 13.5 M | 1.56% [1.13, 2.05] | 0.29% [0.21, 0.38] | 2.627 | 3.302 | 3.887 | 0.0003 | 4.9 ms | 6.4 ms |
+| `griffin-lim` | 0 | 1.20% [0.82, 1.63] | 0.24% [0.16, 0.34] | 1.772 | 3.127 | 3.465 | 0.0038 | 14.8 ms | 17.3 ms |
 
 Streamed against whole-sentence audio, SNR in dB (full fp32), by context in frames on each side of a window:
 
@@ -69,14 +72,18 @@ Streamed against whole-sentence audio, SNR in dB (full fp32), by context in fram
 | `bigvgan-v2-ft` | 3.9 | 6.6 | 10.4 | 17.3 | 25.7 | 43.3 | 82.2 | 97.6 | 98.4 | 98.9 | 98.9 | 98.1 | 24 | 28 | **32** |
 | `bigvgan-v2` | 6.4 | 11.2 | 16.2 | 22.8 | 34.0 | 48.4 | 72.9 | 96.0 | 95.8 | 96.6 | 96.3 | 96.1 | 24 | 28 | **32** |
 | `bigvgan-v1` | 5.5 | 8.8 | 16.4 | 24.1 | 38.0 | 58.7 | 94.2 | 99.3 | 100.1 | 100.2 | 99.5 | 100.0 | 20 | 24 | **24** |
+| `bigvgan-base-ft` | 5.8 | 10.3 | 21.6 | 74.0 | 92.5 | 92.4 | 92.6 | 92.6 | 92.6 | 92.5 | 92.4 | 92.4 | 12 | 16 | **16** |
 | `bigvgan-base` | 6.2 | 10.2 | 21.7 | 77.2 | 93.8 | 93.5 | 93.8 | 93.5 | 93.7 | 93.6 | 93.8 | 93.9 | 12 | 16 | **16** |
+| `vocos-ft` | 2.4 | 5.0 | 8.3 | 13.9 | 20.9 | 35.6 | 62.2 | 82.4 | 80.9 | 81.1 | 81.7 | 81.3 | 24 | – | **32** |
 
 | vocoder | kind | streaming | BigVGAN CUDA kernel | CUDA graphs (`fast=True`) |
 |---|---|---|---|---|
 | `bigvgan-v2-ft` | bigvgan | 32 frames of context | yes | yes |
 | `bigvgan-v2` | bigvgan | 32 frames of context | yes | yes |
 | `bigvgan-v1` | bigvgan | 24 frames of context | yes | yes |
+| `bigvgan-base-ft` | bigvgan | 16 frames of context | yes | yes |
 | `bigvgan-base` | bigvgan | 16 frames of context | yes | yes |
+| `vocos-ft` | vocos | 32 frames of context | – | yes |
 | `griffin-lim` | griffin-lim | one piece per sentence | – | no (eager) |
 <!-- vocoders:end -->
 
