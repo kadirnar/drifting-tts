@@ -1,0 +1,18 @@
+# The v3 recipe in the latent space of a pretrained audio VAE (issue #17, the paper's latent setting): the model
+# generates VAE latents and the VAE decoder replaces the vocoder. Data from `drifting-tts extract-latents`
+# (latents repeated 4x to 100 frames per second), kernel features from a latent MAE (configs/mae_latent.yaml).
+base: tts_v3.yaml
+
+data:
+  root: data/train_voxcpm2
+
+mae:
+  path: runs/mae_voxcpm2/mae_ema.pt
+
+model:
+  gen:
+    patch: 4               # one generator token per VAE frame (the 4 repeats of a 25 Hz latent)
+
+drift:
+  spectral_detail: false   # harmonic-contrast features are defined on mel bins, not on latent channels
+  crop_frames: 256         # 2.56 s at 100 frames per second (64 latent frames)

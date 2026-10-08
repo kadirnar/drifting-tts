@@ -15,8 +15,9 @@ from __future__ import annotations
 from .base import AudioBackend, LatentStats, resample, stream_decode
 
 BACKENDS = ("bigvgan", "dacvae", "voxcpm2", "voxcpm1.5")
+VAE_BACKENDS = ("dacvae", "voxcpm2", "voxcpm1.5")  # the TTS model can be trained on these (`extract-latents`)
 
-__all__ = ["BACKENDS", "AudioBackend", "LatentStats", "load_backend", "resample", "stream_decode"]
+__all__ = ["BACKENDS", "VAE_BACKENDS", "AudioBackend", "LatentStats", "load_backend", "resample", "stream_decode"]
 
 
 def load_backend(name: str, device: str = "cuda", **kwargs) -> AudioBackend:

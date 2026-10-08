@@ -14,6 +14,7 @@ import torch
 
 from .audio import SAMPLE_RATE
 from .data import MelStats
+from .latents import VAE_BACKENDS
 from .text import normalize, split_sentences, text_to_ids  # noqa: F401 (split_sentences re-exported)
 from .voices import DEFAULT_VOICE, VOICES, voice_id
 
@@ -76,11 +77,16 @@ class Synthesizer:
 
         self.model, self.cfg, stats = load_tts(model_path, device)
         self.stats = MelStats(stats["mean"], stats["std"])
-        backend = stats.get("backend", "vocos")
-        self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=backend)
-        if self.vocoder.mel != backend:
+        self.backend = stats.get("backend", "vocos")
+        if self.backend in VAE_BACKENDS:  # a model trained on VAE latents: the VAE decoder is the vocoder
+            from .latents.vocoder import LatentVocoder
+
+            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1))
+        else:
+            self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=self.backend)
+        if self.vocoder.mel != self.backend:
             raise ValueError(f"vocoder {self.vocoder.name!r} expects {self.vocoder.mel} mels, but the model produces "
-                             f"{backend} mels")
+                             f"{self.backend} mels")
         self.device = device
         self.default_temperature = preferred_temperature(self.model)
         spk_file = Path(self.cfg.data.root) / "speakers.json"
