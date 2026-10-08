@@ -6,8 +6,9 @@ non-commercial use only. Its weights are downloaded at runtime and never stored 
 
 * ``convert``: the Revox mel converted from the recording's BigVGAN mel against the Revox mel of the recording
   upsampled to 48 kHz, in dB below 11.5 kHz, with linear- and log-domain time interpolation.
-* ``f0``: WORLD dio / harvest on the Griffin-Lim and BigVGAN-v2-ft audio of the mel against harvest on the recording:
-  voicing decision error (VDE), gross pitch error (GPE, > 20%), fine pitch error (cents RMS), and their cost.
+* ``f0``: WORLD dio / harvest on the Griffin-Lim and BigVGAN-v2-ft audio of the mel, as the ``revox`` vocoder runs it
+  (``revox_pitch``), against the recording on the frames where harvest and dio agree: voicing decision error (VDE),
+  gross pitch error (GPE, > 20%), fine pitch error (cents RMS).
 * ``quality``: copy-synthesis rows scored by ``resynthesis_benchmark.score`` (same utterances, judges and columns),
   plus the share of energy above 12 kHz and the output's F0 against the recording's.
 * ``speed``: real-time factor of each stage of the ``revox`` registry entry (GPU for the torch stages, ONNX Runtime
@@ -41,6 +42,7 @@ from drifting_tts.vocoder import (
     load_vocoder,
     resample_sharp,
     revox_frames,
+    revox_pitch,
     to_revox_frames,
 )
 
@@ -53,14 +55,19 @@ def sync() -> None:
         torch.cuda.synchronize()
 
 
-def f0_job(job: tuple[np.ndarray, int, str]) -> np.ndarray:
-    return world_f0(*job[:2], PERIOD, job[2]).astype(np.float32)
+def f0_job(job: tuple[np.ndarray, int, str, int, bool]) -> np.ndarray:
+    wav, sr, method, frames, source = job
+    if source:
+        return revox_pitch(torch.from_numpy(wav), sr, frames, method)[0].numpy()
+    f0 = world_f0(wav, sr, PERIOD, method).astype(np.float32)[:frames]
+    return np.pad(f0, (0, frames - len(f0)))
 
 
-def f0_all(pool, wavs: list[torch.Tensor], frames: list[int], method: str, sr: int = SAMPLE_RATE) -> list[np.ndarray]:
-    """WORLD F0 at Revox's frame centres for each waveform (``frames`` each, 0: unvoiced)."""
-    outs = pool.map(f0_job, [(w.double().cpu().numpy(), sr, method) for w in wavs])
-    return [np.pad(f[:k], (0, max(0, k - len(f)))) for f, k in zip(outs, frames)]
+def f0_all(pool, wavs: list[torch.Tensor], frames: list[int], method: str, source: bool = False,
+           sr: int = SAMPLE_RATE) -> list[np.ndarray]:
+    """WORLD F0 at Revox's frame centres (``frames`` each, 0: unvoiced): as the ``revox`` vocoder computes it
+    (``source``), else plain WORLD."""
+    return list(pool.map(f0_job, [(w.double().cpu().numpy(), sr, method, k, source) for w, k in zip(wavs, frames)]))
 
 
 def f0_reference(harvest: list[np.ndarray], dio: list[np.ndarray]) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -203,7 +210,7 @@ def main() -> None:
         res["f0"] = {}
         for src, ws in (("griffin-lim", gl_wavs), (args.vocoder, voc_wavs)):
             for method in ("dio", "harvest"):
-                res["f0"][f"{src}/{method}"] = e = f0_errors(ref, f0_all(pool, ws, frames, method))
+                res["f0"][f"{src}/{method}"] = e = f0_errors(ref, f0_all(pool, ws, frames, method, True))
                 print("f0", src, method, json.dumps(e), flush=True)
         save()
 
@@ -219,7 +226,7 @@ def main() -> None:
         for src, ws in (("griffin-lim", gl_wavs), (args.vocoder, voc_wavs)):
             for method in args.f0_methods:
                 systems[f"revox: converted mel, {src} F0 ({method})"] = [
-                    run(c, f) for c, f in zip(conv, f0_all(pool, ws, frames, method))]
+                    run(c, f) for c, f in zip(conv, f0_all(pool, ws, frames, method, True))]
         off = [torch.zeros(1, k, dtype=torch.bool) for k in frames]
         systems["revox: converted mel, no F0"] = [run(c, np.zeros(k, np.float32), o, o)
                                                   for c, k, o in zip(conv, frames, off)]
@@ -250,8 +257,8 @@ def main() -> None:
             g = timed(lambda m=m: rv.gl.magnitude(m), t, "nnls")
             c = timed(lambda g=g: rv.front.convert(g), t, "mel conversion")
             y = timed(lambda g=g: rv.gl.reconstruct(g), t, "griffin-lim audio")
-            timed(lambda y=y: world_f0(y[0].double().cpu().numpy(), SAMPLE_RATE, PERIOD, "dio"), t, "dio")
-            timed(lambda y=y: world_f0(y[0].double().cpu().numpy(), SAMPLE_RATE, PERIOD, "harvest"), t, "harvest")
+            timed(lambda y=y, c=c: revox_pitch(y[0], SAMPLE_RATE, c.shape[-1], "dio"), t, "dio")
+            timed(lambda y=y, c=c: revox_pitch(y[0], SAMPLE_RATE, c.shape[-1], "harvest"), t, "harvest")
             timed(lambda m=m: voc(m), t, args.vocoder)
             k = c.shape[-1]
             f0, vv = torch.full((1, k), 120.0), torch.ones(1, k, dtype=torch.bool)

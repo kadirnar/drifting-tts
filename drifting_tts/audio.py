@@ -132,15 +132,18 @@ def extract_f0(wav: torch.Tensor | np.ndarray, frames: int, sample_rate: int = S
     return out
 
 
-def world_f0(wav: torch.Tensor | np.ndarray, sample_rate: int, frame_period: float, method: str = "dio") -> np.ndarray:
-    """WORLD F0 in Hz (60-800 Hz, 0: unvoiced) at ``k * frame_period`` ms, ``k = 0, 1, ...`` (:func:`extract_f0`)."""
+def world_f0(wav: torch.Tensor | np.ndarray, sample_rate: int, frame_period: float, method: str = "dio",
+             allowed_range: float = 0.1) -> np.ndarray:
+    """WORLD F0 in Hz (60-800 Hz, 0: unvoiced) at ``k * frame_period`` ms, ``k = 0, 1, ...`` (:func:`extract_f0`).
+    ``allowed_range``: dio's voicing threshold (larger: more frames voiced)."""
     import pyworld
 
     x = np.asarray(wav, dtype=np.float64)
     if method == "harvest":
         f0, _ = pyworld.harvest(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=frame_period)
     elif method == "dio":
-        f0, t = pyworld.dio(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=frame_period)
+        f0, t = pyworld.dio(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=frame_period,
+                            allowed_range=allowed_range)
         f0 = pyworld.stonemask(x, f0, t, sample_rate)
     else:
         raise ValueError(f"unknown F0 method {method!r}")

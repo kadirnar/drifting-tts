@@ -289,11 +289,14 @@ class RevoxLogMel(torch.nn.Module):
 
 def revox_pitch(wav: Tensor, sample_rate: int, frames: int, method: str = "dio") -> tuple[Tensor, Tensor, Tensor]:
     """``f0_hz``, ``voiced``, ``pitch_valid`` (``[frames]`` each) from WORLD on ``wav`` ``[samples]``, at Revox's
-    frame centres ``k * 10`` ms. WORLD's unvoiced frames are reliable unvoiced decisions (``pitch_valid``)."""
+    frame centres ``k * 10`` ms. WORLD's unvoiced frames are reliable unvoiced decisions (``pitch_valid``). dio runs
+    with a looser voicing threshold (``allowed_range`` 0.2): Revox cannot voice a frame without F0, and dio's default
+    misses voiced frames of Griffin-Lim audio (docs/VOCODERS.md)."""
     from .audio import world_f0
 
     f0 = torch.zeros(frames)
-    raw = torch.from_numpy(world_f0(wav.double().cpu().numpy(), sample_rate, 1000 * REVOX_HOP / REVOX_RATE, method))
+    raw = torch.from_numpy(world_f0(wav.double().cpu().numpy(), sample_rate, 1000 * REVOX_HOP / REVOX_RATE, method,
+                                    allowed_range=0.2))
     f0[: min(frames, len(raw))] = raw[:frames].float()
     return f0, f0 > 0, torch.ones(frames, dtype=torch.bool)
 

@@ -20,6 +20,7 @@ from drifting_tts.vocoder import (
     ola_istft,
     resample_sharp,
     revox_frames,
+    revox_pitch,
     to_revox_frames,
 )
 
@@ -251,6 +252,15 @@ def test_revox_mel_conversion_matches_upsampled_audio():
     assert mae < 0.5 and abs(bias) < 0.2
     mae, bias = error_db(front.convert(gl.magnitude(BigVGANLogMel()(x))))  # through our mel and NNLS
     assert mae < 2.0 and abs(bias) < 0.5
+
+
+@pytest.mark.parametrize("method", ["dio", "harvest"])
+def test_revox_pitch(method):
+    x = _harmonic(glide=0.0)[0]
+    k = revox_frames(x.numel() // HOP_LENGTH)
+    f0, voiced, valid = revox_pitch(x, 24_000, k, method)
+    assert f0.shape == voiced.shape == valid.shape == (k,) and valid.all() and torch.equal(voiced, f0 > 0)
+    assert voiced[5:-5].all() and abs(float(f0[voiced].median()) / 140 - 1) < 0.02
 
 
 def _revox_cached() -> bool:
