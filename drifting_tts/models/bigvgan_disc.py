@@ -1,8 +1,9 @@
 """BigVGAN-v2 discriminators and losses, ported from NVIDIA/BigVGAN (MIT): ``discriminators.py`` / ``loss.py``.
 
 The released ``bigvgan_discriminator_optimizer.pt`` stores a multi-period discriminator (``mpd``) and, under the
-key ``mrd``, the multi-scale sub-band CQT discriminator. Module names and the (old-style) weight norm match the
-reference, so those state dicts load with ``strict=True``. The CQT front end needs ``nnAudio``.
+key ``mrd``, the multi-scale sub-band CQT discriminator (v2) or the multi-resolution discriminator (v1 and
+BigVGAN-base, ``"discriminator": "mrd"`` in their ``config.json``). Module names and the (old-style) weight norm match
+the reference, so those state dicts load with ``strict=True``. The CQT front end needs ``nnAudio``.
 """
 
 from __future__ import annotations
@@ -115,6 +116,45 @@ class MultiScaleSubbandCQTDiscriminator(nn.Module):
              "cqtd_bins_per_octaves": [24, 36, 48], **h}
         self.discriminators = nn.ModuleList([DiscriminatorCQT(h, hop, n, b) for hop, n, b in zip(
             h["cqtd_hop_lengths"], h["cqtd_n_octaves"], h["cqtd_bins_per_octaves"])])
+
+    def forward(self, y: Tensor, y_hat: Tensor) -> Outputs:
+        return _run(self.discriminators, y, y_hat)
+
+
+class DiscriminatorR(nn.Module):
+    """Magnitude-spectrogram discriminator at one STFT resolution ``(n_fft, hop, win)`` (BigVGAN v1, UniVNet)."""
+
+    def __init__(self, resolution: list[int], mult: float = 1.0):
+        super().__init__()
+        self.resolution = resolution
+        c = int(32 * mult)
+        self.convs = nn.ModuleList([_wn(nn.Conv2d(1, c, (3, 9), padding=(1, 4)))]
+                                   + [_wn(nn.Conv2d(c, c, (3, 9), stride=(1, 2), padding=(1, 4))) for _ in range(3)]
+                                   + [_wn(nn.Conv2d(c, c, (3, 3), padding=(1, 1)))])
+        self.conv_post = _wn(nn.Conv2d(c, 1, (3, 3), padding=(1, 1)))
+
+    def spectrogram(self, x: Tensor) -> Tensor:
+        n_fft, hop, win = self.resolution
+        x = F.pad(x, ((n_fft - hop) // 2, (n_fft - hop) // 2), mode="reflect").squeeze(1)
+        # no window argument: a rectangular window, as in the reference
+        return torch.stft(x, n_fft, hop, win, center=False, return_complex=True).abs()
+
+    def forward(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
+        fmap = []
+        x = self.spectrogram(x)[:, None]
+        for conv in self.convs:
+            x = F.leaky_relu(conv(x), 0.1)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        return torch.flatten(x, 1, -1), fmap
+
+
+class MultiResolutionDiscriminator(nn.Module):
+    def __init__(self, h: dict):
+        super().__init__()
+        mult = h.get("mrd_channel_mult", h.get("discriminator_channel_mult", 1))
+        self.discriminators = nn.ModuleList([DiscriminatorR(r, mult) for r in h["resolutions"]])
 
     def forward(self, y: Tensor, y_hat: Tensor) -> Outputs:
         return _run(self.discriminators, y, y_hat)
