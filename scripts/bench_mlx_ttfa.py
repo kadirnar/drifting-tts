@@ -2,6 +2,7 @@
 
     python scripts/bench_mlx_ttfa.py --model /path/to/mlx --out mlx_latency.json
     python scripts/bench_mlx_ttfa.py --mode buffered --no-compile --runs 10
+    python scripts/bench_mlx_ttfa.py --vocoder vocos-ft --out vocos.json      # a small vocoder
 
 Run each configuration in a fresh process. Model resolution/download and materialized weight loading are reported
 separately. The first inference has no synthesis warm-up; it is process-cold, not a claim about OS disk/Metal caches.
@@ -40,7 +41,7 @@ TEXTS = {
 
 def run(synth, text: str, *, mode: str, chunk_frames: int, first_chunk_frames: int, seed: int,
         synchronize: Callable[[], None], options: dict, reset_peak: Callable[[], None] | None = None,
-        memory_metrics: Callable[[], dict] | None = None) -> dict:
+        memory_metrics: Callable[[], dict] | None = None, stream_options: dict | None = None) -> dict:
     """Time the consumer boundary; NumPy conversion forces MLX's lazy work to complete before first audio."""
     synchronize()
     if reset_peak is not None:
@@ -48,7 +49,7 @@ def run(synth, text: str, *, mode: str, chunk_frames: int, first_chunk_frames: i
     start = time.perf_counter()
     if mode == "stream":
         chunks = synth.stream(text, chunk_frames=chunk_frames, first_chunk_frames=first_chunk_frames,
-                              seed=seed, **options)
+                              seed=seed, **options, **(stream_options or {}))
     else:
         chunks = (synth(text, seed=seed, **options),)
     ttfa = None
@@ -152,7 +153,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-limit-mb", type=int, default=256,
                    help="MLX device cache limit in MiB for this dedicated benchmark process (default: 256)")
     p.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32",
-                   help="acoustic compute dtype; vocoder remains float32")
+                   help="DiT compute dtype; the text encoder and the vocoder remain float32")
+    p.add_argument("--vocoder", default=None, help="bigvgan-v2-ft (default), bigvgan-base-ft, vocos-ft or a file")
+    p.add_argument("--quantize", type=int, choices=(4, 8), default=None, help="quantised DiT weights")
+    p.add_argument("--fused-activations", action="store_true", help="BigVGAN activations as Metal kernels")
+    p.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True,
+                   help="queue the next stream chunk before copying the current one to the host")
     p.add_argument("--runs", type=int, default=10, help="measured warm runs per input")
     p.add_argument("--warmup", type=int, default=2, help="untimed warm-up runs per input after its first run")
     p.add_argument("--text", action="append", help="custom input, repeatable; otherwise use three built-in inputs")
@@ -195,13 +201,26 @@ def main(argv: list[str] | None = None) -> None:
     if model_path is None:
         from huggingface_hub import snapshot_download
 
-        model_path = Path(snapshot_download(args.repo, revision=args.revision,
-                                          allow_patterns=["mlx/config.json", "mlx/*.safetensors"])) / "mlx"
+        try:  # only the chosen vocoder's file
+            from drifting_tts.mlx.vocoder import DEFAULT_VOCODER, VOCODERS
+
+            weights = ["model.safetensors", VOCODERS.get(args.vocoder or DEFAULT_VOCODER, "")]
+        except ImportError:  # a checkout before the vocoder registry
+            weights = ["*.safetensors"]
+        model_path = Path(snapshot_download(args.repo, revision=args.revision, allow_patterns=[
+            f"mlx/{f}" for f in ["config.json", *weights] if f])) / "mlx"
     resolve_seconds = time.perf_counter() - start
     constructor = {"dtype": getattr(mx, args.dtype)}
-    supports_compile = "compile" in inspect.signature(Synthesizer.__init__).parameters
-    if supports_compile:
-        constructor["compile"] = args.compile
+    supported = inspect.signature(Synthesizer.__init__).parameters
+    supports_compile = "compile" in supported
+    for name, value in (("compile", args.compile), ("vocoder", args.vocoder), ("quantize", args.quantize),
+                        ("fused_activations", args.fused_activations)):
+        if name in supported:
+            constructor[name] = value
+        elif value:
+            p.error(f"this checkout's Synthesizer has no {name!r} option")
+    prefetch_supported = "prefetch" in inspect.signature(Synthesizer.stream).parameters
+    stream_options = {"prefetch": args.prefetch} if prefetch_supported else {}
     start = time.perf_counter()
     mx.reset_peak_memory()
     synth = Synthesizer(model_path, **constructor)
@@ -213,10 +232,13 @@ def main(argv: list[str] | None = None) -> None:
                "length_scale": args.length_scale, "pause": args.pause}
     call_options = {"mode": args.mode, "chunk_frames": args.chunk_frames, "first_chunk_frames": args.first_chunk_frames,
                     "synchronize": mx.synchronize, "options": options,
-                    "reset_peak": mx.reset_peak_memory, "memory_metrics": memory_metrics}
+                    "reset_peak": mx.reset_peak_memory, "memory_metrics": memory_metrics,
+                    "stream_options": stream_options}
     result = {"schema_version": 1, "provenance": provenance(model_path, mx),
               "settings": {"mode": args.mode, "compile": args.compile if supports_compile else False,
                            "compile_supported": supports_compile, "dtype": args.dtype,
+                           "vocoder": args.vocoder, "quantize": args.quantize,
+                           "fused_activations": args.fused_activations, **stream_options,
                            "cache_limit_bytes": args.cache_limit_mb * 1024 * 1024,
                            "previous_cache_limit_bytes": previous_cache_limit,
                            "chunk_frames": args.chunk_frames if args.mode == "stream" else None,

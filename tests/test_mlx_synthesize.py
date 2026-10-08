@@ -11,7 +11,9 @@ from mlx.utils import tree_flatten  # noqa: E402
 
 from drifting_tts.mlx.bigvgan import BigVGAN  # noqa: E402
 from drifting_tts.mlx.model import DriftingTTS  # noqa: E402
-from drifting_tts.mlx.synthesize import Synthesizer  # noqa: E402
+from drifting_tts.mlx.synthesize import Synthesizer, quantize_acoustic  # noqa: E402
+from drifting_tts.mlx.vocoder import save_vocoder  # noqa: E402
+from drifting_tts.mlx.vocos import Vocos  # noqa: E402
 from drifting_tts.text import SYMBOLS, normalize, split_sentences, text_to_ids  # noqa: E402
 
 MODEL = {
@@ -25,6 +27,7 @@ VOCODER = {
     "resblock": "1", "resblock_kernel_sizes": [3], "resblock_dilation_sizes": [[1, 3]],
     "activation": "snakebeta", "snake_logscale": True, "use_tanh_at_final": False, "use_bias_at_final": False,
 }
+VOCOS = {"input_channels": 4, "dim": 8, "intermediate_dim": 16, "num_layers": 2, "n_fft": 16, "hop_length": 4}
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +44,8 @@ def checkpoint(tmp_path_factory):
         vocoder = BigVGAN(VOCODER)
         mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
         mx.save_safetensors(str(path / "vocoder.safetensors"), dict(tree_flatten(vocoder.parameters())))
+        save_vocoder(path / "vocos_ft.safetensors", dict(tree_flatten(Vocos(VOCOS).parameters())), "vocos", VOCOS,
+                     fp16=True)
         config = {
             "model": MODEL, "vocoder": VOCODER, "num_speakers": 2, "n_vocab": len(SYMBOLS), "n_mels": 4,
             "sample_rate": 24_000, "voices": {"studio": 0, "female": 1}, "default_voice": "studio",
@@ -131,7 +136,9 @@ def test_invalid_stream_parameters(synth, kwargs):
         list(synth.stream("Merhaba.", **kwargs))
 
 
-def test_first_next_decodes_only_the_first_audio_chunk(synth, monkeypatch):
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_first_next_decodes_only_the_first_audio_chunk(synth, monkeypatch, prefetch):
+    """Without prefetching, the first ``next()`` decodes one window; with it, the second is also queued."""
     encoded, decoded = [], []
     encode, vocode = synth._encode, synth._vocode
 
@@ -145,21 +152,30 @@ def test_first_next_decodes_only_the_first_audio_chunk(synth, monkeypatch):
 
     monkeypatch.setattr(synth, "_encode", record_encode)
     monkeypatch.setattr(synth, "_vocode", record_vocode)
-    stream = synth.stream("Merhaba dünya. Nasılsın?", chunk_frames=11, first_chunk_frames=3)
+    stream = synth.stream("Merhaba dünya. Nasılsın?", chunk_frames=11, first_chunk_frames=3, prefetch=prefetch)
     assert not encoded and not decoded
     audio, first = next(stream)
     total_frames = 2 * len(text_to_ids("merhaba dünya.", normalized=True))
-    assert len(encoded) == len(decoded) == 1
-    assert decoded == [3 + synth.vocoder.context_frames]
+    context = synth.vocoder.context_frames
+    assert len(encoded) == 1 and len(decoded) == 1 + prefetch
+    assert decoded[0] == 3 + context and decoded[1:] == [min(total_frames, 3 + 11 + context)][:prefetch]
     assert decoded[0] < total_frames and len(audio) == 3 * synth.vocoder.hop_length
     assert first["sentence_index"] == first["chunk_index"] == 0
     assert 0 < first["ttfa_seconds"] <= first["elapsed_seconds"]
     audio, second = next(stream)
-    assert len(encoded) == 1 and len(decoded) == 2
+    assert len(encoded) == 1 and len(decoded) == 2 + prefetch
     assert len(audio) == 11 * synth.vocoder.hop_length
     assert second["chunk_index"] == 1 and second["acoustic_seconds"] == 0
     assert second["ttfa_seconds"] == first["ttfa_seconds"]
     stream.close()
+
+
+@pytest.mark.parametrize("chunk_frames", [1, 11])
+def test_prefetch_does_not_change_the_audio(synth, chunk_frames):
+    text, kwargs = "Merhaba dünya. Nasılsın?", {"seed": 5, "chunk_frames": chunk_frames, "first_chunk_frames": 2}
+    eager = [audio for audio, _ in synth.stream(text, prefetch=False, **kwargs)]
+    queued = [audio for audio, _ in synth.stream(text, prefetch=True, **kwargs)]
+    assert len(eager) == len(queued) and all(np.array_equal(a, b) for a, b in zip(eager, queued))
 
 
 def test_default_temperature_and_duration_scaling(synth):
@@ -181,3 +197,59 @@ def test_compiled_synthesis_matches_eager_with_pitch_and_shape_changes(checkpoin
         streamed = np.concatenate([audio for audio, _ in compiled.stream(text, chunk_frames=11, **kwargs)])
         np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-4)
         np.testing.assert_allclose(streamed, expected, atol=2e-5, rtol=2e-4)
+
+
+def test_vocos_vocoder_streams_exactly(checkpoint):
+    synth = Synthesizer(checkpoint, vocoder="vocos-ft")
+    assert synth.vocoder.kind == "vocos" and synth.vocoder_name == "vocos-ft" and synth.vocoder.hop_length == 4
+    text, kwargs = "Merhaba dünya. Nasılsın?", {"seed": 3, "speaker": "female"}
+    expected, _ = synth(text, **kwargs)
+    chunks = list(synth.stream(text, chunk_frames=5, first_chunk_frames=2, **kwargs))
+    assert len(chunks) > 4
+    np.testing.assert_allclose(np.concatenate([a for a, _ in chunks]), expected, atol=2e-6, rtol=2e-5)
+    words = sum(len(text_to_ids(s, normalized=True)) for s in split_sentences(normalize(text)))
+    assert len(expected) == 2 * words * 4 + int(0.15 * 24_000)
+
+
+def test_from_pretrained_downloads_only_the_chosen_vocoder(checkpoint, monkeypatch):
+    import huggingface_hub
+
+    patterns = []
+
+    def fake_download(repo, allow_patterns, revision=None):
+        patterns.append(sorted(allow_patterns))
+        return str(checkpoint.parent / "repo")
+
+    (checkpoint.parent / "repo").mkdir(exist_ok=True)
+    if not (checkpoint.parent / "repo" / "mlx").exists():
+        (checkpoint.parent / "repo" / "mlx").symlink_to(checkpoint)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
+    assert Synthesizer.from_pretrained().vocoder.kind == "bigvgan"
+    assert Synthesizer.from_pretrained(vocoder="vocos-ft").vocoder.kind == "vocos"
+    assert patterns == [["mlx/config.json", "mlx/model.safetensors", "mlx/vocoder.safetensors"],
+                        ["mlx/config.json", "mlx/model.safetensors", "mlx/vocos_ft.safetensors"]]
+
+
+def test_quantized_dit_runs_and_stays_close(checkpoint):
+    model = DriftingTTS({**MODEL, "gen": {**MODEL["gen"], "hidden": 32}}, num_speakers=2, n_vocab=len(SYMBOLS),
+                        n_mels=4)
+    x, cond = mx.random.normal((1, 9, 4), key=mx.random.key(0)), mx.random.normal((1, 9, 12), key=mx.random.key(1))
+    args = (x, cond, mx.array([1]), mx.array([2.0]), mx.array([[0, 1]]))
+    ref = np.array(model.generate(*args))
+    quantize_acoustic(model, 8)
+    kinds = {type(m).__name__ for name, m in model.generator.named_modules() if name.startswith("blocks.")}
+    assert "QuantizedLinear" in kinds and "Linear" not in kinds
+    assert type(model.generator.in_proj).__name__ == "Linear"  # outside the blocks: unchanged
+    out = np.array(model.generate(*args))
+    assert np.abs(out - ref).max() < 0.05 * np.abs(ref).max()
+    synth = Synthesizer(checkpoint, quantize=8)
+    assert np.isfinite(synth("Merhaba.")[0]).all()
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_low_precision_dit_keeps_durations(checkpoint, synth, dtype):
+    low = Synthesizer(checkpoint, dtype=getattr(mx, dtype))
+    assert low.model.encoder.emb.weight.dtype == mx.float32
+    assert low.model.generator.in_proj.weight.dtype == getattr(mx, dtype)
+    text = "Merhaba dünya. Nasılsın?"
+    assert len(low(text, seed=1)[0]) == len(synth(text, seed=1)[0])

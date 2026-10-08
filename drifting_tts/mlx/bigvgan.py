@@ -1,4 +1,5 @@
-"""BigVGAN-v2 generator (NVIDIA, MIT) in MLX for inference: weight norm removed, channels-last internally."""
+"""BigVGAN generators (NVIDIA, MIT; v2 and the v1 base) in MLX for inference: weight norm removed, channels-last
+internally."""
 
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ def vocoder_context_frames(hparams: dict) -> int:
     Trace one complete output hop backwards through the network. Each anti-aliased activation has
     radius five; residual branches contribute the largest summed radius. Transposed convolutions
     map an output interval to input indices with integer ceil/floor, preserving all output phases.
-    The standard 24 kHz / 256x BigVGAN-v2 needs 38 mel frames on either side.
+    The 24 kHz / 256x BigVGAN-v2 needs 38 mel frames on either side, BigVGAN-base 18.
     """
     rates, kernels = hparams["upsample_rates"], hparams["upsample_kernel_sizes"]
     if len(rates) != len(kernels) or any((k - u) % 2 for u, k in zip(rates, kernels)):
@@ -79,6 +80,55 @@ def _downsample(*z: mx.array) -> mx.array:
     return sum(w * v for w, v in zip(_DOWN, z))
 
 
+def _floats(name: str, values) -> str:
+    return f"constant float {name}[{len(values)}] = {{{', '.join(f'{float(v):.9g}f' for v in values)}}};"
+
+
+# The same activation as one Metal kernel (opt-in, needs validation on a Mac): output t of channel c is
+# sum_k F[k] * snake(u[clamp(2t + k - 5)]) over the 2x upsampled signal u, whose even / odd samples are 6-tap filters
+# of the edge-padded input. Each thread recomputes the 12 upsampled values it needs instead of materialising the 2x
+# signal and its padded phases, so the input is read and the output written once.
+_ACTIVATION_HEADER = "\n".join([_floats("UP_EVEN", _UP_EVEN), _floats("UP_ODD", _UP_ODD), _floats("DOWN_F", _F)])
+_ACTIVATION_SOURCE = """
+    uint c = thread_position_in_grid.x, t = thread_position_in_grid.y, b = thread_position_in_grid.z;
+    int n = x_shape[1], ch = x_shape[2];
+    if ((int)c >= ch || (int)t >= n) return;
+    const device T* xb = x + (size_t)b * n * ch + c;
+    float a = alpha[c], ib = inv_beta[c], acc = 0.0f;
+    for (int k = 0; k < 12; ++k) {
+        int m = clamp(2 * (int)t + k - 5, 0, 2 * n - 1), j = m >> 1;
+        float u = 0.0f;
+        if (m & 1) {
+            for (int r = 0; r < 6; ++r) u += UP_ODD[r] * (float)xb[(size_t)clamp(j + r - 2, 0, n - 1) * ch];
+        } else {
+            for (int r = 0; r < 6; ++r) u += UP_EVEN[r] * (float)xb[(size_t)clamp(j + r - 3, 0, n - 1) * ch];
+        }
+        float s = metal::precise::sin(u * a);
+        acc += DOWN_F[k] * (u + ib * s * s);
+    }
+    out[((size_t)b * n + t) * ch + c] = (T)acc;
+"""
+_activation_kernel = None
+
+
+def fused_activation_available() -> bool:
+    """Whether :func:`fused_activation` can run: a Metal GPU is the default device."""
+    return mx.default_device().type == mx.gpu and mx.metal.is_available()
+
+
+def fused_activation(x: mx.array, alpha: mx.array, inv_beta: mx.array) -> mx.array:
+    """:class:`Activation1d` on ``[B, T, C]`` as a single Metal kernel (see ``_ACTIVATION_SOURCE``)."""
+    global _activation_kernel
+    if _activation_kernel is None:
+        _activation_kernel = mx.fast.metal_kernel(name="drifting_aa_snake", input_names=["x", "alpha", "inv_beta"],
+                                                  output_names=["out"], source=_ACTIVATION_SOURCE,
+                                                  header=_ACTIVATION_HEADER)
+    b, t, c = x.shape
+    return _activation_kernel(inputs=[x, alpha.astype(mx.float32), inv_beta.astype(mx.float32)],
+                              template=[("T", x.dtype)], grid=(c, t, b), threadgroup=(min(c, 32), min(t, 8), 1),
+                              output_shapes=[x.shape], output_dtypes=[x.dtype])[0]
+
+
 class SnakeBeta(nn.Module):
     """``x + 1 / (beta + 1e-9) * sin(alpha * x) ** 2`` per channel (``beta = alpha``: Snake)."""
 
@@ -109,13 +159,17 @@ def _edge(x: mx.array, n: int) -> mx.array:
 
 class Activation1d(nn.Module):
     """Anti-aliased snake (2x upsample, snake, 2x low-pass downsample) in polyphase form: the 2x signal is kept as
-    its even / odd phases and both filters run as fused elementwise kernels over shifted views. ``[B, T, C]``."""
+    its even / odd phases and both filters run as fused elementwise kernels over shifted views. ``[B, T, C]``.
+    ``fused``: one Metal kernel instead (:func:`fused_activation`) when a Metal GPU is the default device."""
 
     def __init__(self, channels: int, logscale: bool = True, beta: bool = True):
         super().__init__()
         self.act = SnakeBeta(channels, logscale, beta)
+        self.fused = False
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.fused and fused_activation_available():
+            return fused_activation(x, *self.act.coefficients())
         t = x.shape[1]
         x = mx.pad(x, [(0, 0), (3, 3), (0, 0)], mode="edge")
         even, odd = _upsample_snake(*self.act.coefficients(), *(x[:, r: r + t] for r in range(7)))
@@ -180,7 +234,7 @@ class AMPBlock1(nn.Module):
 
 
 class BigVGAN(nn.Module):
-    """BigVGAN-v2 generator from its ``config.json`` hparams. Parameter names are those of the PyTorch state dict
+    """BigVGAN (v2 or v1) generator from its ``config.json`` hparams. Parameters are named as in the PyTorch state dict
     without the anti-aliasing filter buffers; ``use_tanh_at_final=false`` returns the unclamped waveform (the
     reference clamps it to ``[-1, 1]``)."""
 
@@ -225,6 +279,14 @@ class BigVGAN(nn.Module):
         mx.eval(constants)
         return self
 
+    def use_fused_activations(self, enabled: bool = True) -> BigVGAN:
+        """Run each anti-aliased activation as one Metal kernel (:func:`fused_activation`) when a Metal GPU is the
+        default device; elsewhere this has no effect."""
+        for module in self.modules():
+            if isinstance(module, Activation1d):
+                module.fused = enabled
+        return self
+
     def __call__(self, mel: mx.array) -> mx.array:
         """Log-mel ``[B, num_mels, T]`` -> waveform ``[B, T * prod(upsample_rates)]``."""
         x = self.conv_pre(mel.transpose(0, 2, 1).astype(self.conv_pre.weight.dtype))
@@ -236,7 +298,8 @@ class BigVGAN(nn.Module):
         return mx.tanh(x) if self.use_tanh_at_final else x
 
 
-def _to_numpy(v) -> np.ndarray:
+def to_numpy(v) -> np.ndarray:
+    """A torch tensor or array-like as float32 NumPy."""
     return v.detach().cpu().float().numpy() if hasattr(v, "detach") else np.asarray(v, dtype=np.float32)
 
 
@@ -244,7 +307,7 @@ def convert_bigvgan(state_dict: dict) -> dict[str, np.ndarray]:
     """PyTorch generator state dict (tensors or arrays) -> float32 MLX weights keyed as ``BigVGAN``'s parameters.
     Old-style weight norm (``weight_g`` / ``weight_v``) is folded; the anti-aliasing filters are checked against the
     recomputed one and dropped."""
-    sd = {k: _to_numpy(v) for k, v in state_dict.items()}
+    sd = {k: to_numpy(v) for k, v in state_dict.items()}
     for k in [k for k in sd if k.endswith(".weight_v")]:
         v, g = sd.pop(k).astype(np.float64), sd.pop(k[:-1] + "g")
         sd[k[:-2]] = g * v / np.sqrt((v.reshape(len(v), -1) ** 2).sum(1)).reshape(g.shape)
@@ -258,12 +321,3 @@ def convert_bigvgan(state_dict: dict) -> dict[str, np.ndarray]:
             v = v.transpose(1, 2, 0) if k.startswith("ups.") else v.transpose(0, 2, 1)
         out[k] = np.ascontiguousarray(v, dtype=np.float32)
     return out
-
-
-def load_bigvgan(weights: str, hparams: dict, dtype: mx.Dtype = mx.float32) -> BigVGAN:
-    """``weights``: a ``.safetensors`` of :func:`convert_bigvgan` output (any float storage), cast to ``dtype``.
-    Keep float32: the snake activations are precision sensitive."""
-    model = BigVGAN(hparams)
-    model.load_weights([(k, v.astype(dtype)) for k, v in mx.load(weights).items()])
-    mx.eval(model.parameters())
-    return model.prepare_for_inference()
