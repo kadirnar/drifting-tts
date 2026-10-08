@@ -40,6 +40,8 @@ score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", 
 # in a whole TTS stack), so only the Hub client is needed to fetch facebook/dacvae-watermarked, openbmb/VoxCPM2 / 1.5
 dacvae = ["huggingface_hub"]
 voxcpm = ["huggingface_hub"]
+# the `revox` vocoder: Minori Live's Revox Vocoder 1.0 ONNX (CC BY-NC-SA 4.0, non-commercial), fetched at runtime
+revox = ["onnxruntime", "huggingface_hub"]
 # MLX inference on Apple silicon (`drifting_tts.mlx`); on Linux install "mlx[cpu]" or "mlx[cuda]" instead
 mlx = ["mlx>=0.29", "huggingface_hub"]
 
