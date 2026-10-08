@@ -106,6 +106,8 @@ def score(wavs: list[torch.Tensor], refs: list[str], judges, dnsmos, band: int, 
         full16.append(band_match(wav, 0))
         row["mos"] = judges.mos(full16[-1])
         rows.append(row)
+        if (i + 1) % 100 == 0:
+            print(f"  scored {i + 1}/{len(wavs)}", flush=True)
     dns = dnsmos.score(full16)
     for row, d in zip(rows, dns):
         row.update(dnsmos_sig=float(d[0]), dnsmos_bak=float(d[1]), dnsmos_ovrl=float(d[2]), dnsmos_p808=float(d[3]))
