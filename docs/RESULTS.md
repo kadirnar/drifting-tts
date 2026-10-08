@@ -158,9 +158,9 @@ from 30 to 8 ms. A sentence of a length not seen before sometimes costs about 20
 ## MLX
 
 `drifting_tts.mlx` is a port of the inference model to MLX for Apple silicon: the text encoder, the pitch and duration
-predictors, DriftDiT and BigVGAN-v2. In BigVGAN, the anti-aliased activations are written in polyphase form and the
-transposed convolutions as strided phases, so nothing is interleaved or zero-inserted. Every part was checked against
-PyTorch with MLX 0.32 on Linux (CPU backend):
+predictors, DriftDiT, BigVGAN-v2 and the two small vocoders (BigVGAN-base and Vocos fine-tunes). In BigVGAN, the
+anti-aliased activations are written in polyphase form and the transposed convolutions as strided phases, so nothing
+is interleaved or zero-inserted. Every part was checked against PyTorch with MLX 0.32 on Linux (CPU backend):
 
 | check | result |
 |---|---|
@@ -169,10 +169,13 @@ PyTorch with MLX 0.32 on Linux (CPU backend):
 | BigVGAN-v2, published weights (fp16, snake parameters fp32) | SNR 59.1 dB |
 | whole pipeline, published weights, same noise as a PyTorch run | identical sample count, SNR 59.9 dB |
 | Whisper large-v3 on two MLX outputs | 0% CER |
+| BigVGAN-base-ft, fp32, mels of the released model (3 sentences) | SNR 92.3–99.7 dB; streamed = whole-sentence MLX audio |
+| Vocos-ft, fp32, mels of the released model (3 sentences) | SNR 95.0–104.4 dB; streamed = whole-sentence MLX audio |
 
 The published weights (`mlx/` in the model repo, 496 MB) keep the acoustic model in fp32. Storing it in fp16 as well
 lowered the end-to-end SNR to 31.9 dB. The older Linux CPU results above establish numerical parity; the Apple GPU
-measurements below were performed separately.
+measurements below were performed separately, with BigVGAN-v2 and before the streaming prefetch; the small vocoders
+have not been timed on a Mac yet ([commands](MLX.md#validating-on-a-mac)).
 
 ### Apple M2 Pro, 7 October 2026
 

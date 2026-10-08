@@ -112,14 +112,18 @@ write_wav("merhaba.wav", wav)
 
 For low latency, consume `tts.stream(text)` as it yields `(audio, info)` chunks. The first chunk contains 256 ms of
 host-ready audio; later chunks grow to reduce repeated vocoder work. `tts(text)` still waits for the whole waveform.
-See [streaming, memory settings and reproducible benchmarks](docs/MLX.md).
+See [streaming, vocoders, memory settings and reproducible benchmarks](docs/MLX.md).
 
 - **Settings:** the same voices and options as the PyTorch API. The defaults are the recommended T = 0.3 and α = 2.
+- **Vocoders:** BigVGAN-v2 by default; `Synthesizer.from_pretrained(vocoder="bigvgan-base-ft")` or `"vocos-ft"`
+  (CLI `--vocoder`) uses a 14 M-parameter vocoder instead of 112 M ([quality](docs/VOCODERS.md),
+  [MLX parity](docs/MLX.md#vocoders)). Only the chosen vocoder is downloaded.
 - **Weights:** `python -m drifting_tts.mlx.convert` converts the PyTorch checkpoints. The result is published under
   [`mlx/`](https://huggingface.co/Vyvo/drifting-tts-tr/tree/main/mlx).
-- **Mac validation:** tested on Apple M2 Pro (16 GB), macOS 26.5.2, MLX 0.32.3. Warm streaming TTFA is about
-  **84–97 ms** across short/long sentences and a paragraph ([methodology and results](docs/RESULTS.md#mlx)).
-  The first request and optional `--compile` need separate measurement; these are not model-loading times.
+- **Mac validation:** tested on Apple M2 Pro (16 GB), macOS 26.5.2, MLX 0.32.3. With BigVGAN-v2, warm streaming
+  TTFA is **84–97 ms** across short/long sentences and a paragraph ([methodology and results](docs/RESULTS.md#mlx)).
+  The first request and optional `--compile` need separate measurement; these are not model-loading times. The small
+  vocoders have not been timed on a Mac yet.
 
 ## On iPhone and native macOS
 
