@@ -1,7 +1,8 @@
 # Model code adapted from https://github.com/facebookresearch/dacvae (commit 414c207).
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
-# Changes: inference only, one module, weight norm folded at load time, posterior mean, fixed watermark message.
+# Changes: inference only, one module, weight norm folded at load time, posterior mean, fixed watermark message,
+# hooks for fine-tuning the decoder's audio path with the watermark frozen.
 """DAC-VAE (``facebook/dacvae-watermarked``, Apache-2.0): 48 kHz in and out, 128-d latents at 25 Hz.
 
 The model code is a minimal inference port of https://github.com/facebookresearch/dacvae (Apache-2.0, Copyright (c)
@@ -13,6 +14,9 @@ Meta Platforms, Inc. and affiliates; derived from Descript's DAC, MIT). It is ve
 * The decoder adds an AudioSeal-style watermark through a 150 Hz branch with two LSTMs. Upstream draws a random
   16-bit message per call; here the message is fixed (``message``), so decoding is deterministic.
 * Encoder and decoder are non-causal convolution stacks (symmetric padding); the watermark LSTMs are causal.
+* Decoder fine-tuning (``finetune-vocoder`` with ``vocoder.arch: vae_decoder``) trains the audio path only
+  (:meth:`Decoder.audio_path`). The watermark (``wm_model`` and the watermark layers of every ``DecoderBlock``) is
+  frozen and still added to the output, at training and at inference time, exactly as by the released decoder.
 """
 
 from __future__ import annotations
@@ -102,8 +106,8 @@ class VAEBottleneck(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Upsampling block whose layer list interleaves the audio path with the watermark's down / up paths, in the
-    upstream order (so the state dict loads as is)."""
+    """Upsampling block whose layer list interleaves the audio path (``MAIN``) with the watermark's down / up paths
+    (``WM_DOWN``, ``WM_UP``), in the upstream order (so the state dict loads as is)."""
 
     MAIN, WM_DOWN, WM_UP = (0, 1, 4, 5, 8, 9), (7, 10, 11), (2, 3, 6)
 
@@ -169,18 +173,34 @@ class Decoder(nn.Module):
         out = channels // 2 ** len(rates)
         self.wm_model = Watermarker(out, out // 3, wm_latent, channels // 3)
 
-    def forward(self, x: Tensor, message: Tensor) -> Tensor:
+    def audio_path(self) -> list[nn.Module]:
+        """The modules that make the audio before the watermark: the input convolution and the ``MAIN`` layers of
+        every block. The output layer (Snake, the convolution to one channel, tanh) sits inside
+        ``wm_model.encoder_block.pre`` upstream and is left out with the rest of ``wm_model``."""
+        return [self.model[0]] + [b.block[i] for b in self.model[1:] for i in DecoderBlock.MAIN]
+
+    def components(self, x: Tensor, message: Tensor) -> tuple[Tensor, Tensor]:
+        """``(y, w)``: the audio before the watermark and the watermark ``alpha * post(h)`` that the decoder adds to
+        it, each ``[B, 1, samples]``. The watermark is computed from ``y`` and the message only."""
         for layer in self.model:
             x = layer(x)
+        y = self.wm_model.encoder_block.pre[:3](x)  # the audio before the watermark
+        return y, self.watermark(y, message)
+
+    def watermark(self, y: Tensor, message: Tensor) -> Tensor:
+        """The watermark ``alpha * post(h)`` that the decoder adds to the audio ``y`` ``[B, 1, samples]``."""
         wm, blocks = self.wm_model, self.model[1:]
-        y = wm.encoder_block.pre[:3](x)  # the audio before the watermark
         h = wm.encoder_block.pre[3](y)
         for b in reversed(blocks):
             h = b.run(h, DecoderBlock.WM_DOWN)
         h = wm.decoder_block.pre(wm.msg_processor(wm.encoder_block.post(h), message.to(h.device)))
         for b in blocks:
             h = b.run(h, DecoderBlock.WM_UP)
-        return y + wm.alpha * wm.decoder_block.post(h)
+        return wm.alpha * wm.decoder_block.post(h)
+
+    def forward(self, x: Tensor, message: Tensor) -> Tensor:
+        y, w = self.components(x, message)
+        return y + w
 
 
 class DACVAE(nn.Module):
@@ -210,14 +230,21 @@ class DACVAE(nn.Module):
 class DACVAEBackend(AudioBackend):
     name, input_rate, output_rate, frame_rate, dim = "dacvae", 48_000, 48_000, 25.0, 128
 
-    def __init__(self, device: str = "cuda", model: DACVAE | None = None, message: Tensor | None = None):
-        """``model``: a ``DACVAE`` (default: the released weights); ``message``: the watermark's 16 bits (zeros)."""
+    def __init__(self, device: str = "cuda", model: DACVAE | None = None, message: Tensor | None = None,
+                 decoder: dict | None = None):
+        """``model``: a ``DACVAE`` (default: the released weights); ``message``: the watermark's 16 bits (zeros);
+        ``decoder``: a fine-tuned decoder (``decoder_ft.pt`` of ``finetune-vocoder``, loaded with
+        :func:`drifting_tts.latents.vocoder.load_decoder_checkpoint`) that replaces the released decoder weights. Its
+        watermark weights are the released ones (they are frozen in fine-tuning)."""
+        self.released = model is None and decoder is None  # the released weights, unchanged
         if model is None:
             from huggingface_hub import hf_hub_download
 
             state, kwargs = load_vae_checkpoint(hf_hub_download(REPO, "weights.pth", revision=REVISION))
             model = DACVAE(**kwargs)
             model.load_state_dict(state)
+        if decoder is not None:
+            model.decoder.load_state_dict(decoder["decoder"])
         self.model, self.device = model.to(device).eval(), device
         self.input_rate = self.output_rate = model.sample_rate
         self.frame_rate = model.sample_rate / model.hop_length
@@ -234,5 +261,38 @@ class DACVAEBackend(AudioBackend):
 
     @torch.no_grad()
     def decode(self, latent: Tensor) -> Tensor:
-        z = latent.float().to(self.device)
-        return self.model.decode(z, self.message.expand(z.shape[0], -1))[:, 0].clamp(-1, 1)
+        return self.decode_train(latent.float().to(self.device)).clamp(-1, 1)
+
+    def trainable_decoder(self) -> nn.Module:
+        """The decoder, with only its audio path trainable (:meth:`Decoder.audio_path`). Everything else is frozen:
+        the encoder, the bottleneck projections and the whole watermark (``wm_model``, including the audio's output
+        layer, and the watermark layers of every block). :meth:`decode_train` still adds the watermark."""
+        self.model.requires_grad_(False)
+        for m in self.model.decoder.audio_path():
+            m.requires_grad_(True)
+        return self.model.decoder
+
+    def decoder_weight_norm(self) -> dict[str, tuple[Tensor, Tensor]]:
+        """The released decoder's weight norm before folding, ``{module path in the decoder: (weight_g, weight_v)}``
+        (``dim=0``): the audio path's convolutions and the output layer's (the watermark's own convolutions have
+        none). Empty unless the backend holds the released weights."""
+        if not self.released:
+            return {}
+        from huggingface_hub import hf_hub_download
+
+        state = torch.load(hf_hub_download(REPO, "weights.pth", revision=REVISION), map_location="cpu",
+                           weights_only=True)["state_dict"]
+        return {k[len("decoder."): -len(".weight_g")]: (v, state[k[:-1] + "v"]) for k, v in state.items()
+                if k.startswith("decoder.") and k.endswith(".weight_g")}
+
+    def decode_train(self, latent: Tensor) -> Tensor:
+        """:meth:`decode` with gradients and without the clamp; the watermark is added as at release."""
+        return self.model.decode(latent, self.message.expand(latent.shape[0], -1))[:, 0]
+
+    @torch.no_grad()
+    def watermark_components(self, latent: Tensor) -> tuple[Tensor, Tensor]:
+        """``(y, w)`` ``[B, samples]``: the audio before the watermark and the watermark that ``decode`` adds to it
+        (before the clamp)."""
+        z = self.model.quantizer.out_proj(latent.float().to(self.device))
+        y, w = self.model.decoder.components(z, self.message.expand(z.shape[0], -1))
+        return y[:, 0], w[:, 0]

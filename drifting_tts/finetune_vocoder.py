@@ -12,9 +12,10 @@ GAN objective:
 - ``bigvgan``: resumes NVIDIA's released generator *and* discriminators (MPD + multi-scale sub-band
   CQT) with their AdamW states, as the official recipe does; LSGAN, feature matching and the
   multi-scale mel L1 (x15), at the learning rate where the released schedule ended.
-- ``vae_decoder`` (a TTS model trained on VAE latents, ``extract-latents``; VoxCPM2): the VAE's decoder in place of
-  the vocoder, trained on generated latents with the ``bigvgan`` recipe and NVIDIA's released 24 kHz discriminators
-  (:class:`VAEDecoderGAN`). Exports ``decoder_ft.pt`` for ``LatentVocoder`` / ``Synthesizer(vocoder=...)``.
+- ``vae_decoder`` (a TTS model trained on VAE latents, ``extract-latents``; VoxCPM2, DAC-VAE): the VAE's decoder in
+  place of the vocoder, trained on generated latents with the ``bigvgan`` recipe and NVIDIA's released 24 kHz
+  discriminators (:class:`VAEDecoderGAN`). DAC-VAE's watermark stays frozen and is added as at release. Exports
+  ``decoder_ft.pt`` for ``LatentVocoder`` / ``Synthesizer(vocoder=...)``.
 
 ``vocoder.objective: drift`` trains either architecture without a GAN (:class:`DriftVocoder`, ``drift_vocoder.py``).
 """
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import shutil
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -191,7 +193,8 @@ class BigVGANGAN:
         # stored as "mrd" in the released checkpoints: the sub-band CQT discriminator (v2) or the MRD (v1, base)
         self.mrd = (bd.MultiScaleSubbandCQTDiscriminator(h) if cqt else bd.MultiResolutionDiscriminator(h)).to(device)
         betas = tuple(tc.get("betas", (h["adam_b1"], h["adam_b2"])))
-        self.opt_g = torch.optim.AdamW(self.gen.parameters(), tc.lr, betas=betas)
+        # frozen generator parameters (a VAE decoder's watermark) are left out
+        self.opt_g = torch.optim.AdamW([p for p in self.gen.parameters() if p.requires_grad], tc.lr, betas=betas)
         # same parameter order as the reference (CQT-D first), so its optimizer state can be loaded
         self.d_params = list(itertools.chain(self.mrd.parameters(), self.mpd.parameters()))
         self.opt_d = torch.optim.AdamW(self.d_params, tc.get("lr_d", tc.lr), betas=betas)
@@ -299,26 +302,28 @@ class BigVGANGAN:
 
 
 def latent_windows(latents: torch.Tensor, audio: torch.Tensor, frame_len: torch.Tensor, repeat: int, segment: int,
-                   context: int, hop: int):
-    """Random training windows for a causal VAE decoder, on VAE-frame boundaries.
+                   context: int, hop: int, right: int = 1):
+    """Random training windows for a VAE decoder, on VAE-frame boundaries.
 
     ``latents``: ``[B, dim, T]`` with every VAE frame repeated ``repeat`` times (``extract-latents``), ``frame_len``
     their lengths; ``audio``: ``[B, S]`` recordings with ``hop`` samples per VAE frame. Item ``i`` gets a segment of
-    ``segment`` VAE frames from a random VAE frame ``s`` (with at least one more frame after it, for the resampler) and
-    a decoder window of ``context + segment + 1`` VAE frames from ``a = max(0, s - context)``: ``context`` frames of
-    left context, or the utterance start, which the decoder then sees as it does when decoding a whole utterance.
+    ``segment`` VAE frames from a random VAE frame ``s`` (with at least one more frame after it) and a decoder window
+    of ``width = context + segment + right`` VAE frames from ``a = clamp(s - context, 0, n - width)``: ``context``
+    frames of left context and ``right`` frames of right context, or the utterance start / end, which the decoder
+    then sees as it does when decoding a whole utterance. A causal decoder needs no right context: ``right = 1``
+    serves the resampler. A non-causal decoder needs both sides.
 
-    Returns the windows ``[B, dim, context + segment + 1]`` (repeats averaged back, as ``LatentVocoder`` does), the
-    offset of each segment in its window (``s - a`` VAE frames) and the target audio ``[B, segment * hop]``
-    (samples ``[s * hop, (s + segment) * hop)``)."""
+    Returns the windows ``[B, dim, width]`` (repeats averaged back, as ``LatentVocoder`` does), the offset of each
+    segment in its window (``s - a`` VAE frames) and the target audio ``[B, segment * hop]`` (samples
+    ``[s * hop, (s + segment) * hop)``)."""
     if repeat > 1:
         latents = F.avg_pool1d(latents[..., : latents.shape[-1] // repeat * repeat], repeat)
     n = frame_len.cpu() // repeat
-    width = context + segment + 1
+    width = context + segment + right
     if (n < width).any():
         raise ValueError(f"utterances of {int(n.min())} VAE frames are shorter than a window of {width}")
     starts = (torch.rand(len(n)) * (n - segment).float()).long()  # s in [0, n - segment - 1]
-    lefts = (starts - context).clamp_min(0)
+    lefts = torch.minimum((starts - context).clamp_min(0), n - width)
     z = torch.stack([latents[i, :, a: a + width] for i, a in enumerate(lefts.tolist())])
     y = torch.stack([audio[i, s * hop: (s + segment) * hop] for i, s in enumerate(starts.tolist())])
     return z, (starts - lefts).to(latents.device), y
@@ -334,20 +339,25 @@ def discriminator_hparams(repo: str, overrides: dict | None = None) -> dict:
 
 
 class VAEDecoderGAN(BigVGANGAN):
-    """The decoder of an audio VAE (``vocoder.arch: vae_decoder``; VoxCPM2's causal AudioVAE decoder) fine-tuned on
-    generated latents with the BigVGAN-v2 recipe: NVIDIA's released 24 kHz MPD + CQT-D (and their AdamW state), LSGAN,
-    feature matching and the multi-scale mel L1 (x15). Only the decoder is trained; the encoder is not used.
+    """The decoder of an audio VAE (``vocoder.arch: vae_decoder``: VoxCPM2's causal AudioVAE decoder, DAC-VAE's
+    non-causal, watermarked one) fine-tuned on generated latents with the BigVGAN-v2 recipe: NVIDIA's released 24 kHz
+    MPD + CQT-D (and their AdamW state), LSGAN, feature matching and the multi-scale mel L1 (x15). Only the decoder is
+    trained; the encoder is not used.
 
     * Input: denormalised latents, the ``repeat`` copies of every VAE frame averaged back (as ``LatentVocoder`` does
       at inference), so the decoder sees native 25 Hz frames.
     * Segments (:func:`latent_windows`): ``segment_frames`` VAE frames that start on a VAE frame, decoded in a window
-      with ``context_frames`` frames of left context (the decoder is causal: no right context is needed) and one
-      frame on the right for the resampler. Only the segment's own samples are scored.
-    * Output: the decoder's rate (48 kHz for VoxCPM2), resampled to 24 kHz inside the graph with the same
-      band-limited sinc as ``LatentVocoder`` at inference (``torchaudio``), and compared with the 24 kHz recordings.
-      The band above 12 kHz gets no training signal; the TTS pipeline never outputs it.
-    * Weight norm: re-applied to every convolution for training, as the VAE was trained (``vocoder.weight_norm``),
-      and folded back on export.
+      with ``context_frames`` frames of left context. A non-causal decoder also gets ``right_context_frames`` frames
+      of right context (default: ``context_frames``); a causal one gets a single frame on the right, for the
+      resampler. Only the segment's own samples are scored.
+    * Trainable parameters: those the backend's ``trainable_decoder`` leaves trainable. DAC-VAE trains its audio path
+      only: the watermark is frozen and still added to every output, in training as at inference. Every export checks
+      that the frozen weights are still the released ones.
+    * Output: the decoder's rate (48 kHz), resampled to 24 kHz inside the graph with the same band-limited sinc as
+      ``LatentVocoder`` at inference (``torchaudio``), and compared with the 24 kHz recordings. The band above 12 kHz
+      gets no training signal; the TTS pipeline never outputs it.
+    * Weight norm: re-applied to every trainable convolution for training, as the VAE was trained
+      (``vocoder.weight_norm``), and folded back on export.
     """
 
     export_name = "decoder_ft.pt"
@@ -364,14 +374,20 @@ class VAEDecoderGAN(BigVGANGAN):
         self.be = load_backend(backend, device, **({"target_rate": vc.target_rate} if vc.get("target_rate") else {}))
         self.target_rate = int(getattr(self.be, "target_rate", None) or self.be.output_rate)
         self.gen = self.be.trainable_decoder().train()
+        # the frozen part of the decoder (DAC-VAE: the watermark), as released: every export checks it is unchanged
+        self.frozen = {k: v.detach().cpu().clone() for k, v in self.gen.named_parameters() if not v.requires_grad}
         self.weight_norm = vc.get("weight_norm", True)
         if self.weight_norm:
             self._apply_weight_norm()
         self.hop = round(SAMPLE_RATE / self.be.frame_rate)  # 24 kHz samples per VAE frame (960 at 25 Hz)
         self.segment, self.context = tc.segment_frames, tc.get("context_frames", 0)
-        self.min_frames = repeat * (self.context + self.segment + 1)
+        self.right = 1 if self.be.causal else max(1, tc.get("right_context_frames", self.context))
+        self.min_frames = repeat * (self.context + self.segment + self.right)
         self.resample = torchaudio.transforms.Resample(self.be.output_rate, SAMPLE_RATE).to(device)
         self._setup(discriminator_hparams(self.repo, vc.get("hparams")), device)
+        trained = sum(p.numel() for p in self.gen.parameters() if p.requires_grad)
+        print(f"decoder: {trained / 1e6:.1f}M parameters trained, "
+              f"{sum(v.numel() for v in self.frozen.values()) / 1e6:.1f}M frozen", flush=True)
 
     @torch.no_grad()
     def _apply_weight_norm(self) -> None:
@@ -380,8 +396,8 @@ class VAEDecoderGAN(BigVGANGAN):
         released = self.be.decoder_weight_norm()
         n = 0
         for name, m in self.gen.named_modules():
-            if not isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
-                continue
+            if not isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)) or not m.weight.requires_grad:
+                continue  # frozen convolutions stay as they are
             w = m.weight.detach().clone()
             torch.nn.utils.parametrizations.weight_norm(m)
             p = m.parametrizations.weight
@@ -398,7 +414,8 @@ class VAEDecoderGAN(BigVGANGAN):
             print(f"weight norm: {n} convolutions start from the released magnitudes and directions", flush=True)
 
     def segments(self, latents: torch.Tensor, audio: torch.Tensor, frame_len: torch.Tensor):
-        z, offsets, y = latent_windows(latents, audio, frame_len, self.repeat, self.segment, self.context, self.hop)
+        z, offsets, y = latent_windows(latents, audio, frame_len, self.repeat, self.segment, self.context, self.hop,
+                                       self.right)
         return (z, offsets), y
 
     def audio_samples(self, frames: int) -> int:
@@ -418,7 +435,8 @@ class VAEDecoderGAN(BigVGANGAN):
 
     def export(self, path: Path, step: int) -> None:
         """``{"decoder": state dict (weight norm folded), "backend", "target_rate", "sample_rate", "step"}``: tensors
-        and numbers only, loadable with ``weights_only=True`` (``LatentVocoder(decoder=...)``)."""
+        and numbers only, loadable with ``weights_only=True`` (``LatentVocoder(decoder=...)``). The state holds the
+        frozen weights too (DAC-VAE: the watermark), which must still be the released ones."""
         # the weights are read from the parametrized modules: removing the parametrization from a copy would delete
         # the ``weight`` property of the class it shares with the training modules
         state, tag = {}, ".parametrizations.weight.original"
@@ -429,6 +447,9 @@ class VAEDecoderGAN(BigVGANGAN):
                 elif k.endswith(tag + "0"):
                     prefix = k[: k.index(tag)]
                     state[f"{prefix}.weight"] = self.gen.get_submodule(prefix).weight.detach().cpu().clone()
+        changed = [k for k, v in self.frozen.items() if not torch.equal(state[k], v)]
+        if changed:
+            raise RuntimeError(f"frozen decoder weights changed in training: {', '.join(changed[:5])}")
         save_checkpoint(path, decoder=state, backend=self.backend, target_rate=self.target_rate,
                         sample_rate=SAMPLE_RATE, step=step)
 
@@ -688,4 +709,7 @@ def run(args) -> None:
         if step % tc.save_every == 0 or step == tc.steps:
             save_checkpoint(work / "last.pt", step=step, epoch=sampler.epoch, **gan.state_dict())
             gan.export(work / gan.export_name, step)
+            if tc.get("keep_snapshots", False):  # every export also as <name>_<step>, e.g. decoder_ft_2500.pt
+                name = Path(gan.export_name)
+                shutil.copyfile(work / name, work / f"{name.stem}_{step}{name.suffix}")
     print(f"done: {work / gan.export_name}", flush=True)
