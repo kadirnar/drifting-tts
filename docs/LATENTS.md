@@ -315,7 +315,8 @@ is refused for a latent model, since there it used to be ignored silently.
 ### Results
 
 The TTS model is the same in every latent row: the VoxCPM2-latent model at 10k steps. Only the decoder changes.
-The fine-tuned decoder was trained for 20k steps, about 3 hours on an RTX 5090 shared with other jobs.
+The fine-tuned decoder was trained for 20k steps (about 3 hours on an RTX 5090 shared with other jobs), then
+continued to 40k, since UTMOSv2 was still rising.
 
 Freya-TR-Eval, first 100 sentences, speaker 722, T = 0.3, α = 2 (`drifting-tts benchmark`):
 - WER / CER: Whisper large-v3 on 8 kHz band-matched audio, with 95% intervals.
@@ -324,10 +325,23 @@ Freya-TR-Eval, first 100 sentences, speaker 722, T = 0.3, α = 2 (`drifting-tts 
 | model | decoder / vocoder | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS SIG / BAK / OVRL | RTF |
 |---|---|---|---|---|---|---|
 | VoxCPM2 latents | released decoder | 4.94% [3.23, 6.89] | 1.39% | 2.052 [2.007, 2.100] | 1.73 / 2.76 / 1.49 | 0.0103 |
-| VoxCPM2 latents | **fine-tuned decoder** | **2.31%** [1.18, 3.60] | **0.50%** | **2.340** [2.294, 2.385] | **3.46 / 4.08 / 3.21** | 0.0104 |
+| VoxCPM2 latents | fine-tuned decoder, 20k steps | 2.31% [1.18, 3.60] | 0.50% | 2.340 [2.294, 2.385] | 3.46 / 4.08 / 3.21 | 0.0104 |
+| VoxCPM2 latents | **fine-tuned decoder, 35k steps** (published) | **1.87%** [0.97, 2.96] | **0.43%** | **2.530** [2.479, 2.583] | **3.49 / 4.10 / 3.25** | 0.0056 |
+| VoxCPM2 latents | fine-tuned decoder, 40k steps | 1.76% [0.99, 2.69] | 0.42% | 2.410 [2.357, 2.462] | – | 0.0055 |
 | v3.1, released | `bigvgan-v2-ft` | 0.66% [0.22, 1.22] | 0.14% | 2.934 [2.892, 2.975] | 3.56 / 4.13 / 3.33 | 0.0231 |
 
-The two latent rows were timed back to back on the same busy GPU. v3.1's RTF comes from its own, earlier run.
+The released and 20k rows were timed back to back on the same busy GPU, and the 35k / 40k rows later on a quieter
+one. v3.1's RTF comes from its own, earlier run.
+
+**Continued training (20k → 40k steps).** On Freya-24, UTMOSv2 at each snapshot:
+
+| step | 20k | 25k | 30k | 35k | 40k |
+|---|---|---|---|---|---|
+| UTMOSv2 | 2.33 | 2.47 | 2.45 | 2.49 | 2.43 |
+
+DNSMOS OVRL stays at 3.22–3.27 throughout. On Freya-100, 35k is the most natural decoder (UTMOSv2 2.53, against
+2.41 at 40k) at the same WER, within the intervals. It is published as `voxcpm2_decoder_ft.pt` in
+[`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2).
 
 On the 24 sentences of the diagnosis in #27, DNSMOS OVRL goes from 1.45 with the released decoder to 3.22 with the
 fine-tuned one; v3.1 scores 3.34.
