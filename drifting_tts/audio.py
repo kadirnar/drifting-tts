@@ -124,19 +124,27 @@ def extract_f0(wav: torch.Tensor | np.ndarray, frames: int, sample_rate: int = S
     ``method``: ``dio`` (+ stonemask, fast) or ``harvest`` (about 15x slower, fewer voicing / octave errors on
     noisy speech).
     """
-    import pyworld
-
-    x = np.asarray(wav, dtype=np.float64)
     period = 1000.0 * HOP_LENGTH / sample_rate / 2  # half-hop grid: frame centres sit on it for every backend
-    if method == "harvest":
-        f0, _ = pyworld.harvest(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=period)
-    elif method == "dio":
-        f0, t = pyworld.dio(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=period)
-        f0 = pyworld.stonemask(x, f0, t, sample_rate)
-    else:
-        raise ValueError(f"unknown F0 method {method!r}")
-    f0 = f0[round(2 * FRAME_CENTRE[backend])::2]
+    f0 = world_f0(wav, sample_rate, period, method)[round(2 * FRAME_CENTRE[backend])::2]
     out = np.zeros(frames, dtype=np.float32)
     n = min(frames, len(f0))
     out[:n] = f0[:n]
     return out
+
+
+def world_f0(wav: torch.Tensor | np.ndarray, sample_rate: int, frame_period: float, method: str = "dio",
+             allowed_range: float = 0.1) -> np.ndarray:
+    """WORLD F0 in Hz (60-800 Hz, 0: unvoiced) at ``k * frame_period`` ms, ``k = 0, 1, ...`` (:func:`extract_f0`).
+    ``allowed_range``: dio's voicing threshold (larger: more frames voiced)."""
+    import pyworld
+
+    x = np.asarray(wav, dtype=np.float64)
+    if method == "harvest":
+        f0, _ = pyworld.harvest(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=frame_period)
+    elif method == "dio":
+        f0, t = pyworld.dio(x, sample_rate, f0_floor=60.0, f0_ceil=800.0, frame_period=frame_period,
+                            allowed_range=allowed_range)
+        f0 = pyworld.stonemask(x, f0, t, sample_rate)
+    else:
+        raise ValueError(f"unknown F0 method {method!r}")
+    return f0
