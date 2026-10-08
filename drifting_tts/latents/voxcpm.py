@@ -178,11 +178,15 @@ class VoxCPMBackend(AudioBackend):
     frame_rate, causal = 25.0, True
 
     def __init__(self, name: str = "voxcpm2", device: str = "cuda", model: AudioVAE | None = None,
-                 target_rate: int | None = None):
+                 target_rate: int | None = None, decoder: dict | None = None):
         """``name``: ``voxcpm2`` or ``voxcpm1.5``; ``model``: an ``AudioVAE`` (default: the released weights);
-        ``target_rate``: VoxCPM2's output-bandwidth condition (default 48000, as VoxCPM2 decodes)."""
+        ``target_rate``: VoxCPM2's output-bandwidth condition (default 48000, as VoxCPM2 decodes); ``decoder``: a
+        fine-tuned decoder (``decoder_ft.pt`` of ``finetune-vocoder``, loaded with
+        :func:`drifting_tts.latents.vocoder.load_decoder_checkpoint`) that replaces the released decoder weights; its
+        ``target_rate`` is used unless one is given."""
         if name not in MODELS:
             raise ValueError(f"unknown VoxCPM model {name!r}; choose from {', '.join(MODELS)}")
+        self.released = model is None and decoder is None  # the released weights, unchanged
         if model is None:
             from huggingface_hub import hf_hub_download
 
@@ -190,6 +194,9 @@ class VoxCPMBackend(AudioBackend):
             config = json.loads(open(hf_hub_download(repo, "config.json", revision=revision)).read())
             model = AudioVAE(config["audio_vae_config"], v2=config.get("architecture") == "voxcpm2")
             model.load_state_dict(load_vae_checkpoint(hf_hub_download(repo, "audiovae.pth", revision=revision))[0])
+        if decoder is not None:
+            model.decoder.load_state_dict(decoder["decoder"])
+            target_rate = target_rate or decoder.get("target_rate")
         self.name, self.model, self.device = name, model.to(device).eval(), device
         self.input_rate, self.output_rate = model.sample_rate, model.out_sample_rate
         self.frame_rate = model.sample_rate / model.hop_length
@@ -204,4 +211,26 @@ class VoxCPMBackend(AudioBackend):
 
     @torch.no_grad()
     def decode(self, latent: Tensor) -> Tensor:
-        return self.model.decode(latent.float().to(self.device), self.target_rate)[:, 0].clamp(-1, 1)
+        return self.decode_train(latent.float().to(self.device)).clamp(-1, 1)
+
+    def trainable_decoder(self) -> nn.Module:
+        return self.model.decoder
+
+    def decoder_weight_norm(self) -> dict[str, tuple[Tensor, Tensor]]:
+        """The released decoder's weight norm before folding: ``{module path in the decoder: (weight_g, weight_v)}``
+        (``torch.nn.utils.weight_norm``, ``dim=0``). Fine-tuning starts from these magnitudes and directions: with
+        ``v`` re-derived from the folded weights its norm would be ``g`` (e.g. 0.015 instead of 0.56 for the output
+        convolution), and the optimizer's first steps would turn the directions far faster than in training. Empty
+        unless the backend holds the released weights."""
+        if not self.released:
+            return {}
+        from huggingface_hub import hf_hub_download
+
+        repo, revision = MODELS[self.name]
+        state = torch.load(hf_hub_download(repo, "audiovae.pth", revision=revision), map_location="cpu",
+                           weights_only=True)["state_dict"]
+        return {k[len("decoder."): -len(".weight_g")]: (v, state[k[:-1] + "v"]) for k, v in state.items()
+                if k.startswith("decoder.") and k.endswith(".weight_g")}
+
+    def decode_train(self, latent: Tensor) -> Tensor:
+        return self.model.decode(latent, self.target_rate)[:, 0]

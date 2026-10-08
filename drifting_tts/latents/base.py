@@ -67,6 +67,21 @@ class AudioBackend(ABC):
     def decode(self, latent: Tensor) -> Tensor:
         """Frames ``[B, dim, T]`` -> waveform ``[B, T * hop_out]`` at ``output_rate``, in ``[-1, 1]``."""
 
+    def trainable_decoder(self) -> torch.nn.Module:
+        """The decoder module that ``finetune-vocoder`` trains (``vocoder.arch: vae_decoder``); its forward pass is
+        :meth:`decode_train`."""
+        raise NotImplementedError(f"decoder fine-tuning is not implemented for the {self.name} backend")
+
+    def decoder_weight_norm(self) -> dict[str, tuple[Tensor, Tensor]]:
+        """``{module path in the trainable decoder: (weight_g, weight_v)}`` of the released (unfolded) weight norm,
+        where known: fine-tuning re-parametrizes those convolutions as they were trained."""
+        return {}
+
+    def decode_train(self, latent: Tensor) -> Tensor:
+        """:meth:`decode` with gradients and without the final clamp: ``[B, dim, T]`` on the device ->
+        ``[B, T * hop_out]``."""
+        raise NotImplementedError(f"decoder fine-tuning is not implemented for the {self.name} backend")
+
 
 def stream_decode(backend: AudioBackend, latent: Tensor, first: int = 8, chunk: int = 64,
                   context: int = 8) -> Iterator[Tensor]:

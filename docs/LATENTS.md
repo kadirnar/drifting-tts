@@ -242,7 +242,8 @@ v3.1.
 
 Open directions:
 - **A decaying learning rate**, or a larger drift batch, in case the constant rate keeps the latent model from settling.
-- **Fine-tuning the VoxCPM2 decoder on generated latents**, the latent counterpart of the GTA vocoder fine-tune.
+- **Fine-tuning the VoxCPM2 decoder on generated latents**, the latent counterpart of the GTA vocoder fine-tune: see
+  [below](#fine-tuning-the-voxcpm2-decoder-on-generated-latents-27).
 - **Kernel features.** The latent MAE may be the bottleneck. Mel-MAE features of the decoded audio are an
   alternative.
 
@@ -252,3 +253,138 @@ drifting-tts train-mae --config configs/mae_latent.yaml --workdir runs/mae_voxcp
 drifting-tts train --config configs/tts_latent.yaml --workdir runs/tts_voxcpm2 train.steps=10000
 # DAC-VAE: --backend dacvae, and model.n_mels=128 for the MAE
 ```
+
+## Fine-tuning the VoxCPM2 decoder on generated latents (#27)
+
+Generated VoxCPM2 latents are over-smooth: real latents decoded by the released decoder score DNSMOS OVRL 3.25,
+generated ones 1.45, and real latents averaged over 3 frames fall to 1.42 (#27). The released decoder turns the
+missing frame-level structure into noise: on generated latents its output has no harmonic structure at all. The
+fix is the latent counterpart of the GTA vocoder fine-tune. The decoder is trained to turn teacher-forced generated
+latents back into the recordings.
+
+```bash
+drifting-tts finetune-vocoder --config configs/vocoder_voxcpm2_decoder.yaml --workdir runs/voxcpm2_decoder \
+  data.root=data/train_voxcpm2 tts.path=runs/tts_voxcpm2/model_ema.pt
+drifting-tts benchmark --model runs/tts_voxcpm2/model_ema.pt --vocoder runs/voxcpm2_decoder/decoder_ft.pt \
+  --num 100 --speaker 722 --temperature 0.3 --cfg 2.0
+```
+
+```python
+from drifting_tts.synthesize import Synthesizer
+
+synth = Synthesizer("runs/tts_voxcpm2/model_ema.pt", "cuda", vocoder="runs/voxcpm2_decoder/decoder_ft.pt")
+```
+
+Without `vocoder`, a latent model still decodes with the released decoder. A registry vocoder name (`bigvgan-v2-ft`)
+is refused for a latent model, since there it used to be ignored silently.
+
+### Recipe (`vocoder.arch: vae_decoder`)
+
+- **What is trained.** Only the decoder (45.8M parameters) is trained; the encoder is not used. The recipe is
+  BigVGAN-v2's:
+  - NVIDIA's released 24 kHz discriminators, MPD + CQT-D (45.6M), with their AdamW state;
+  - LSGAN, feature matching and the multi-scale mel L1 (×15);
+  - AdamW (0.8, 0.99), LR 5e-5 with a 1000-step warm-up for the decoder and a per-step decay of 0.99999.
+- **Inputs.** Batches mix generated and real latents: 80% of them are generated (`gta_prob`) at T = 0.3 and α = 2,
+  the inference settings, under the ground-truth alignment and pitch. The remaining 20% are real latents, so that the
+  decoder keeps decoding them cleanly. The latents are denormalised and their 4 repeats averaged back: the decoder
+  sees native 25 Hz frames, as at inference.
+- **Segments.** Each segment is 16 VAE frames (0.64 s) and starts on a VAE frame, i.e. on a multiple of 960 samples
+  at 24 kHz. The decoder is causal, so a segment is decoded in a window with 12 frames of left context, or from the
+  utterance start, and only the segment's own samples are scored.
+  - Against decoding the whole utterance, the windowed output reaches only 16 dB SNR without context, 81 dB with
+    12 frames (median) and 145 dB with 24 frames.
+- **Output rate.** The decoder generates 48 kHz audio. It is resampled to 24 kHz inside the graph, with the same
+  band-limited sinc as `LatentVocoder` at inference, and compared with the 24 kHz recordings. Three reasons:
+  - the recordings carry nothing above 12 kHz;
+  - the released discriminators are 24 kHz models;
+  - the TTS pipeline outputs 24 kHz.
+
+  The cost: the band above 12 kHz gets no training signal, and the fine-tuned decoder drops VoxCPM2's bandwidth
+  extension (12–16 kHz at −47 dB against −35 dB for the released decoder, relative to 0–4 kHz). Use it at 24 kHz,
+  the default of `LatentVocoder`.
+- **Weight norm.** The decoder is trained with weight norm on every convolution, as the VAE was, starting from the
+  released `weight_g` / `weight_v`. It is folded back into plain weights on export.
+  - These must be the released tensors. Re-deriving `v` from the folded weights gives it norm `g`: 0.015 instead of
+    0.56 for the output convolution. The optimizer's first steps then turn the directions about 36× faster.
+  - In a first run that did this (LR 1e-4, no warm-up), the mel loss on real latents jumped from 1.14 to 1.8 in 100
+    steps and was still about 1.4 after 2.5k steps.
+- **Export.** `decoder_ft.pt` holds the decoder state, the backend, `target_rate` (48000), `sample_rate` (24000) and
+  the step: tensors and numbers only, which load with `weights_only=True`.
+
+### Results
+
+The TTS model is the same in every latent row: the VoxCPM2-latent model at 10k steps. Only the decoder changes.
+The fine-tuned decoder was trained for 20k steps, about 3 hours on an RTX 5090 shared with other jobs.
+
+Freya-TR-Eval, first 100 sentences, speaker 722, T = 0.3, α = 2 (`drifting-tts benchmark`):
+- WER / CER: Whisper large-v3 on 8 kHz band-matched audio, with 95% intervals.
+- DNSMOS P.835 on the same 100 sentences.
+
+| model | decoder / vocoder | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS SIG / BAK / OVRL | RTF |
+|---|---|---|---|---|---|---|
+| VoxCPM2 latents | released decoder | 4.94% [3.23, 6.89] | 1.39% | 2.052 [2.007, 2.100] | 1.73 / 2.76 / 1.49 | 0.0103 |
+| VoxCPM2 latents | **fine-tuned decoder** | **2.31%** [1.18, 3.60] | **0.50%** | **2.340** [2.294, 2.385] | **3.46 / 4.08 / 3.21** | 0.0104 |
+| v3.1, released | `bigvgan-v2-ft` | 0.66% [0.22, 1.22] | 0.14% | 2.934 [2.892, 2.975] | 3.56 / 4.13 / 3.33 | 0.0231 |
+
+The two latent rows were timed back to back on the same busy GPU. v3.1's RTF comes from its own, earlier run.
+
+On the 24 sentences of the diagnosis in #27, DNSMOS OVRL goes from 1.45 with the released decoder to 3.22 with the
+fine-tuned one; v3.1 scores 3.34.
+
+- **The noise is gone.** DNSMOS OVRL on generated speech rises from 1.49 to 3.21, within 0.12 of v3.1.
+  - On generated latents, the released decoder produces no harmonic structure at all: whisper-like noise inside the
+    formants.
+  - The fine-tuned decoder restores voicing. Cepstral peak prominence, a periodicity measure, rises from 0.66 to
+    0.99 on 24 sentences. v3.1 scores 1.03 (10 sentences); real-latent resynthesis scores 1.34, against 1.27 for the
+    recordings.
+- **Intelligibility doubles.** WER falls from 4.94% to 2.31% and CER from 1.39% to 0.50%, with no change to the TTS
+  model: Whisper copes far better with clean speech.
+- **Naturalness improves, but less.** UTMOSv2 gains 0.29 (2.05 → 2.34; the intervals are disjoint), yet stays
+  0.6 below v3.1.
+  - DNSMOS jumps within the first 2.5k steps. UTMOSv2 first falls, then climbs steadily, and is still rising at 20k
+    steps (table below).
+- **Speed is unchanged.** The architecture is the released decoder's (RTF 0.0054 on a quieter GPU, table above).
+
+Resynthesis check: real latents of 24 held-out utterances, decoded and compared with their recordings.
+
+| decoder | UTMOSv2 | DNSMOS SIG / BAK / OVRL | multi-scale mel L1 to the recording |
+|---|---|---|---|
+| (the recordings) | 2.851 | 3.56 / 3.96 / 3.24 | – |
+| released | 2.660 | 3.55 / 3.99 / 3.24 | 1.161 |
+| fine-tuned, 20k steps | 2.515 | 3.55 / 4.01 / 3.25 | **1.101** |
+
+- **Clean decoding is kept.** DNSMOS is unchanged, and the output is closer to the recordings: mel L1 1.101 against
+  1.161.
+- **UTMOSv2 loses 0.15.** At 2.5k steps the loss was 0.48, and it was uniform: every one of the 24 utterances was
+  worse. It is not a spectral-tilt effect: matching the long-term spectra moves UTMOSv2 by at most 0.04.
+- **The mel regression causes it, not the discriminators.** The decoder is asked to rebuild the recordings from
+  generated latents, which lack their fine structure. A mel-loss-only fine-tune with no discriminators, 2k steps:
+  - loses more on resynthesis (UTMOSv2 1.91), although its mel L1 is the lowest (1.057);
+  - cleans generated speech much less (OVRL 2.36).
+  The adversarial terms win this naturalness back as training goes on.
+
+Snapshots on the same 24 Freya sentences and 24 held-out utterances:
+
+| steps | Freya UTMOSv2 | Freya DNSMOS SIG / BAK / OVRL | resynthesis UTMOSv2 | resynthesis mel L1 |
+|---|---|---|---|---|
+| released decoder | 2.084 | 1.69 / 2.65 / 1.45 | 2.660 | 1.161 |
+| 2.5k | 1.500 | 3.26 / 4.09 / 3.02 | 2.176 | 1.145 |
+| 5k | 1.757 | 3.34 / 4.07 / 3.10 | 2.174 | 1.134 |
+| 10k | 2.071 | 3.44 / 4.11 / 3.21 | 2.274 | 1.137 |
+| 15k | 2.258 | 3.45 / 4.11 / 3.21 | 2.381 | 1.166 |
+| 17.5k | 2.408 | 3.48 / 4.10 / 3.24 | 2.449 | 1.095 |
+| 20k | 2.327 | 3.46 / 4.10 / 3.22 | 2.515 | 1.101 |
+
+During training:
+- The mel L1 on real-latent segments fell from 1.155 (first 2.5k steps) to 1.05; the released decoder scores about
+  1.14 on such segments.
+- On generated-latent segments it fell from 2.32 to 2.17. Generated latents differ from the recording in fine
+  prosody, so this loss has a floor.
+- The discriminator losses rose slightly (MPD 1.69 → 2.0).
+
+Open issues:
+- UTMOSv2 is still rising at 20k steps, and longer training may close more of the gap to v3.1.
+- The remaining gap is in the generated latents themselves (#27, generator side): the decoder can only invent the
+  frame-level detail they lack.
+- UTMOSv2 is trained on English and is only a relative proxy, so listen before choosing a checkpoint.

@@ -21,6 +21,8 @@ natural log floored at 1e-5). Any vocoder trained on this mel can turn them into
   fine-tune (`drifting-tts finetune-vocoder`), built with the code of its NVIDIA `repo`. `{"vocos", "init", "mel":
   "bigvgan", "head_padding": "same"}` is a Vocos fine-tuned on BigVGAN-style mels: with a `same` ISTFT head, frame
   *i* is centred on sample *i* · 256 + 128, as in BigVGAN, and T frames give T · 256 samples.
+  `{"decoder", "backend", "target_rate"}` is a fine-tuned VAE decoder (`decoder_ft.pt`, `vocoder.arch:
+  vae_decoder`) for a model trained on VAE latents: see [LATENTS.md](LATENTS.md#fine-tuning-the-voxcpm2-decoder-on-generated-latents-27).
 - **The NVIDIA repos** ship the same `bigvgan.py`, and their configs use the same mel as ours (v1: `fmax: 12000`;
   v2: `fmax: null`, i.e. 12 kHz). All three load through `build_bigvgan(repo=...)`. The fused anti-aliased activation
   kernel (`cuda_kernel=True`) is the same snake-beta kernel in v1, v1-base and v2. On real mels its output is within
