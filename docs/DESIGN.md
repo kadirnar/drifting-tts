@@ -207,3 +207,79 @@ temperature. The useful signals are:
 - Theory and estimators: Sinkhorn drifting (2603.12366), W-Flow (2605.11755; bias of diagonal
   masking), ABC minibatch correction (2604.27239), the friction analysis (2604.18194; with one target
   the spread around it is set by `τ`).
+
+## 8. A GAN-free vocoder (experimental)
+
+A GAN vocoder has two losses: a reconstruction loss (multi-scale mel L1) for the content, and an adversarial loss
+for realism, where a discriminator judges local patches. `vocoder.objective: drift`
+(`drifting_tts/drift_vocoder.py`) keeps the first and replaces the second with the drifting field. The field is
+computed in a **frozen** feature space, as the paper computes it in a frozen pretrained MAE. No discriminator is
+trained.
+
+| GAN fine-tuning | drift fine-tuning |
+|---|---|
+| `wave = G(mel)` | `wave = G(mel, z)`: `noise_channels` Gaussian channels at the frame rate are appended to the mel. Their input weights start at zero, so the released weights are unchanged at step 0. |
+| one waveform per mel segment | `S = drift.samples` waveforms per segment |
+| discriminators trained alongside | frozen feature maps: every layer of NVIDIA's released BigVGAN-v2 MPD and CQT-D, log-\|STFT\| patches at 3 resolutions, optionally an SSL encoder. Each map is locations × channels. |
+| adversarial + feature-matching loss | drift loss: `conditional` and / or `pooled` pairing (below) |
+
+**Pairing.**
+- `conditional`: one drift problem per (segment, feature location). The positive is the real waveform's feature at
+  that location (`P = 1`; `drift.pos_shifts` adds time-shifted copies). The negatives are the other `S − 1` samples.
+  The problem has the layout of the TTS model's per-location problems (§2).
+- `pooled`: one problem per feature map over all segments of the batch: `B·S·L'` generated patches against `B·L'` real
+  ones, with `L' = drift.pooled_locations` random locations. This matches the distribution of local patches, which is
+  what a patch discriminator judges.
+
+Both pairings can be weighted and combined. The temperatures follow `drift.py`: the official fixed set, or one learned
+Kyutai temperature per pairing (`drift.mode: kyutai`). The feature maps need no hand normalisation, because the field
+divides each map by its mean pairwise distance.
+
+**Design decisions.**
+- **Inference at `z = 0`.** The export has the GAN fine-tunes' layout plus `noise_channels`. At `z = 0` the noise
+  columns of the input convolution contribute nothing, so `Vocoder` and `load_bigvgan` drop them and load a standard
+  Vocos or BigVGAN. The streaming vocoder and CUDA graphs then work unchanged, and so do the ONNX and MLX converters
+  of a BigVGAN (both load through `load_bigvgan`). Fixed noise (`Vocoder(noise_seed=…)`) depends
+  on the utterance length, so a streamed window would not see the same noise as the full utterance. In a 400-step
+  smoke run (Vocos, 32 dev utterances) `z = 0` and two fixed seeds were within 0.0004 of each other in multi-scale
+  mel L1 against the recordings, although the two seeds differed from each other by 0.49.
+- **One feature part at a time.** The step back-propagates the drift loss to a detached copy of the waveforms, one
+  sub-discriminator (or the STFT set, or the SSL encoder) at a time. It then sends the summed gradient through the
+  generator in one backward pass, together with the mel loss. Only one part's graph is alive (the largest, a CQT-D
+  sub-discriminator, holds ~0.9 GB of activations for 8 waveforms of 16384 samples). The gradient equals
+  back-propagation through the whole feature space (`tests/test_drift_vocoder.py`), and 16 Vocos waveforms of 16384
+  samples train in 4.0 GB.
+- **No cuDNN autotuning** for this trainer. The ~50 frozen convolution shapes made the first step take ~95 s and spike
+  to 12 GB of workspace, and later steps were slower than with the default algorithms.
+
+**Open questions.** The released discriminators were trained against BigVGAN-v2 at the end of its training, so their
+features may not resolve the artefacts of a Vocos. With `P = 1`, the conditional field pulls every sample towards
+the recorded phase at each location. The pooled field does not, so the balance between the two pairings is the main
+knob of the pilot.
+
+**Results: a negative result so far.** Three 20k-step pilots fine-tuned the released Vocos on the v3.1 mels.
+- Config: `configs/vocoder_drift_vocos.yaml`, GTA mels at T = 0.3, mel loss ×15.
+- They were scored like the other rows of [VOCODERS.md](VOCODERS.md): 495 Freya-TR-Eval sentences at `z = 0`.
+- The baseline is the GAN fine-tune of the same Vocos, at 40k steps.
+
+| Vocos fine-tune | WER | CER | UTMOSv2 | DNSMOS OVRL | DNSMOS P.808 |
+|---|---|---|---|---|---|
+| GAN (`vocos-ft`, 40k steps) | 1.56% | 0.29% | **2.627** | **3.302** | **3.887** |
+| drift: conditional + pooled | **1.13%** | **0.21%** | 1.403 | 3.146 | 3.499 |
+| drift: pooled only | 1.41% | 0.26% | 1.401 | 3.102 | 3.407 |
+| drift: conditional + pooled, `drift_coeff` 3 | 1.43% | 0.27% | 1.840 | 2.975 | 3.551 |
+| `griffin-lim`, for reference | 1.20% | 0.24% | 1.772 | 3.127 | 3.465 |
+
+- **Content is learned; realism is not.** Every drift run is as intelligible as the GAN fine-tune or more, but
+  UTMOSv2 stays at or near the Griffin-Lim floor.
+- **Fixed noise does not help.** Sampling `z` from a fixed seed instead of `z = 0` changed UTMOSv2 by less than 0.1
+  on 40 sentences.
+- **The pairing barely matters.** Dropping the conditional pairing left UTMOSv2 unchanged. This rules out the
+  "pull towards the recorded phase" as the main cause.
+- **A stronger drift helps but is far from enough.** Tripling the drift weight raised UTMOSv2 from 1.40 to 1.84,
+  with a lower DNSMOS OVRL.
+
+The likely limit is the frozen feature space. Discriminators trained against BigVGAN-v2 do not resolve what makes a
+Vocos output sound synthetic, and a trained discriminator can follow the generator's artefacts. Untested directions:
+features of a self-supervised speech model (`features.ssl`), larger drift weights with a lower mel weight, and
+discriminators fine-tuned as feature extractors.

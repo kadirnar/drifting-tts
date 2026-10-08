@@ -1,0 +1,23 @@
+# GAN-free BigVGAN-base (v1, 14 M) fine-tuning with the drifting objective (issue #18): configs/vocoder_drift_vocos.yaml
+# with NVIDIA's released BigVGAN-base generator (our mel: 24 kHz, 100 bands, hop 256, fmax 12 kHz). Only the generator
+# is loaded; the frozen feature space is the same (BigVGAN-v2's released MPD + CQT-D and log-STFT patches). The export
+# (bigvgan_ft.pt) runs at z = 0: drifting_tts.vocoder.load_bigvgan folds the noise channels away.
+base: vocoder_drift_vocos.yaml
+
+vocoder:
+  objective: drift
+  backend: bigvgan
+  arch: bigvgan
+  repo: nvidia/bigvgan_base_24khz_100band
+  pretrained: true                 # released generator (bigvgan_generator.pt)
+  hparams: {}                      # config.json overrides (architecture changes need pretrained: false)
+  noise_channels: 8
+
+train:
+  steps: 20000
+  batch_size: 4                    # B x S = 16 waveforms of 8192 samples: ~10 GB (2: 5.7 GB measured, RTX 5090)
+  segment_frames: 32               # 32 mel frames <-> 8192 samples, BigVGAN-base's training segment
+  lr: 2.0e-5                       # as the GAN fine-tune of BigVGAN-base (configs/vocoder_bigvgan_base.yaml)
+  lr_decay: 1.0
+  grad_clip: 500.0                 # clip_grad_norm of the BigVGAN recipe
+  compile: true                    # torch.compile the anti-aliased activations (~2 min to compile)
