@@ -218,10 +218,33 @@ Evaluation: `drifting-tts benchmark` on the first 100 Freya-TR-Eval sentences, s
 - **VoxCPM2 is the faster model.** With patch 4 on 100 Hz frames, the generator sees 25 tokens per second of audio,
   against 47 for mels with patch 2. It trains 2.5× and synthesises 3× faster.
 
-Next steps:
-- A longer VoxCPM2 run, to see whether naturalness catches up while the intelligibility lead holds. The released
-  mel model was trained far longer than these pilots.
-- Fine-tuning the VoxCPM2 decoder on generated latents, the latent counterpart of the GTA vocoder fine-tune.
+### Longer training and the released model
+
+The VoxCPM2 pilot was continued from 10k to 50k steps, at the same constant learning rate after warm-up. It was
+then evaluated on the same 100 sentences as above, next to the released v3.1 (mels + `bigvgan-v2-ft`):
+
+| model | WER | CER | UTMOSv2 |
+|---|---|---|---|
+| v3.1, released | **0.66%** | **0.14%** | **2.934** |
+| VoxCPM2 latents, 10k steps | 4.94% | 1.39% | 2.052 |
+| VoxCPM2 latents, 50k steps | 7.57% | 2.50% | 1.904 |
+
+- **Longer training made the latent model worse.** On four validation sentences sampled every 10k steps, the CER
+  stays at 10–15% with no downward trend.
+- **The latent objective plateaus early.** The mel model of the same recipe was trained far longer and reached
+  0.66% WER, so the plateau is specific to the latent target.
+- The released model stays well ahead on every column.
+
+Both latent checkpoints are on the Hub
+([`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2)).
+[`Vyvo/drifting-tts-tr-compare`](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare) plays them next to
+v3.1.
+
+Open directions:
+- **A decaying learning rate**, or a larger drift batch, in case the constant rate keeps the latent model from settling.
+- **Fine-tuning the VoxCPM2 decoder on generated latents**, the latent counterpart of the GTA vocoder fine-tune.
+- **Kernel features.** The latent MAE may be the bottleneck. Mel-MAE features of the decoded audio are an
+  alternative.
 
 ```bash
 drifting-tts extract-latents --data data/train --backend voxcpm2 --out data/train_voxcpm2   # --repeat 4
