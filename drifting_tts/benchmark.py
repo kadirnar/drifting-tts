@@ -25,6 +25,7 @@ import soundfile as sf
 import torch
 
 from .audio import SAMPLE_RATE
+from .synthesize import add_vocoder_args
 from .voices import DEFAULT_VOICE, VOICES
 
 FREYA = "freyavoice/freya-tr-eval"
@@ -32,7 +33,7 @@ FREYA = "freyavoice/freya-tr-eval"
 
 def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="TTS checkpoint")
-    p.add_argument("--vocoder", default=None, help="fine-tuned vocoder (bigvgan_ft.pt / vocos_ft.pt)")
+    add_vocoder_args(p)
     p.add_argument("--texts", default=FREYA, help="HF dataset id, .jsonl (field 'text') or .txt")
     p.add_argument("--num", type=int, default=0, help="first N sentences only (0: all)")
     p.add_argument("--speaker", nargs="+", default=[DEFAULT_VOICE],
@@ -43,7 +44,6 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--asr", default="large-v3")
     p.add_argument("--mos", default="utmosv2", choices=["utmosv2", "utmos22", "none"])
     p.add_argument("--save-wavs", type=int, default=20)
-    p.add_argument("--cuda-kernel", action="store_true")
     p.add_argument("--stream", action="store_true", help="synthesise with Synthesizer.stream (streaming vocoder)")
     p.add_argument("--fast", action="store_true", help="CUDA graphs, Synthesizer(fast=True); implies --stream")
     p.add_argument("--out", default="outputs/benchmark")

@@ -40,8 +40,7 @@ from huggingface_hub import hf_hub_download
 from drifting_tts.synthesize import Synthesizer
 
 repo = "Vyvo/drifting-tts-tr"
-tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda",
-                  vocoder=hf_hub_download(repo, "bigvgan_v2_ft.pt"))
+tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft")
 
 wav, info = tts("Merhaba, bu cümle tek adımda üretildi.", speaker="studio", cfg_scale=2.0, temperature=0.3)
 sf.write("merhaba.wav", wav.numpy(), 24000)
@@ -51,6 +50,9 @@ sf.write("merhaba.wav", wav.numpy(), 24000)
   IDs also works, e.g. `speaker=17`; [docs/SPEAKERS.md](docs/SPEAKERS.md) scores every one of them.
 - `temperature`: the noise level. 0.3 sounds clearest; higher values give more variety.
 - `cfg_scale`: the guidance strength, learned during training, so it costs nothing at inference.
+- `vocoder`: `"bigvgan-v2-ft"` is the BigVGAN-v2 fine-tuned on this model's mels (downloaded from the Hub). Other
+  names: the stock NVIDIA `"bigvgan-v2"`, `"bigvgan-v1"` and `"bigvgan-base"` (14 M), or the weight-free
+  `"griffin-lim"`; a checkpoint path also works. [docs/VOCODERS.md](docs/VOCODERS.md) compares them.
 - Numbers, dates, times, units, currencies and common abbreviations are read out in Turkish automatically.
 
 The same from the command line:
@@ -67,8 +69,8 @@ in overlapping windows whose pieces join into the whole-sentence audio; Freya WE
 ([details](docs/RESULTS.md#latency-and-size)):
 
 ```python
-tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda",
-                  vocoder=hf_hub_download(repo, "bigvgan_v2_ft.pt"), cuda_kernel=True, fast=True)
+tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft",
+                  cuda_kernel=True, fast=True)
 for piece in tts.stream("Merhaba! Bu ses parça parça, bekletmeden geliyor.", speaker="studio",
                         cfg_scale=2.0, temperature=0.3):
     play(piece)   # float32 tensor at 24 kHz
@@ -182,6 +184,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 |---|---|
 | [docs/RESULTS.md](docs/RESULTS.md) | benchmark details, voices, latency and parameter counts |
 | [docs/SPEAKERS.md](docs/SPEAKERS.md) | WER, CER, DNSMOS, UTMOSv2, pitch and speaking rate of all 723 speaker IDs |
+| [docs/VOCODERS.md](docs/VOCODERS.md) | the vocoder registry and a comparison on the same mels: quality, speed, streaming |
 | [docs/TRAINING.md](docs/TRAINING.md) | the training recipe, the evidence behind each choice, adding a voice |
 | [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
@@ -191,6 +194,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
+| [scripts/compare_vocoders.py](scripts/compare_vocoders.py) | vocoder comparison ([docs/VOCODERS.md](docs/VOCODERS.md)) |
 
 ## Limitations
 

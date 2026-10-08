@@ -37,6 +37,7 @@ from .audio import SAMPLE_RATE
 from .data import MelDataset, collate
 from .judges import SV_MODELS, Judges
 from .metrics import SpectralComparison, bootstrap_ci, error_counts, mel_center_freqs
+from .synthesize import add_vocoder_args
 from .text import normalize
 
 
@@ -63,8 +64,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out", default="outputs/eval")
     p.add_argument("--save-wavs", type=int, default=10, help="wavs written per row")
     p.add_argument("--no-gt", action="store_true", help="skip the recording / copy-synthesis rows")
-    p.add_argument("--vocoder", default=None, help="fine-tuned vocoder (vocos_ft.pt / bigvgan_ft.pt)")
-    p.add_argument("--cuda-kernel", action="store_true", help="BigVGAN: fused activation CUDA kernel (faster)")
+    add_vocoder_args(p)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
 
