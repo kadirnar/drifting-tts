@@ -49,7 +49,8 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
 
     stock = "the stock vocoder of the model's mel front end (BigVGAN-v2 or Vocos)"
     p.add_argument("--vocoder", default=default,
-                   help=f"{' | '.join(VOCODERS)} or a checkpoint (bigvgan_ft.pt / vocos_ft.pt from finetune-vocoder); "
+                   help=f"{' | '.join(VOCODERS)} or a checkpoint (bigvgan_ft.pt / vocos_ft.pt from finetune-vocoder; "
+                        "for a model trained on VAE latents: a fine-tuned decoder, decoder_ft.pt); "
                         "revox[:<F0 source>[:dio|harvest]] is Minori Live - Revox Vocoder 1.0 "
                         "(https://huggingface.co/minori-live/revox-vocoder-1), CC BY-NC-SA 4.0: non-commercial use "
                         f"only; default: {default or stock}")
@@ -67,7 +68,9 @@ class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
-        checkpoint path, or ``None`` for the stock vocoder of the model's mel front end.
+        checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
+        latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
+        decoder (``decoder_ft.pt`` of ``finetune-vocoder``).
         ``fast`` (CUDA): the acoustic model and the streaming vocoder's windows run as CUDA graphs
         (:mod:`drifting_tts.fast`), captured here (about 2 s); the output is the same as without it. ``compile`` also
         fuses the DiT with ``torch.compile`` (about 20 s the first time) and ``tf32`` uses TF32 matmuls: both are
@@ -81,7 +84,10 @@ class Synthesizer:
         if self.backend in VAE_BACKENDS:  # a model trained on VAE latents: the VAE decoder is the vocoder
             from .latents.vocoder import LatentVocoder
 
-            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1))
+            if vocoder is not None and not Path(vocoder).is_file():
+                raise ValueError(f"a model trained on {self.backend} latents decodes them with its VAE decoder: "
+                                 f"vocoder must be a fine-tuned decoder checkpoint (decoder_ft.pt), not {vocoder!r}")
+            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1), decoder=vocoder)
         else:
             self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=self.backend)
         if self.vocoder.mel != self.backend:
