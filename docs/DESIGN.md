@@ -256,3 +256,30 @@ divides each map by its mean pairwise distance.
 features may not resolve the artefacts of a Vocos. With `P = 1`, the conditional field pulls every sample towards
 the recorded phase at each location. The pooled field does not, so the balance between the two pairings is the main
 knob of the pilot.
+
+**Results: a negative result so far.** Three 20k-step pilots fine-tuned the released Vocos on the v3.1 mels.
+- Config: `configs/vocoder_drift_vocos.yaml`, GTA mels at T = 0.3, mel loss ×15.
+- They were scored like the other rows of [VOCODERS.md](VOCODERS.md): 495 Freya-TR-Eval sentences at `z = 0`.
+- The baseline is the GAN fine-tune of the same Vocos, at 40k steps.
+
+| Vocos fine-tune | WER | CER | UTMOSv2 | DNSMOS OVRL | DNSMOS P.808 |
+|---|---|---|---|---|---|
+| GAN (`vocos-ft`, 40k steps) | 1.56% | 0.29% | **2.627** | **3.302** | **3.887** |
+| drift: conditional + pooled | **1.13%** | **0.21%** | 1.403 | 3.146 | 3.499 |
+| drift: pooled only | 1.41% | 0.26% | 1.401 | 3.102 | 3.407 |
+| drift: conditional + pooled, `drift_coeff` 3 | 1.43% | 0.27% | 1.840 | 2.975 | 3.551 |
+| `griffin-lim`, for reference | 1.20% | 0.24% | 1.772 | 3.127 | 3.465 |
+
+- **Content is learned; realism is not.** Every drift run is as intelligible as the GAN fine-tune or more, but
+  UTMOSv2 stays at or near the Griffin-Lim floor.
+- **Fixed noise does not help.** Sampling `z` from a fixed seed instead of `z = 0` changed UTMOSv2 by less than 0.1
+  on 40 sentences.
+- **The pairing barely matters.** Dropping the conditional pairing left UTMOSv2 unchanged. This rules out the
+  "pull towards the recorded phase" as the main cause.
+- **A stronger drift helps but is far from enough.** Tripling the drift weight raised UTMOSv2 from 1.40 to 1.84,
+  with a lower DNSMOS OVRL.
+
+The likely limit is the frozen feature space. Discriminators trained against BigVGAN-v2 do not resolve what makes a
+Vocos output sound synthetic, and a trained discriminator can follow the generator's artefacts. Untested directions:
+features of a self-supervised speech model (`features.ssl`), larger drift weights with a lower mel weight, and
+discriminators fine-tuned as feature extractors.

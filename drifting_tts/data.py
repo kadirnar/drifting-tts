@@ -60,21 +60,42 @@ def passes(rec: dict | None, rules: list[tuple[str, float, float]]) -> bool:
 
 
 class MelStats:
-    """Global scalar normalisation of log-mels: ``(mel - mean) / std``."""
+    """Normalisation ``(x - mean) / std``: one scalar for log-mels, one value per channel for VAE latents (lists in
+    ``stats.json``; a channel's std is floored at ``min_std`` so collapsed channels stay finite)."""
 
-    def __init__(self, mean: float, std: float):
-        self.mean, self.std = float(mean), float(std)
+    def __init__(self, mean: float | list[float], std: float | list[float], min_std: float = 1e-3):
+        m, s = torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32)
+        if m.numel() == 1:
+            self.mean, self.std = float(m), float(s)
+        else:  # [C, 1]: broadcasts over [..., C, T]
+            self.mean, self.std = m.reshape(-1, 1), s.reshape(-1, 1).clamp_min(min_std)
 
     @classmethod
     def load(cls, root: str | Path) -> MelStats:
         s = json.loads((Path(root) / "stats.json").read_text())
         return cls(s["mean"], s["std"])
 
+    @property
+    def per_channel(self) -> bool:
+        return isinstance(self.mean, torch.Tensor)
+
+    def _on(self, x: torch.Tensor):
+        if not self.per_channel:
+            return self.mean, self.std
+        return self.mean.to(x.device, x.dtype), self.std.to(x.device, x.dtype)
+
     def normalize(self, mel: torch.Tensor) -> torch.Tensor:
-        return (mel - self.mean) / self.std
+        mean, std = self._on(mel)
+        return (mel - mean) / std
 
     def denormalize(self, mel: torch.Tensor) -> torch.Tensor:
-        return mel * self.std + self.mean
+        mean, std = self._on(mel)
+        return mel * std + mean
+
+    def to_dict(self) -> dict:
+        if not self.per_channel:
+            return {"mean": self.mean, "std": self.std}
+        return {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
 
 
 class MelDataset(Dataset):
@@ -98,7 +119,11 @@ class MelDataset(Dataset):
     ):
         root = Path(root)
         self.stats = MelStats.load(root)
-        self.backend = json.loads((root / "stats.json").read_text()).get("backend", "vocos")
+        st = json.loads((root / "stats.json").read_text())
+        self.backend = st.get("backend", "vocos")
+        # features per frame and frames per second: 100 log-mel bins at 93.75 Hz, or VAE latents (extract-latents)
+        self.dim, self.frame_rate = int(st.get("dim", N_MELS)), float(st.get("frame_rate", FRAME_RATE))
+        self.latent_repeat = int(st.get("latent_repeat", 1))  # extract-latents: copies of every VAE frame
         self.with_f0 = with_f0
         self._f0_path = root / "f0.bin"
         if with_f0 and not self._f0_path.exists():
@@ -128,7 +153,7 @@ class MelDataset(Dataset):
         if rules and not scores:
             print(f"data.filters: no {root / 'scores.jsonl'} (run `drifting-tts score`), nothing filtered")
         elif rules:
-            hours = sum(e["frames"] for e in self.items) / FRAME_RATE / 3600
+            hours = sum(e["frames"] for e in self.items) / self.frame_rate / 3600
             total = len(self.items) + failed * drop
             print(f"data.filters ({split}): {failed}/{total} utterances fail; "
                   + (f"kept {len(self.items)} ({hours:.1f} h)" if drop else "not filtered (apply_to_val: false)"))
@@ -139,7 +164,7 @@ class MelDataset(Dataset):
     @property
     def mels(self) -> np.ndarray:
         if self._mels is None:
-            self._mels = np.memmap(self._mels_path, dtype=np.float16, mode="r").reshape(-1, N_MELS)
+            self._mels = np.memmap(self._mels_path, dtype=np.float16, mode="r").reshape(-1, self.dim)
         return self._mels
 
     @property
@@ -183,7 +208,7 @@ def collate(batch: list[dict]) -> dict:
     text_len = torch.tensor([b["text"].numel() for b in batch])
     mel_len = torch.tensor([b["mel"].shape[1] for b in batch])
     text = torch.full((B, int(text_len.max())), PAD_ID, dtype=torch.long)
-    mel = torch.zeros(B, N_MELS, int(mel_len.max()))
+    mel = torch.zeros(B, batch[0]["mel"].shape[0], int(mel_len.max()))
     for i, b in enumerate(batch):
         text[i, : text_len[i]] = b["text"]
         mel[i, :, : mel_len[i]] = b["mel"]

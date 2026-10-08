@@ -14,6 +14,7 @@ import torch
 
 from .audio import SAMPLE_RATE
 from .data import MelStats
+from .latents import VAE_BACKENDS
 from .text import normalize, split_sentences, text_to_ids  # noqa: F401 (split_sentences re-exported)
 from .voices import DEFAULT_VOICE, VOICES, voice_id
 
@@ -49,7 +50,9 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
     stock = "the stock vocoder of the model's mel front end (BigVGAN-v2 or Vocos)"
     p.add_argument("--vocoder", default=default,
                    help=f"{' | '.join(VOCODERS)} or a checkpoint (bigvgan_ft.pt / vocos_ft.pt from finetune-vocoder); "
-                        f"default: {default or stock}")
+                        "revox[:<F0 source>[:dio|harvest]] is Minori Live - Revox Vocoder 1.0 "
+                        "(https://huggingface.co/minori-live/revox-vocoder-1), CC BY-NC-SA 4.0: non-commercial use "
+                        f"only; default: {default or stock}")
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
 
@@ -74,11 +77,16 @@ class Synthesizer:
 
         self.model, self.cfg, stats = load_tts(model_path, device)
         self.stats = MelStats(stats["mean"], stats["std"])
-        backend = stats.get("backend", "vocos")
-        self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=backend)
-        if self.vocoder.mel != backend:
+        self.backend = stats.get("backend", "vocos")
+        if self.backend in VAE_BACKENDS:  # a model trained on VAE latents: the VAE decoder is the vocoder
+            from .latents.vocoder import LatentVocoder
+
+            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1))
+        else:
+            self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=self.backend)
+        if self.vocoder.mel != self.backend:
             raise ValueError(f"vocoder {self.vocoder.name!r} expects {self.vocoder.mel} mels, but the model produces "
-                             f"{backend} mels")
+                             f"{self.backend} mels")
         self.device = device
         self.default_temperature = preferred_temperature(self.model)
         spk_file = Path(self.cfg.data.root) / "speakers.json"

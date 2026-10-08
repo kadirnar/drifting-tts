@@ -4,17 +4,24 @@ import pytest
 import torch
 from huggingface_hub.constants import HF_HUB_CACHE
 
-from drifting_tts.audio import HOP_LENGTH, BigVGANLogMel, LogMel
+from drifting_tts.audio import HOP_LENGTH, BigVGANLogMel, LogMel, world_f0
 from drifting_tts.fast import stream_vocoder
 from drifting_tts.vocoder import (
     BASE_REPO,
     BIGVGAN_REPO,
+    REVOX_REPO,
+    REVOX_REVISION,
     VOCODERS,
     GriffinLim,
+    RevoxLogMel,
     Vocoder,
     checkpoint_kind,
     load_vocoder,
     ola_istft,
+    resample_sharp,
+    revox_frames,
+    revox_pitch,
+    to_revox_frames,
 )
 
 
@@ -48,12 +55,15 @@ def test_registry_entries():
     assert {"bigvgan-v2-ft", "bigvgan-v2", "bigvgan-v1", "bigvgan-base", "bigvgan-base-ft", "vocos-ft",
             "griffin-lim"} <= set(VOCODERS)
     for name, e in VOCODERS.items():
-        assert e.kind in ("bigvgan", "vocos", "griffin-lim"), name
+        assert e.kind in ("bigvgan", "vocos", "griffin-lim", "revox"), name
         assert e.context is None or e.context > 0
         if e.kind == "bigvgan":
             assert e.repo.startswith("nvidia/") and e.mel == "bigvgan"
     assert VOCODERS["griffin-lim"].context is None and VOCODERS["griffin-lim"].mel is None
     assert VOCODERS["bigvgan-base-ft"].repo == BASE_REPO and VOCODERS["vocos-ft"].mel == "bigvgan"
+    revox = VOCODERS["revox"]
+    assert revox.context is None and revox.mel == "bigvgan" and revox.repo == REVOX_REPO
+    assert "non-commercial" in revox.about and "Minori Live" in revox.about  # CC BY-NC-SA 4.0, attributed
 
 
 def test_unknown_vocoder_and_checkpoint_kinds(tmp_path):
@@ -205,3 +215,84 @@ def test_synthesizer_with_registry_names(tmp_path):
     torch.save({"vocos": model.state_dict(), "init": cfg, "step": 1}, tmp_path / "vocos_ft.pt")  # Vocos mels
     with pytest.raises(ValueError, match="expects vocos mels"):
         Synthesizer(_tiny_tts_checkpoint(tmp_path, "bigvgan"), "cpu", vocoder=str(tmp_path / "vocos_ft.pt"))
+
+
+def _harmonic(seconds: float = 1.0, f0: float = 140.0, glide: float = 20.0) -> torch.Tensor:
+    """A gliding 29-harmonic tone with a 3 Hz amplitude modulation, 24 kHz ``[1, samples]``."""
+    t = torch.arange(int(24_000 * seconds)) / 24_000
+    phase = 2 * torch.pi * torch.cumsum(f0 + glide * t, 0) / 24_000
+    return 0.1 * sum(torch.sin(h * phase) / h for h in range(1, 30))[None] * (0.6 + 0.4 * torch.sin(6 * torch.pi * t))
+
+
+def test_revox_frames_and_time_interpolation():
+    assert [revox_frames(t) for t in (1, 15, 30, 31)] == [2, 16, 32, 34]  # ceil(512 T / 480) at 48 kHz
+    t = 40
+    times = (torch.arange(t) + 0.5) * HOP_LENGTH / 24_000  # BigVGAN frame centres
+    y = to_revox_frames(3 + 2 * times[None])
+    k = torch.arange(revox_frames(t)) / 100  # Revox frame centres
+    inner = (k * 93.75 - 0.5 >= 0) & (k * 93.75 - 0.5 <= t - 1)
+    torch.testing.assert_close(y[0, inner], 3 + 2 * k[inner])  # a linear ramp is reproduced exactly
+    assert not inner[0] and y[0, 0] == 3 + 2 * times[0]  # frame 0 (0 s) precedes the first centre: held
+
+
+def test_revox_mel_conversion_matches_upsampled_audio():
+    """Revox's mel converted from the 24 kHz magnitude matches its mel of the audio upsampled x2, in dB."""
+    x, gl, front = _harmonic(), GriffinLim("bigvgan"), RevoxLogMel()
+    frames = x.shape[-1] // HOP_LENGTH
+    truth = front(resample_sharp(x, 24_000, 48_000))[..., : revox_frames(frames)]
+    top = (front.fb.shape[-1] - 1 - (front.fb.flip(-1) > 0).float().argmax(-1)) * 24_000 / (front.fb.shape[-1] - 1)
+    low = top < 11_500  # below the upsampler's transition band
+
+    def error_db(mel: torch.Tensor) -> tuple[float, float]:
+        d, ref = (mel - truth)[0, low, 2:-2], truth[0, low, 2:-2]  # the edge frames see different padding
+        d = 20 / torch.log(torch.tensor(10.0)) * d[ref > ref.max() - 6.9]  # within 60 dB of the peak
+        return float(d.abs().mean()), float(d.mean())
+
+    mae, bias = error_db(front.convert(gl.stft(x).abs()[..., :frames]))  # exact magnitude: x2 and timing
+    assert mae < 0.5 and abs(bias) < 0.2
+    mae, bias = error_db(front.convert(gl.magnitude(BigVGANLogMel()(x))))  # through our mel and NNLS
+    assert mae < 2.0 and abs(bias) < 0.5
+
+
+@pytest.mark.parametrize("method", ["dio", "harvest"])
+def test_revox_pitch(method):
+    x = _harmonic(glide=0.0)[0]
+    k = revox_frames(x.numel() // HOP_LENGTH)
+    f0, voiced, valid = revox_pitch(x, 24_000, k, method)
+    assert f0.shape == voiced.shape == valid.shape == (k,) and valid.all() and torch.equal(voiced, f0 > 0)
+    assert voiced[5:-5].all() and abs(float(f0[voiced].median()) / 140 - 1) < 0.02
+
+
+def _revox_cached() -> bool:
+    pytest.importorskip("onnxruntime")
+    from huggingface_hub import hf_hub_download
+
+    try:
+        hf_hub_download(REVOX_REPO, "vocoder.onnx", revision=REVOX_REVISION, local_files_only=True)
+    except Exception:
+        return False
+    return True
+
+
+def test_revox_vocoder(tmp_path):
+    """Needs the Revox ONNX in the HF cache (non-commercial weights, never bundled): skipped otherwise."""
+    if not _revox_cached():
+        pytest.skip(f"{REVOX_REPO} not in the HF cache")
+    voc = load_vocoder("revox:griffin-lim:harvest", "cpu")
+    assert voc.kind == "revox" and voc.mel == "bigvgan" and voc.context is None and not voc.graphs
+    assert voc.num_params == 4_463_874 and voc.model.f0 == "griffin-lim" and voc.model.method == "harvest"
+    mel = BigVGANLogMel()(_harmonic(glide=0.0))
+    wav = voc(mel)
+    assert wav.shape == (1, mel.shape[-1] * HOP_LENGTH) and wav.abs().max() <= 1 and torch.isfinite(wav).all()
+    f0 = world_f0(wav[0].double().numpy(), 24_000, 10.0, "harvest")
+    assert abs(float(torch.tensor(f0[f0 > 0]).median()) / 140 - 1) < 0.03  # the pitch survives
+    pieces = list(stream_vocoder(voc, mel, context=voc.context))
+    assert len(pieces) == 1 and torch.equal(pieces[0], wav[0])  # one piece per sentence
+
+    from drifting_tts.synthesize import Synthesizer
+
+    synth = Synthesizer(_tiny_tts_checkpoint(tmp_path, "bigvgan"), "cpu", vocoder="revox:none")
+    wav, _ = synth("merhaba dünya. nasılsın?", speaker=0, pause=0.1)
+    mels = synth.mels("merhaba dünya. nasılsın?", speaker=0)
+    assert wav.numel() == sum(m.shape[-1] for m in mels) * HOP_LENGTH + 2400
+    assert len(list(synth.stream("merhaba dünya. nasılsın?", speaker=0, pause=0.1))) == 3

@@ -1,0 +1,13 @@
+# Latent-MAE feature encoder for a model trained on VAE latents (issue #17): the 1-D MAE with the latent channels
+# as input channels (the 2-D Mel-MAE assumes a frequency axis). Data from `drifting-tts extract-latents`.
+base: mae.yaml
+
+data:
+  root: data/train_voxcpm2
+
+model:
+  n_mels: 64            # the latent dimension (VoxCPM2: 64, DAC-VAE: 128)
+  mask_patch: 16        # 160 ms: 4 latent frames, so a masked patch cannot be copied from its own repeats
+
+train:
+  steps: 20000

@@ -179,3 +179,76 @@ DAC-VAE is the second pilot:
   every output.
 
 VoxCPM1.5 is dominated: it has the lowest UTMOSv2 (2.68), the highest band-matched WER and 6 unused channels.
+
+## TTS pilots (#17)
+
+Three pilots trained the same v3 recipe for 10k steps on the same filtered training set:
+- **VoxCPM2 latents** (`configs/tts_latent.yaml`).
+- **DAC-VAE latents** (the same config with the DAC-VAE root and its MAE).
+- **Mels** (`configs/tts_v3.yaml`), the reference.
+
+The latent pilots differ from the mel pilot in three ways:
+- **Frames.** `extract-latents` repeats every 25 Hz latent frame 4 times, so monotonic alignment has a frame per
+  token (characters with blanks come at ~29 per second). The generator uses patch 4, so it still sees one token per
+  latent frame.
+- **Kernel features.** These come from a 1-D latent MAE (`configs/mae_latent.yaml`, 20k steps) instead of the 2-D
+  Mel-MAE.
+- **Decoding.** `LatentVocoder` averages the repeats back and decodes with the released VAE decoder, which is not
+  fine-tuned. The mel pilot uses the fine-tuned BigVGAN-v2.
+
+Evaluation: `drifting-tts benchmark` on the first 100 Freya-TR-Eval sentences, speaker 722, T = 0.3, α = 2.
+- WER / CER: Whisper large-v3 on 8 kHz band-matched audio.
+- UTMOSv2.
+- RTF: the acoustic model plus the decoder or vocoder.
+
+| pilot (10k steps) | WER | CER | sentences with errors | UTMOSv2 | RTF | training speed |
+|---|---|---|---|---|---|---|
+| **VoxCPM2 latents** | **4.94%** | **1.39%** | 29 / 100 | 2.052 | **0.0054** | 7.6 it/s |
+| DAC-VAE latents | 9.55% | 2.91% | 46 / 100 | 1.837 | 0.0239 | 3–4 it/s (GPU shared) |
+| mels | 18.77% | 5.26% | 78 / 100 | **2.746** | 0.0158 | 3.0 it/s |
+
+- **Latents learn to speak much faster.** At the same step count, the VoxCPM2 pilot makes a quarter of the mel
+  pilot's word errors. The mel pilot's errors are spread over most sentences, not concentrated in a few failures.
+- **Naturalness lags.** UTMOSv2 is 2.05 for VoxCPM2 and 1.84 for DAC-VAE, against 2.75 for mels. The decoders'
+  resynthesis ceiling explains only part of this: about 2.80 for both VAEs, 2.92 for BigVGAN. Most of the gap is in
+  the generated latents. The mel pilot also gains from a vocoder fine-tuned on generated mels, which the VAE decoders
+  are not.
+- **VoxCPM2 beats DAC-VAE on every column**, although DAC-VAE has the better ceiling: 64 channels are easier to
+  generate than 128. The DAC-VAE decoder is also slower (RTF 0.0239 against 0.0054).
+- **VoxCPM2 is the faster model.** With patch 4 on 100 Hz frames, the generator sees 25 tokens per second of audio,
+  against 47 for mels with patch 2. It trains 2.5× and synthesises 3× faster.
+
+### Longer training and the released model
+
+The VoxCPM2 pilot was continued from 10k to 50k steps, at the same constant learning rate after warm-up. It was
+then evaluated on the same 100 sentences as above, next to the released v3.1 (mels + `bigvgan-v2-ft`):
+
+| model | WER | CER | UTMOSv2 |
+|---|---|---|---|
+| v3.1, released | **0.66%** | **0.14%** | **2.934** |
+| VoxCPM2 latents, 10k steps | 4.94% | 1.39% | 2.052 |
+| VoxCPM2 latents, 50k steps | 7.57% | 2.50% | 1.904 |
+
+- **Longer training made the latent model worse.** On four validation sentences sampled every 10k steps, the CER
+  stays at 10–15% with no downward trend.
+- **The latent objective plateaus early.** The mel model of the same recipe was trained far longer and reached
+  0.66% WER, so the plateau is specific to the latent target.
+- The released model stays well ahead on every column.
+
+Both latent checkpoints are on the Hub
+([`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2)).
+[`Vyvo/drifting-tts-tr-compare`](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare) plays them next to
+v3.1.
+
+Open directions:
+- **A decaying learning rate**, or a larger drift batch, in case the constant rate keeps the latent model from settling.
+- **Fine-tuning the VoxCPM2 decoder on generated latents**, the latent counterpart of the GTA vocoder fine-tune.
+- **Kernel features.** The latent MAE may be the bottleneck. Mel-MAE features of the decoded audio are an
+  alternative.
+
+```bash
+drifting-tts extract-latents --data data/train --backend voxcpm2 --out data/train_voxcpm2   # --repeat 4
+drifting-tts train-mae --config configs/mae_latent.yaml --workdir runs/mae_voxcpm2 data.root=data/train_voxcpm2
+drifting-tts train --config configs/tts_latent.yaml --workdir runs/tts_voxcpm2 train.steps=10000
+# DAC-VAE: --backend dacvae, and model.n_mels=128 for the MAE
+```
