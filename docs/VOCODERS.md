@@ -13,7 +13,7 @@ natural log floored at 1e-5). Any vocoder trained on this mel can turn them into
 | `bigvgan-base` | NVIDIA BigVGAN-base (v1), 24 kHz, 100 bands | `nvidia/bigvgan_base_24khz_100band` |
 | `bigvgan-base-ft` | BigVGAN-base fine-tuned on this model's mels (14 M parameters) | `Vyvo/drifting-tts-tr`, `bigvgan_base_ft.pt` |
 | `vocos-ft` | Vocos fine-tuned on this model's mels (13.5 M parameters) | `Vyvo/drifting-tts-tr`, `vocos_ft.pt` |
-| `vocos-ft2` | `vocos-ft` trained further with the second recipe ([below](#training-vocos-further)) | local: `runs/vocos_v2/vocos_ft.pt` (not published) |
+| `vocos-v2` | `vocos-ft` trained further with the second recipe ([below](#training-vocos-further)): the vocoder of release v3.2 (`vocos-ft2` is an alias) | `Vyvo/drifting-tts-tr`, `vocos_v2.pt` |
 | `griffin-lim` | mel filterbank inverted by non-negative least squares, then 64 iterations of fast Griffin-Lim | none |
 | `vocos` | `charactr/vocos-mel-24khz`, for models trained on Vocos's own mels | `charactr/vocos-mel-24khz` |
 | `revox` | Minori Live — [Revox Vocoder 1.0](https://huggingface.co/minori-live/revox-vocoder-1) (PC-NSF-Vocos, 48 kHz, 4.5 M parameters) on converted mels, with F0 from the Griffin-Lim audio (`revox:<F0 source>[:dio\|harvest]`). **CC BY-NC-SA 4.0: non-commercial use only.** [Below](#revox-vocoder-10-non-commercial) | `minori-live/revox-vocoder-1`, `vocoder.onnx`, downloaded at runtime |
@@ -105,8 +105,8 @@ Streamed against whole-sentence audio, SNR in dB (full fp32), by context in fram
 
 `vocos-ft` is the fastest vocoder but the least natural fine-tune. Its network stays as it is: the backbone, the
 ISTFT head and the 32 frames of streaming context. Only its training changes. The second recipe is
-`configs/vocoder_vocos_v2.yaml`, and its result is the registry entry `vocos-ft2`, a local checkpoint
-(`runs/vocos_v2/vocos_ft.pt`) that is not on the Hub.
+`configs/vocoder_vocos_v2.yaml`, and its result is the registry entry `vocos-v2` (`vocos_v2.pt` on the Hub), the
+vocoder of release v3.2.
 
 ### Diagnosis: pitch and periodicity
 
@@ -210,7 +210,8 @@ the pilots took 0.6–1.5 h per 10k steps.
 `configs/vocoder_vocos_v2.yaml` (the P3 recipe) runs 160k steps from `vocos-ft`, 200k steps in total. The cosine
 decays the rates to 10% of their peaks, and a snapshot is kept every 5k steps. The snapshot to publish is chosen on
 Freya-100 (UTMOSv2, DNSMOS, WER) and copy-synthesis (F0 error, periodicity), because the last step is not always the
-best. `vocos-ft2` points at P3's 10k snapshot until then.
+best. The final snapshot (160k steps) is the vocoder of release v3.2, published as `vocos_v2.pt`
+(`scripts/prepare_release.py` keeps only what `load_vocoder` reads).
 
 ## Revox Vocoder 1.0 (non-commercial)
 

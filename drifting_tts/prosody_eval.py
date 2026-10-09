@@ -6,12 +6,17 @@ own text is synthesised (T = 0.3, α = 2, ``vocos-ft``, seed = dataset index as 
 * ``recording``: the recording (the reference); ``copy``: its mel through the vocoder (copy-synthesis ceiling);
 * ``predicted``: the released pipeline as is (:class:`Synthesizer`: sentence by sentence, 0.15 s pauses);
   ``pause-punct`` / ``pause-punct-j<J>``: the same with :class:`drifting_tts.prosody.PausePolicy` (jitter J);
+* ``release``: the release pipeline (v3.2): sentence by sentence, durations and token pitch sampled by the
+  ``--release-prosody`` predictor, punctuation pauses, vocoded by ``--release-vocoder``;
 * one pass over the whole text (no sentence split), the prosody combined from ``+``-joined parts:
   ``onepass`` (predicted durations and pitch), ``oracle-dur`` (ground-truth MAS durations: the mel has the
   recording's frame count), ``oracle-pitch`` (ground-truth token pitch), ``oracle-both``, ``pitch-gain-<g>``
   (predicted token pitch scaled around its utterance mean on voiced tokens), ``dur-gain-<g>`` (predicted letter
   log-durations scaled around their mean, total length kept), ``dur-mix-<λ>`` (``(1 - λ)`` predicted + ``λ``
   ground-truth log-durations), e.g. ``oracle-dur+pitch-gain-1.4``.
+
+Suffixes: ``@cfg<α>``, ``@t<T>``, ``@win<N>`` (sampling) and ``@voc=<registry name>`` (another vocoder for that
+system, e.g. ``predicted@voc=bigvgan-v2-ft`` next to ``predicted`` with ``--vocoder vocos-ft``).
 
 The DiT was trained with ground-truth durations and token pitch, so the oracle rows are in distribution: the gap
 between ``onepass`` and ``oracle-both`` is what the deterministic prosody predictors cost.
@@ -83,6 +88,13 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--workers", type=int, default=3, help="CPU processes for F0 extraction (<= 3 on a shared box)")
     p.add_argument("--overwrite", action="store_true", help="recompute systems whose results already exist")
     p.add_argument("--out", default="outputs/prosody")
+    p.add_argument("--release-prosody", default=None,
+                   help="system 'release': the stochastic prosody predictor (drift or a checkpoint)")
+    p.add_argument("--release-prosody-temperature", type=float, default=None, help="default: the checkpoint's")
+    p.add_argument("--release-prosody-durations", choices=["sampled", "regressor"], default="sampled",
+                   help="system 'release': regressor = only the token pitch is sampled (v3.2)")
+    p.add_argument("--release-vocoder", default=None, help="system 'release': its vocoder (default: --vocoder)")
+    p.add_argument("--release-model", default=None, help="system 'release': its acoustic model (default: --model)")
     add_vocoder_args(p, default="vocos-ft")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -100,6 +112,8 @@ class System:
     cfg: float | None = None  # overrides of --cfg / --temperature, and a DiT attention window (@cfg, @t, @win)
     temperature: float | None = None
     attn_window: int | None = None
+    vocoder: str | None = None  # another vocoder (@voc=<name>; 'release': --release-vocoder)
+    sampled: bool = False  # 'release': durations and token pitch from --release-prosody
 
     @property
     def needs_recording(self) -> bool:
@@ -115,9 +129,15 @@ def parse_system(name: str) -> System:
         if m := re.fullmatch(r"(cfg|t|win)([\d.]+)", mod):
             key = {"cfg": "cfg", "t": "temperature", "win": "attn_window"}[m.group(1)]
             setattr(s, key, int(m.group(2)) if key == "attn_window" else float(m.group(2)))
+        elif m := re.fullmatch(r"voc=([\w.-]+)", mod):
+            from .vocoder import VOCODER_ALIASES, VOCODERS
+
+            if m.group(1) not in VOCODERS and m.group(1) not in VOCODER_ALIASES:
+                raise ValueError(f"{name!r}: @voc= takes a vocoder registry name ({', '.join(VOCODERS)})")
+            s.vocoder = m.group(1)
         else:
             raise ValueError(f"unknown system suffix @{mod} in {name!r}")
-    if s.kind in ("recording", "copy") and mods:
+    if s.kind == "recording" and mods or s.kind == "copy" and any(not m.startswith("voc=") for m in mods):
         raise ValueError(f"{name!r}: the recording rows take no sampling options")
     return s
 
@@ -127,6 +147,8 @@ def _parse_base(name: str, base: str) -> System:
         return System(name, base)
     if base == "predicted":
         return System(name, "split")
+    if base == "release":
+        return System(name, "split", jitter=0.0, vocoder="release", sampled=True)
     if m := re.fullmatch(r"pause-punct(?:-j([\d.]+))?", base):
         return System(name, "split", jitter=float(m.group(1) or 0.0))
     s = System(name, "onepass")
@@ -164,12 +186,38 @@ class Utterance:
 class Runner:
     """Synthesises the systems of :func:`parse_system` for one speaker."""
 
-    def __init__(self, synth, speaker: int, temperature: float, cfg_scale: float):
+    def __init__(self, synth, speaker: int, temperature: float, cfg_scale: float, release: dict | None = None):
+        """``release``: ``vocoder`` and ``prosody`` / ``prosody_temperature`` of the ``release`` system."""
         self.synth, self.model, self.device = synth, synth.model, synth.device
         self.spk = torch.tensor([speaker], device=self.device)
         self.speaker = speaker
         self.tempo = getattr(self.model, "duration_scales", {}).get(speaker, self.model.duration_scale)
         self.temperature, self.cfg_scale = temperature, cfg_scale
+        self.release = release or {}
+        self._synths: dict[tuple, object] = {}
+
+    def synth_for(self, s: System):
+        """The Synthesizer of a system: the shared one, or a variant (same acoustic model) with another vocoder
+        and / or the release's prosody predictor (with ``--release-model``: a Synthesizer of that model)."""
+        voc = self.release.get("vocoder") if s.vocoder == "release" else s.vocoder
+        key = (voc, s.sampled)
+        if key == (None, False):
+            return self.synth
+        if key not in self._synths:
+            if s.sampled and not self.release.get("prosody"):
+                raise SystemExit(f"system {s.name!r} needs --release-prosody")
+            base = self.synth
+            if s.sampled and self.release.get("model"):  # another acoustic model
+                from .synthesize import Synthesizer
+
+                base = Synthesizer(self.release["model"], self.device, vocoder=voc or self.synth.vocoder.name)
+                voc = None
+            kw = {} if voc is None else {"vocoder": voc}
+            if s.sampled:
+                kw.update(prosody=self.release["prosody"], prosody_temperature=self.release.get("prosody_temperature"),
+                          prosody_durations=self.release.get("prosody_durations", "sampled"))
+            self._synths[key] = base.variant(**kw)
+        return self._synths[key]
 
     def prosody(self, u: Utterance, s: System, seed_offset: int = 0) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Durations (frames ``[1, N]``, ``None``: predicted) and token pitch (``[1, 1, N]``, ``None``: predicted)."""
@@ -195,7 +243,7 @@ class Runner:
     @torch.no_grad()
     def __call__(self, u: Utterance, s: System, seed: int | None = None) -> torch.Tensor:
         seed = u.index if seed is None else seed
-        synth = self.synth
+        synth = self.synth_for(s)
         cfg = self.cfg_scale if s.cfg is None else s.cfg
         temperature = self.temperature if s.temperature is None else s.temperature
         if s.kind == "recording":
@@ -423,7 +471,11 @@ def run(args) -> None:
         raise SystemExit("--texts has no recordings: only predicted / onepass / *-gain / pause-punct systems")
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel)
     speaker = synth.speaker_id(args.speaker)
-    runner = Runner(synth, speaker, args.temperature, args.cfg)
+    release = {"vocoder": args.release_vocoder, "prosody": args.release_prosody,
+               "prosody_temperature": args.release_prosody_temperature,
+               "prosody_durations": args.release_prosody_durations,
+               "model": args.release_model if args.release_model not in (None, args.model) else None}
+    runner = Runner(synth, speaker, args.temperature, args.cfg, release)
     utts = load_utterances(args, synth, speaker)
     band = (8000 if args.texts else 0) if args.band is None else args.band
     judges = retry_oom(load_judges, args.asr, args.sv if not args.texts else None, args.mos, args.device)
@@ -507,7 +559,8 @@ def run(args) -> None:
     diversity = run_diversity(args, runner, utts, pool, out) if args.diversity else None
     pool.shutdown()
     rows = [results[s.name] for s in systems if s.name in results]
-    report = {"model": args.model, "vocoder": args.vocoder, "split": None if args.texts else args.split,
+    report = {"model": args.model, "vocoder": args.vocoder, "release": release,
+              "split": None if args.texts else args.split,
               "texts": args.texts, "speaker": speaker, "num_utterances": len(utts), "offset": args.offset,
               "longest": args.longest or None,
               "temperature": args.temperature, "cfg": args.cfg, "duration_scale": runner.tempo, "f0": args.f0,

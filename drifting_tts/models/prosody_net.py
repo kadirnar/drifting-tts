@@ -21,6 +21,7 @@ predictions. Three training objectives share the network (``kind``):
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,9 @@ from ..text import PUNCTUATION, SYMBOL_TO_ID
 from .text_encoder import EncoderLayer
 
 KINDS = ("drift", "mse", "flow")
+# what ProsodyPredictor.load reads: a published checkpoint keeps only these (export_checkpoint)
+CHECKPOINT_KEYS = ("ema", "stats", "net_cfg", "cond_dim", "duration_scales", "temperature", "flow_steps",
+                   "tts_fingerprint", "pause_edges")
 SPACE_ID = SYMBOL_TO_ID[" "]
 PUNCT_IDS = [SYMBOL_TO_ID[c] for c in PUNCTUATION if c != " "]
 
@@ -208,6 +212,8 @@ class ProsodyPredictor(nn.Module):
         self.stats = ProsodyStats(self.net.word_dim)
         self.duration_scales: dict[int, float] = {}
         self.temperature: float | None = None  # preferred prosody temperature (train-prosody --calibrate-only)
+        # leading + trailing silence of its generated sentences per voice (PausePolicy.for_voice(edge=...))
+        self.pause_edges: dict[int, float] = {}
         self.flow_steps = 8
         self._word_encoder = None
 
@@ -307,16 +313,57 @@ class ProsodyPredictor(nn.Module):
 
     @classmethod
     def load(cls, path, device="cpu", tts=None) -> ProsodyPredictor:
+        """``path``: a checkpoint, or a name of :data:`drifting_tts.hub.PROSODY_MODELS` (e.g. ``drift``, downloaded).
+        With ``tts``, the condition size is checked, and a checkpoint that records the fingerprint of the encoder it
+        was trained on (:func:`tts_fingerprint`) warns when ``tts`` has another one."""
+        from ..hub import resolve_prosody
+
+        path = resolve_prosody(path)
         ck = torch.load(path, map_location="cpu", weights_only=False)
         cond_dim = ck["cond_dim"]
         if tts is not None:
             want = tts.encoder.d + tts.encoder.spk.embedding_dim + 2
             if want != cond_dim:
                 raise ValueError(f"prosody model {path} expects {cond_dim} condition channels, the TTS gives {want}")
+            if ck.get("tts_fingerprint") and ck["tts_fingerprint"] != tts_fingerprint(tts):
+                warnings.warn(f"prosody model {path} was trained on the text encoder of another acoustic model "
+                              f"(fingerprint {ck['tts_fingerprint']}, this one {tts_fingerprint(tts)}): check its "
+                              "durations and pitch (scripts/eval_prosody_tokens.py) before using it", stacklevel=2)
         p = cls(ck["net_cfg"], cond_dim)
         p.net.load_state_dict(ck["ema"])
         p.stats.load_state_dict(ck["stats"])
         p.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}
         p.temperature = ck.get("temperature")
+        p.pause_edges = {int(k): float(v) for k, v in ck.get("pause_edges", {}).items()}
         p.flow_steps = int(ck.get("flow_steps", 8))
         return p.to(device).eval()
+
+
+def tts_fingerprint(tts) -> str:
+    """Short hash of the weights a prosody predictor is conditioned on: the text encoder (with the duration
+    predictor and speaker table) and the token pitch predictor of a :class:`DriftingTTS`."""
+    import hashlib
+
+    h = hashlib.sha256()
+    state = {**{f"encoder.{k}": v for k, v in tts.encoder.state_dict().items()},
+             **{f"pitch_predictor.{k}": v for k, v in tts.pitch_predictor.state_dict().items()}}
+    for name in sorted(state):
+        h.update(name.encode())
+        h.update(state[name].detach().float().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()[:16]
+
+
+def export_checkpoint(ck: dict, tts=None) -> dict:
+    """A training checkpoint (``train-prosody``'s ``prosody_ema.pt``) -> what :meth:`ProsodyPredictor.load` needs
+    (:data:`CHECKPOINT_KEYS`), without the training config, paths or step; with ``tts``, the fingerprint of its
+    encoder. Tensors are copied to the CPU, contiguous."""
+    out = {k: ck[k] for k in CHECKPOINT_KEYS if k in ck}
+    for k in ("ema", "stats"):
+        out[k] = {n: t.detach().cpu().contiguous().clone() for n, t in out[k].items()}
+    out["net_cfg"] = dict(out["net_cfg"])
+    out["duration_scales"] = {int(k): float(v) for k, v in out.get("duration_scales", {}).items()}
+    if "pause_edges" in out:
+        out["pause_edges"] = {int(k): float(v) for k, v in out["pause_edges"].items()}
+    if tts is not None:
+        out["tts_fingerprint"] = tts_fingerprint(tts)
+    return out

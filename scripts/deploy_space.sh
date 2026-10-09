@@ -4,6 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SPACE=${1:-Vyvo/drifting-tts-tr-demo}
+if grep -n '{{' space/app.py space/README.md; then  # result placeholders of a release not filled in yet
+  echo "fill in the {{...}} placeholders above before deploying" >&2; exit 1
+fi
 STAGE=$(mktemp -d)
 cp space/app.py space/requirements.txt space/README.md "$STAGE/"
 cp -r drifting_tts "$STAGE/"
