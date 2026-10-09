@@ -76,7 +76,8 @@ def test_features_find_the_pause_and_the_pitch_movement():
 
 
 def test_paired_metrics_of_a_signal_with_itself_and_a_flattened_copy():
-    contour = 120 * 2 ** (3 * np.sin(np.linspace(0, 3 * np.pi, 150)) / 12)
+    pytest.importorskip("librosa")  # MFCC + DTW come from the `eval` extra, which CI does not install
+    contour =120 * 2 ** (3 * np.sin(np.linspace(0, 3 * np.pi, 150)) / 12)
     x = tone(contour)
     same = paired_metrics(x, x)
     assert same["f0_corr"] > 0.999 and same["f0_rmse"] < 0.05 and same["dur_ratio"] == pytest.approx(1.0)
@@ -128,7 +129,8 @@ def test_scale_deviations():
 
 
 def test_seed_diversity():
-    f = 100 * 2 ** (np.sin(np.linspace(0, 6, 300)) / 12)
+    pytest.importorskip("librosa")  # DTW alignment of the contours (the `eval` extra)
+    f =100 * 2 ** (np.sin(np.linspace(0, 6, 300)) / 12)
     same = seed_diversity([f, f.copy(), f.copy()], lengths=[3.0, 3.0, 3.0])
     assert same["f0_spread"] == pytest.approx(0.0, abs=1e-9) and same["len_cv"] == 0.0
     moved = seed_diversity([f, f * 2 ** (1 / 12)], durations=[torch.tensor([2, 4]), torch.tensor([2, 8])])
