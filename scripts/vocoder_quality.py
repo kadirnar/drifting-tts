@@ -8,7 +8,8 @@ held-out recordings (docs/VOCODERS.md, "Training Vocos further").
   periodicity of each output against ``--ref`` (default ``bigvgan-v2-ft``) on the same mels.
 * ``copy``: recorded mel -> vocoder against the recording, on the first ``--copy-num`` utterances of the ``val``
   split (``val``: all speakers, the set of ``resynthesis_benchmark.py``) or of speaker 722 in it (``studio``):
-  log-mel L1 (the BigVGAN front end), multi-resolution log-STFT L1, UTMOSv2, DNSMOS OVRL, and against the
+  log-mel L1 (the BigVGAN front end) and its mean bias per band in dB, multi-resolution log-STFT L1, UTMOSv2,
+  DNSMOS OVRL, and against the
   recording's WORLD harvest F0: voicing decision error (VDE), gross pitch error (GPE, > 20% off), the RMS of the
   other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output and recording. ``*_gta``
   sets vocode the acoustic model's mels of the same utterances under their ground-truth alignment and pitch (what
@@ -28,6 +29,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -36,6 +38,7 @@ import numpy as np
 import torch
 
 SR, FRAME_MS, F0_MIN, F0_MAX = 24_000, 10.0, 60.0, 500.0
+BANDS = {"0_1k": (0, 1000), "1_4k": (1000, 4000), "4_8k": (4000, 8000), "8_12k": (8000, 12000)}
 HOP = int(SR * FRAME_MS / 1000)
 
 
@@ -115,13 +118,21 @@ class LogStft(torch.nn.Module):
 
         super().__init__()
         self.mel = BigVGANLogMel()
+        self.centres = (self.mel.fb * torch.linspace(0, SR / 2, self.mel.fb.shape[1])).sum(1) / self.mel.fb.sum(1)
+
+    def centres_in(self, lo: float, hi: float) -> torch.Tensor:
+        return ((self.centres >= lo) & (self.centres < hi)).nonzero()[:, 0]
 
     def forward(self, y: torch.Tensor, ref: torch.Tensor, mel_in: torch.Tensor | None = None) -> dict:
         """Against the recording ``ref``, and (``mel_in_l1``) the log-mel of ``y`` against the vocoder's input."""
         n = min(y.shape[-1], ref.shape[-1])
         y, ref = y[..., :n].float(), ref[..., :n].float()
-        mel_y = self.mel(y)
-        out = {"mel_l1": float((mel_y - self.mel(ref)).abs().mean())}
+        mel_y, mel_r = self.mel(y), self.mel(ref)
+        out = {"mel_l1": float((mel_y - mel_r).abs().mean())}
+        loud = mel_r.amax(-2) > mel_r.amax() - 9.2  # frames within 40 dB (natural-log mel) of the loudest
+        for name, (lo, hi) in BANDS.items():  # mean log-mel difference in dB, per band, on those frames
+            diff = (mel_y - mel_r)[..., self.centres_in(lo, hi), :][..., loud]
+            out[f"bias_{name}"] = float(20 / math.log(10) * diff.mean())
         if mel_in is not None:
             k = min(mel_y.shape[-1], mel_in.shape[-1])
             out["mel_in_l1"] = float((mel_y[..., :k] - mel_in[..., :k]).abs().mean())
@@ -291,7 +302,7 @@ def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
         f0s = pool_f0(pool, wavs)
         pers = [periodicity(w.to(args.device)) for w in wavs]
         table[name] = {"spec": spec, "mel_l1": mean_of(d, "mel_l1"), "stft_l1": mean_of(d, "stft_l1"),
-                       "mel_in_l1": mean_of(d, "mel_in_l1"),
+                       "mel_in_l1": mean_of(d, "mel_in_l1"), **{f"bias_{b}": mean_of(d, f"bias_{b}") for b in BANDS},
                        **judge(wavs), **against(f0s, pers, rec_f0, rec_per), **pitch_summary(f0s, pers)}
         print(f"{key} {name}: " + json.dumps({k: round(v, 4) for k, v in table[name].items()
                                                if isinstance(v, float)}) + f" ({time.perf_counter() - t0:.0f} s)",
