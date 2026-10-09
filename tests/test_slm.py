@@ -1,5 +1,7 @@
 """SLM adversary (drifting_tts/slm.py): shapes, update separation, gradient paths, and the disabled default."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -20,13 +22,44 @@ STATS = MelStats(-5.0, 2.0)
 F = 64  # crop frames (TINY)
 
 
-def tiny_wavlm():
-    from transformers import WavLMConfig, WavLMModel
+class StubWavLM(torch.nn.Module):
+    """transformers-free stand-in with WavLM's interface: a strided convolution and ``layers`` residual blocks over
+    16 kHz audio, ``hidden_states`` = the input embedding and every block's output (``layers + 1`` of them)."""
 
+    def __init__(self, dim: int = 16, layers: int = 2):
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=dim, num_hidden_layers=layers)
+        self.conv = torch.nn.Conv1d(1, dim, 40, stride=20)
+        self.blocks = torch.nn.ModuleList(torch.nn.Linear(dim, dim) for _ in range(layers))
+
+    def forward(self, input_values, output_hidden_states=True):
+        h = torch.nn.functional.gelu(self.conv(input_values[:, None])).transpose(1, 2)
+        hidden = [h]
+        for block in self.blocks:
+            h = h + torch.nn.functional.gelu(block(h))
+            hidden.append(h)
+        return SimpleNamespace(hidden_states=tuple(hidden))
+
+
+def tiny_wavlm():
     torch.manual_seed(0)
-    return WavLMModel(WavLMConfig(hidden_size=16, num_hidden_layers=2, num_attention_heads=2, intermediate_size=32,
-                                  conv_dim=(8, 8), conv_stride=(5, 4), conv_kernel=(10, 4), num_conv_pos_embeddings=8,
-                                  num_conv_pos_embedding_groups=2, num_buckets=16, max_bucket_distance=40))
+    return StubWavLM()
+
+
+def test_transformers_wavlm_has_the_interface_the_adversary_uses(tmp_path):
+    """The real (tiny, random) WavLM: config fields, all hidden states, and loading a local directory."""
+    transformers = pytest.importorskip("transformers")
+    from drifting_tts.slm import load_wavlm
+
+    cfg = transformers.WavLMConfig(hidden_size=16, num_hidden_layers=2, num_attention_heads=2, intermediate_size=32,
+                                   conv_dim=(8, 8), conv_stride=(5, 4), conv_kernel=(10, 4), num_conv_pos_embeddings=8,
+                                   num_conv_pos_embedding_groups=2, num_buckets=16, max_bucket_distance=40)
+    transformers.WavLMModel(cfg).save_pretrained(tmp_path / "wavlm")
+    slm = SLMAdversary(slm_cfg().slm, tiny_vocoder(tmp_path), load_wavlm(str(tmp_path / "wavlm")), STATS, "cpu")
+    fake = torch.randn(4, 100, F, requires_grad=True)
+    loss, metrics, _ = slm.step(fake, torch.randn(2, 100, F), 0.1 * torch.randn(2, F * 256))
+    loss.backward()
+    assert slm.disc.pre.in_channels == 3 * 16 and fake.grad.abs().sum() > 0
 
 
 def tiny_vocoder(tmp_path) -> Vocoder:
@@ -220,12 +253,14 @@ def _prepare_bigvgan(tmp_path):
     return data
 
 
-def test_train_with_slm_end_to_end_cpu(tmp_path):
+def test_train_with_slm_end_to_end_cpu(tmp_path, monkeypatch):
+    import drifting_tts.slm
+
     data = _prepare_bigvgan(tmp_path)
     voc = tiny_vocoder(tmp_path)
     save_checkpoint(tmp_path / "vocos_tiny.pt", vocos=voc.model.state_dict(),
                     init=str(tmp_path / "tiny_vocos_same.yaml"), mel="bigvgan", head_padding="same")
-    tiny_wavlm().save_pretrained(tmp_path / "wavlm")
+    monkeypatch.setattr(drifting_tts.slm, "load_wavlm", lambda name: tiny_wavlm())  # no transformers needed
     work = tmp_path / "run"
     args = ["train", "--workdir", str(work), f"data.root={data}", "data.min_quality=0",
             f"mae.path={tmp_path / 'mae.pt'}", "train.cpu=true", "train.batch_size=3", "train.num_workers=0",

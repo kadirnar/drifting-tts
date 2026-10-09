@@ -433,7 +433,7 @@ def run(args) -> None:
             writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
             keys = ["loss", "drift", "prior", "duration", "pitch", "centroid_mse", "across_sample_std", "force_0.05",
                     "force", "tau_mean", "p_data", "grad_norm", "grad_norm_enc", "slm_disc", "slm_d_real",
-                    "slm_d_fake", "slm_adv", "slm_fm", "slm_grad_norm_x"]
+                    "slm_d_fake", "slm_adv", "slm_fm", "slm_grad_norm_x", "slm_capped"]
             print(f"step {step} " + " ".join(f"{k}={agg[k]:.4g}" for k in keys if k in agg)
                   + f" ({rate:.2f} it/s)", flush=True)
             agg, t0 = {}, time.time()

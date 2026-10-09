@@ -195,6 +195,7 @@ class SLMAdversary:
         metrics.update(slm_adv=adv, slm_fm=fm, slm_grad_norm_x=gnorm_x)
         if self.grad_clip:  # cap the push on the generated mels (the discriminator's sharpness varies a lot)
             grads["total"] = grads["total"] * (self.grad_clip / (gnorm_x + 1e-12)).clamp(max=1.0)
+            metrics["slm_capped"] = (gnorm_x > self.grad_clip).float()  # its mean over a log window: the binding rate
 
         def surrogate(grad: Tensor, value: Tensor) -> Tensor:  # value ``value``, gradient ``grad`` w.r.t. ``fake``
             s = (fake * grad).sum()
