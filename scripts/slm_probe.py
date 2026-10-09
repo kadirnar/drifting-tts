@@ -102,13 +102,28 @@ def train_steps(args, cfg, device) -> dict:
 def grad_norms(model, mae, taus, bank, slm, it, cfg, device, n: int) -> list[dict]:
     gen = [p for p in model.generator.parameters() if p.requires_grad]
     enc = [p for p in model.parameters() if p.requires_grad and not any(p is q for q in gen)]
-    out = []
+    out, seen = [], {}
+    generate, step = model.generate, slm.step
+
+    def spy_generate(*a, **kw):  # keep the generated crops (drift samples first) to measure gradients w.r.t. them
+        seen["x"] = generate(*a, **kw)
+        return seen["x"]
+
+    def spy_step(fake, *a, **kw):
+        seen["fake"] = fake
+        return step(fake, *a, **kw)
+
+    model.generate, slm.step = spy_generate, spy_step
     for _ in range(n):
         loss, m, info = training_step(model, mae, next(it), bank, cfg, device, taus=taus, slm=slm)
         t = info["slm"]
         rest = loss - slm.weight * t["adv"] - slm.fm_weight * t["fm"]  # drift (+ prior, duration, pitch on the encoder)
         row = {"d_real": float(m["slm_d_real"]), "d_fake": float(m["slm_d_fake"]), "adv": float(t["adv"]),
                "fm": float(t["fm"])}
+        # gradient norms w.r.t. the generated crops: drift on the drift samples, the SLM terms on the judged crops
+        row["x_drift"] = float(torch.autograd.grad(rest, seen["x"], retain_graph=True)[0].float().norm())
+        for k in ("adv", "fm"):
+            row[f"x_{k}"] = float(torch.autograd.grad(t[k], seen["fake"], retain_graph=True)[0].norm())
         for name, params in (("gen", gen), ("enc", enc)):
             grads = {}
             for k, term in (("drift", rest), ("adv", t["adv"]), ("fm", t["fm"])):
@@ -121,13 +136,15 @@ def grad_norms(model, mae, taus, bank, slm, it, cfg, device, n: int) -> list[dic
                 row[f"{name}_cos_drift_{k}"] = float(torch.nn.functional.cosine_similarity(grads["drift"], grads[k], 0))
         out.append(row)
         del loss, info, t, rest
+        seen.clear()
+    model.generate, slm.step = generate, step
     return out
 
 
 def probe_grad_norms(args, cfg, device) -> None:
     model, mae, taus, _, _, _, bank, slm, it = build(cfg, device)
     model.train()
-    slm.disc_warmup, slm.separate_terms = 0, True
+    slm.disc_warmup, slm.separate_terms, slm.grad_clip = 0, True, 0.0
     rows = grad_norms(model, mae, taus, bank, slm, it, cfg, device, args.batches)
     print(json.dumps({"what": "grad_norms", "disc_steps": slm.steps - args.batches, "rows": rows}), flush=True)
     d = []

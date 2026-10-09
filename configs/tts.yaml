@@ -78,6 +78,7 @@ slm:                       # SSL adversary for fine-tuning (drifting_tts/slm.py,
   wavlm: microsoft/wavlm-base-plus   # frozen; all 13 hidden states go to the discriminator
   trim_frames: 16          # frames dropped at both crop ends before WavLM (the vocoder's crop-edge artefacts)
   chunk: 8                 # crops per WavLM pass when computing the generator gradient (bounds memory)
+  grad_clip: null          # max norm of the weighted generator gradient w.r.t. the judged crops (null: none)
   disc_channels: 64        # StyleTTS 2's initial_channel
   disc_lr: 1.0e-4
   disc_betas: [0.0, 0.99]  # StyleTTS 2

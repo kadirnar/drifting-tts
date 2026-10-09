@@ -136,11 +136,45 @@ drifting-tts train --config configs/tts_v3_slm.yaml --workdir runs/slm_pilot    
   crop and its real segment (the crops are generated under the ground-truth alignment and pitch, so they line up).
   The gradient with respect to the generated crops is computed `chunk` crops at a time inside the step and handed
   back as a surrogate loss, so WavLM's activations (~0.12 GB per crop) never sit on top of the drift graph.
-- **Logged:** `slm_disc`, `slm_d_real`, `slm_d_fake` (LSGAN targets 1 / 0), `slm_adv`, `slm_fm`.
+  `grad_clip` caps the norm of that gradient.
+- **Logged:** `slm_disc`, `slm_d_real`, `slm_d_fake` (LSGAN targets 1 / 0), `slm_adv`, `slm_fm`, `slm_grad_norm_x`
+  (the weighted gradient w.r.t. the crops, before the cap).
 - **Exports:** `train.keep_snapshots` keeps `model_ema_<step>.pt`; `train.init_calibration` copies the init
   checkpoint's per-voice duration factors and temperature, so that snapshots compare with v3.1 on Freya-100.
 - `scripts/slm_probe.py` measures peak memory, step rate and the gradient norms of the drift, adversarial and
-  feature-matching terms at the real batch.
+  feature-matching terms (`--grad-norms`).
+
+**Gradient norms at v3.1** (`slm_probe.py --grad-norms`, 2 crops per condition at CFG 1, median of 4 batches;
+unweighted terms, generator parameters):
+
+| conditions | discriminator | D(real) / D(fake) | drift | LSGAN | WavLM L1 | LSGAN / drift |
+|---|---|---|---|---|---|---|
+| 2 | fresh | 0.05 / 0.05 | 1.11 | 0.61 | 1.24 | 0.5 |
+| 2 | 50 D-only steps | 0.70 / 0.13 | 1.13 | 44.3 | 2.62 | 40 |
+| 2, `real: vocoded` | 50 D-only steps | 0.43 / 0.42 | 1.13 | 9.6 | 2.82 | 9 |
+| 4 | fresh | 0.05 / 0.05 | 0.69 | 0.40 | 0.86 | 0.5 |
+| 4 | 50 D-only steps | 0.86 / 0.17 | 0.73 | 19.6 | 1.61 | 28 |
+
+- **The discriminator separates recordings from vocoded generated crops within 50 steps;** it does not separate
+  vocoded real from vocoded generated crops in that time. Its early signal is mostly the vocoder's own artefacts.
+- **The adversarial gradient is orthogonal to the drift gradient** (|cos| < 0.07) and, once the discriminator has
+  warmed up, 1–2 orders of magnitude larger. StyleTTS 2 scales its SLM gradients down for the same reason.
+  `configs/tts_v3_slm.yaml` therefore uses `weight: 0.01` and `grad_clip: 0.01` (the drift gradient w.r.t. the
+  crops is ~0.03 at 16 × 16).
+- On the encoder the ratio is 0.15 (fresh) and 7–9 (warmed up); its gradients are clipped separately.
+
+**Memory** (peak allocated, compiled generator, `slm_probe.py --steps 30`; the RTX 5090 was shared with three other
+jobs, so no step rate is quoted):
+
+| conditions × samples | plain | + SLM, 2 extra crops / condition | + SLM, subset of 2 |
+|---|---|---|---|
+| 1 × 16 | 3.05 GB | 3.56 GB | – |
+| 2 × 16 | 4.56 GB | 5.13 GB | 4.98 GB |
+| 4 × 16 | 7.51 GB | | – |
+| 16 × 16 (linear extrapolation) | ~25.3 GB | ~26.7 GB | ~25.7 GB |
+
+The SLM adds its frozen models (0.41 GB), the extra generator samples (~0.03 GB each) and a transient of ~0.12 GB
+per crop in a chunk while only the generator graph is alive.
 
 ## What to look at while training
 

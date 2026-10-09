@@ -133,6 +133,20 @@ def test_chunked_gradients_match_one_pass(tmp_path):
         assert all(torch.allclose(a, b, atol=1e-6) for a, b in zip(disc, out[0][2]))
 
 
+def test_grad_clip_caps_the_push_on_the_crops_not_the_loss(tmp_path):
+    fake0, real_mel, real_audio = torch.randn(4, 100, F), torch.randn(2, 100, F), 0.1 * torch.randn(2, F * 256)
+    out = []
+    for clip in ("null", "1e-6"):
+        torch.manual_seed(0)
+        slm = adversary(tmp_path, slm_cfg(f"slm.grad_clip={clip}"))
+        fake = fake0.clone().requires_grad_(True)
+        loss, metrics, _ = slm.step(fake, real_mel, real_audio)
+        loss.backward()
+        out.append((float(loss.detach()), fake.grad.norm(), metrics["slm_grad_norm_x"]))
+    (v0, g0, n0), (v1, g1, n1) = out
+    assert v0 == v1 and torch.allclose(g0, n0) and n0 > 1e-6 and torch.allclose(g1, torch.tensor(1e-6))
+
+
 def tiny_batch(audio: bool = True) -> dict:
     torch.manual_seed(1)
     mel_len = torch.tensor([80, 75, 70])

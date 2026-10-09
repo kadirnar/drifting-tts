@@ -14,12 +14,16 @@ drift:
 
 slm:
   enabled: true
-  weight: 1.0
-  fm_weight: 0.0
+  # Gradient norms at v3.1 (scripts/slm_probe.py): after 50 discriminator-only steps the unweighted LSGAN gradient on
+  # the generator is 28-40x the drift gradient (4-8 judged crops; ~0.5x with a fresh discriminator), orthogonal to
+  # it (|cos| < 0.07). weight 0.01 and the cap below keep the adversarial push at ~0.1-0.3x the drift's.
+  weight: 0.01
+  grad_clip: 0.01            # max norm of the weighted gradient w.r.t. the 32 judged crops (drift's: ~0.03 at 16 x 16)
+  fm_weight: 0.0             # L1 to the aligned real segment is a regression (pulls samples to the target): off
   crops_per_cond: 2          # 32 vocoded crops per step
   alpha: 1.0                 # extra samples at CFG scale 1, noise temperature 1: the data distribution, which the
   temperature: 1.0           # discriminator compares against (CFG > 1 samples are off it by design)
-  real: audio
+  real: audio                # vocoded: compare through vocos-ft on both sides (no vocoder artefacts to detect)
   disc_warmup: 1000
 
 train:

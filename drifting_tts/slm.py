@@ -99,6 +99,7 @@ class SLMAdversary:
         self.trim = int(cfg.get("trim_frames", 16)) * HOP_LENGTH
         self.disc_warmup = int(cfg.get("disc_warmup", 0))
         self.chunk = int(cfg.get("chunk", 8))
+        self.grad_clip = float(cfg.get("grad_clip") or 0.0)  # max norm of the weighted gradient w.r.t. the crops
         self.separate_terms = False  # also return each term's own surrogate (gradient-norm probes; costs a backward)
         self.amp = cfg.get("dtype", "bf16") == "bf16" and self.device.type == "cuda"
         for m in (vocoder.model, wavlm):
@@ -140,8 +141,8 @@ class SLMAdversary:
         ``fake``: generated normalised mel crops ``[B * c, C, F]`` (with their graph), grouped by condition;
         ``real_mel`` ``[B, C, F]`` and ``real_audio`` ``[B, F * 256]``: the real crops of the same conditions.
         Returns the weighted generator loss as a surrogate whose value is the loss and whose gradient w.r.t. ``fake``
-        is the loss's (zero during ``disc_warmup``), detached metrics, and the unweighted terms (``adv``, ``fm``;
-        surrogates with their own gradients when ``separate_terms``)."""
+        is the loss's, its norm capped at ``grad_clip`` (zero during ``disc_warmup``), detached metrics, and the
+        unweighted terms (``adv``, ``fm``; surrogates with their own, uncapped gradients when ``separate_terms``)."""
         B, n = real_mel.shape[0], fake.shape[0]
         c = n // B
         train_g = (self.steps >= self.disc_warmup and (self.weight > 0 or self.fm_weight > 0)
@@ -190,7 +191,10 @@ class SLMAdversary:
                    "slm_d_fake": d_fake.mean().detach(), "slm_grad_norm_disc": gnorm}
         if not train_g:
             return fake.new_zeros(()), metrics, {}
-        metrics.update(slm_adv=adv, slm_fm=fm)
+        gnorm_x = grads["total"].norm()
+        metrics.update(slm_adv=adv, slm_fm=fm, slm_grad_norm_x=gnorm_x)
+        if self.grad_clip:  # cap the push on the generated mels (the discriminator's sharpness varies a lot)
+            grads["total"] = grads["total"] * (self.grad_clip / (gnorm_x + 1e-12)).clamp(max=1.0)
 
         def surrogate(grad: Tensor, value: Tensor) -> Tensor:  # value ``value``, gradient ``grad`` w.r.t. ``fake``
             s = (fake * grad).sum()
