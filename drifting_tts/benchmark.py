@@ -92,7 +92,7 @@ def run(args) -> None:
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
                         prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations,
                         prosody_pitch_temperature=args.prosody_pitch_temperature,
-                        prosody_pitch_spread=args.prosody_pitch_spread)
+                        prosody_pitch_spread=args.prosody_pitch_spread, prosody_pitch=args.prosody_pitch_model)
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
 
@@ -131,7 +131,7 @@ def run(args) -> None:
                "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
                "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations,
                "prosody_pitch_temperature": synth.prosody_pitch_temperature if args.prosody else None,
-               "prosody_pitch_spread": args.prosody_pitch_spread}
+               "prosody_pitch_spread": args.prosody_pitch_spread, "prosody_pitch_model": args.prosody_pitch_model}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")
     print(format_table([res]))
