@@ -36,6 +36,7 @@ def test_default_recipe_keeps_its_layout(tmp_path):
 
 
 def test_bigvgan_discriminators_cosine_and_resume(tmp_path):
+    pytest.importorskip("nnAudio")  # the CQT discriminator (the `bigvgan` extra), not installed in CI
     cfg = _cfg(tmp_path, {"lr_schedule": "cosine", "lr_min_ratio": 0.1}, discriminators=["mrd"],
                bigvgan_discriminators=["mpd", "cqtd"], bigvgan_pretrained=False, bigvgan_hparams=TINY_CQT)
     torch.manual_seed(0)
@@ -79,6 +80,7 @@ def test_init_from_a_finished_run(tmp_path, discriminators):
 
 def test_bigvgan_recipe_losses_and_warmup(tmp_path):
     """BigVGAN's balance: summed LSGAN terms, feature matching x 2, multi-scale mel; separate D rate, G warm-up."""
+    pytest.importorskip("nnAudio")
     cfg = _cfg(tmp_path, {"mel_loss": "multiscale", "mel_loss_coeff": 15.0, "bigvgan_reduce": "sum",
                           "lr_disc": 2e-3, "warmup_steps": 2, "disc_warmup_steps": 0},
                discriminators=[], bigvgan_discriminators=["mpd", "cqtd"], bigvgan_pretrained=False,
