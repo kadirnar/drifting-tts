@@ -28,10 +28,11 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 Or try any text in the **[online demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)**, or run the model
 **[in your browser with WebGPU](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)**.
 
-**Experimental:** the same model trained in the latent space of the VoxCPM2 audio VAE, with the VAE decoder fine-tuned
-on its latents ([`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2),
-[docs/LATENTS.md](docs/LATENTS.md)). [This Space](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare) plays it
-next to v3.1. It is faster but not yet as natural (UTMOSv2 2.53 against 2.93).
+**Experimental:** the same model trained in the latent space of an audio VAE, with the VAE decoder fine-tuned on
+its latents: [DAC-VAE](https://huggingface.co/Vyvo/drifting-tts-tr-dacvae) (WER 1.32%, UTMOSv2 2.71) and
+[VoxCPM2](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2) (1.87%, 2.53), against 0.66% and 2.93 for v3.1 on the
+same 100 Freya-TR-Eval sentences ([docs/LATENTS.md](docs/LATENTS.md)).
+[This Space](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare) plays all three side by side.
 
 ## Quick start
 
