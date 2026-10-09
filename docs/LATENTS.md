@@ -50,6 +50,8 @@ for piece in stream_decode(be, z, first=8, chunk=64, context=16):
 - **DAC-VAE watermark.** The decoder adds an AudioSeal-style watermark through a 150 Hz branch with two LSTMs.
   Upstream draws a random 16-bit message for every call. The backend fixes the message (all zeros, or `message=`), so
   decoding is deterministic; the watermark stays in. Two different messages change the output by about −67 dB.
+  Fine-tuning the decoder keeps the watermark frozen and in place (see
+  [below](#fine-tuning-the-dac-vae-decoder-on-generated-latents-32)).
 - **VoxCPM2's 48 kHz decoder.** Before each of its six upsampling blocks, the decoder scales and shifts its features
   with per-channel embeddings of a sample-rate bucket, `bucketize(rate, [20000, 30000, 40000])`. The bucket sets the
   bandwidth that the decoder generates (the output is 48 kHz in every case). VoxCPM2 always decodes with 48000, the
@@ -402,3 +404,171 @@ Open issues:
 - The remaining gap is in the generated latents themselves (#27, generator side): the decoder can only invent the
   frame-level detail they lack.
 - UTMOSv2 is trained on English and is only a relative proxy, so listen before choosing a checkpoint.
+
+## Fine-tuning the DAC-VAE decoder on generated latents (#32)
+
+The same recipe for the DAC-VAE latent model (the 10k-step pilot above). With the released decoder it scores WER
+9.55% and UTMOSv2 1.84 on Freya-100, and its generated latents decode as noise, as VoxCPM2's did: on Freya-24,
+DNSMOS OVRL is 1.44, against 3.27 for the resynthesis of real latents.
+
+```bash
+drifting-tts finetune-vocoder --config configs/vocoder_dacvae_decoder.yaml --workdir runs/dacvae_decoder \
+  data.root=data/train_dacvae tts.path=runs/tts_dacvae/model_ema.pt
+drifting-tts benchmark --model runs/tts_dacvae/model_ema.pt --vocoder runs/dacvae_decoder/decoder_ft.pt \
+  --num 100 --speaker 722 --temperature 0.3 --cfg 2.0
+```
+
+### What changes for DAC-VAE
+
+- **The watermark is kept.** The DAC-VAE decoder adds an AudioSeal-style watermark to its audio: `y + α · w`, where
+  `y` is the audio and `w` comes from a generator branch. That branch is `wm_model` (two LSTMs and a message
+  embedding at 150 Hz) plus the watermark's down and up layers inside every decoder block. It reads only `y` and
+  the 16-bit message.
+  - Only the audio path is trained (65.3M parameters): the input convolution and the audio layers of the four
+    blocks (`Decoder.audio_path`).
+  - The rest of the decoder is frozen (14.7M): all of `wm_model` and the watermark layers of every block. `α` is a
+    constant. The audio's own output layer (Snake, the convolution to one channel, tanh) sits inside
+    `wm_model.encoder_block.pre` upstream, and it stays frozen with the rest of `wm_model`.
+  - The watermark is added in training as at inference: `decode_train` is the released forward pass, so the losses
+    are computed on the watermarked audio.
+  - `decoder_ft.pt` holds the whole decoder, frozen weights included. Every export checks that they are still the
+    released tensors, bit for bit, and refuses to write the file otherwise.
+- **Two-sided context.** The decoder is non-causal, so a training window gets context on both sides:
+  `context_frames` on the left and `right_context_frames` on the right. Near the utterance start or end the window
+  shifts so that it starts or ends with the utterance, as in whole-utterance decoding. The SNR of the windowed
+  output against whole-utterance decoding, on 36 segments of held-out utterances (real latents, fp32):
+
+  | context (left / right frames) | 0 / 1 | 1 / 1 | 2 / 2 | 4 / 4 | 6 / 6 | **8 / 8** | 12 / 12 | 16 / 16 |
+  |---|---|---|---|---|---|---|---|---|
+  | median SNR | 23.8 dB | 35.0 dB | 44.9 dB | 60.3 dB | 83.7 dB | **104.1 dB** | 107.5 dB | 111.1 dB |
+  | worst segment | 12.6 dB | 28.4 dB | 36.5 dB | 48.8 dB | 64.9 dB | **90.9 dB** | 91.8 dB | 91.2 dB |
+
+  Context on one side only is not enough: 8 / 4 frames reach 68.9 dB and 4 / 8 frames 65.9 dB (medians). The
+  config uses 8 frames (320 ms) on each side, so a training window is 32 frames (1.28 s).
+- **Weight norm.** The 29 convolutions of the audio path start from the released `weight_g` / `weight_v`, as for
+  VoxCPM2. The watermark's own convolutions have no weight norm. The output layer's convolution has one in the
+  release, but it is frozen, so it stays folded like the rest of the watermark branch.
+- **Size.** The decoder is larger than VoxCPM2's (80.0M parameters against 45.8M) and has full rather than depthwise
+  convolutions. With the same batch (8 segments of 16 frames) a step takes 24 GB and runs at 2.6 it/s on an RTX 5090.
+
+Everything else is the VoxCPM2 recipe: NVIDIA's 24 kHz discriminators with their AdamW state, LSGAN, feature
+matching and the mel L1, LR 5e-5 with warm-up and decay, 80% generated latents at T = 0.3 and α = 2, and the loss on
+24 kHz audio.
+
+### Results
+
+The TTS model is the DAC-VAE pilot at 10k steps in every DAC-VAE row; only the decoder changes. The decoder was
+trained for 40k steps (4.3 hours on an RTX 5090), with a snapshot every 2.5k steps.
+
+Freya-TR-Eval, first 100 sentences, speaker 722, T = 0.3, α = 2 (`drifting-tts benchmark`). WER / CER come from
+Whisper large-v3 on 8 kHz band-matched audio, with 95% intervals. DNSMOS P.835 is computed on the same 100 sentences.
+All RTFs were measured back to back on the same idle GPU.
+
+| model | decoder / vocoder | WER [95% CI] | CER | sentences with errors | UTMOSv2 [95% CI] | DNSMOS SIG / BAK / OVRL | RTF |
+|---|---|---|---|---|---|---|---|
+| DAC-VAE latents | released decoder | 9.55% [7.10, 12.24] | 2.91% | 46 / 100 | 1.837 [1.782, 1.893] | 1.76 / 2.92 / 1.48 | 0.0112 |
+| DAC-VAE latents | fine-tuned decoder, 35k steps | 1.87% [0.87, 2.96] | 0.40% | 13 / 100 | 2.670 [2.620, 2.719] | 3.49 / 4.06 / 3.23 | 0.0111 |
+| DAC-VAE latents | fine-tuned decoder, 37.5k steps | 1.43% [0.55, 2.46] | 0.34% | 10 / 100 | 2.664 [2.620, 2.705] | 3.49 / 4.02 / 3.20 | 0.0111 |
+| DAC-VAE latents | **fine-tuned decoder, 40k steps** | **1.32%** [0.44, 2.55] | **0.30%** | 8 / 100 | **2.710** [2.667, 2.752] | 3.52 / 4.07 / 3.26 | 0.0111 |
+| VoxCPM2 latents | fine-tuned decoder, 35k steps (published) | 1.87% [0.97, 2.96] | 0.43% | 14 / 100 | 2.530 [2.479, 2.583] | 3.49 / 4.10 / 3.25 | 0.0052 |
+| v3.1, released | `bigvgan-v2-ft` | 0.66% [0.22, 1.22] | 0.14% | 6 / 100 | 2.934 [2.892, 2.975] | 3.56 / 4.13 / 3.33 | 0.0119 |
+
+- **The noise is gone.** DNSMOS OVRL rises from 1.48 to 3.26, within 0.07 of v3.1. This is the same jump as for
+  VoxCPM2.
+- **Intelligibility improves sevenfold.** WER falls from 9.55% to 1.32% and CER from 2.91% to 0.30%, with no change
+  to the TTS model. Sentences with errors drop from 46 to 8. This is below VoxCPM2 with its fine-tuned decoder (1.87%),
+  though the intervals overlap. v3.1 is still lower (0.66%), and its interval overlaps too.
+- **Naturalness.** UTMOSv2 rises from 1.84 to 2.71. That is 0.18 above VoxCPM2 with its fine-tuned decoder and 0.22
+  below v3.1; both gaps have disjoint intervals.
+- **The order of the latent spaces flips.** With the released decoders, the DAC-VAE pilot was behind VoxCPM2 on
+  every column. With fine-tuned decoders it is ahead on WER and UTMOSv2. DAC-VAE's better resynthesis ceiling shows
+  once the decoder can handle generated latents.
+- **Speed is unchanged:** the architecture is the released decoder's. End to end, the DAC-VAE model runs at
+  RTF 0.0111. That is about v3.1's speed and 2.1× slower than VoxCPM2's (0.0052).
+- **Snapshot choice.** 40k is best on every Freya-100 column. On Freya-24, 37.5k scored highest (table below), but
+  24 sentences move UTMOSv2 by about ±0.05 from one snapshot to the next.
+
+Snapshots on Freya-24 (the first 24 sentences, seeds 0–23) and on the resynthesis of 24 held-out utterances (real
+latents, decoded in 2.56 s windows with 8 frames of context on each side):
+
+| steps | Freya UTMOSv2 | Freya DNSMOS SIG / BAK / OVRL | resynthesis UTMOSv2 | resynthesis mel L1 |
+|---|---|---|---|---|
+| released decoder | 1.907 | 1.72 / 2.84 / 1.44 | 2.719 | 0.753 |
+| 2.5k | 1.602 | 3.24 / 4.01 / 2.97 | 2.613 | 0.885 |
+| 5k | 1.918 | 3.37 / 4.00 / 3.08 | 2.601 | 0.821 |
+| 10k | 2.244 | 3.43 / 4.01 / 3.14 | 2.557 | 0.830 |
+| 15k | 2.426 | 3.51 / 4.06 / 3.25 | 2.621 | 0.889 |
+| 20k | 2.472 | 3.51 / 4.09 / 3.26 | 2.671 | 0.980 |
+| 25k | 2.520 | 3.51 / 4.08 / 3.26 | 2.575 | 0.808 |
+| 27.5k | 2.657 | 3.51 / 4.07 / 3.25 | 2.766 | 0.982 |
+| 30k | 2.586 | 3.49 / 4.09 / 3.24 | 2.661 | 0.767 |
+| 35k | 2.715 | 3.47 / 4.04 / 3.20 | 2.643 | 0.762 |
+| 37.5k | 2.744 | 3.47 / 4.02 / 3.19 | 2.678 | 0.771 |
+| 40k | 2.683 | 3.51 / 4.06 / 3.24 | 2.696 | 0.792 |
+
+The curve looks like VoxCPM2's, a step ahead of it:
+- DNSMOS jumps within the first 2.5k steps.
+- UTMOSv2 first falls (1.60 at 2.5k), then climbs. It passes the released decoder at 5k and reaches 2.68–2.74
+  over the last 5k steps. VoxCPM2's decoder scored 2.07 at 10k and 2.33 at 20k on the same sentences.
+
+During training:
+- **Real latents.** The mel L1 on real-latent segments was about 0.76 with the released decoder. It rose to 1.16
+  during the warm-up, averaged 0.87 over the first 5k steps, and was back at 0.75 over the last 10k.
+- **Generated latents.** The mel L1 fell from 3.44 (first 50 steps) to 2.37 (first 5k) and 2.24 (last 5k).
+- **Discriminators.** Their losses rose slightly (MPD 1.7 → 2.0).
+
+Resynthesis check, on real latents of 24 held-out utterances:
+
+| decoder | UTMOSv2 | DNSMOS SIG / BAK / OVRL | multi-scale mel L1 to the recording |
+|---|---|---|---|
+| (the recordings) | 2.851 | 3.56 / 3.96 / 3.24 | – |
+| released | 2.719 | 3.57 / 4.00 / 3.27 | 0.753 |
+| fine-tuned, 40k steps | 2.696 | 3.57 / 4.00 / 3.27 | 0.792 |
+
+- **Clean decoding is kept.** DNSMOS is unchanged and UTMOSv2 loses only 0.02; VoxCPM2's fine-tune lost 0.15 here.
+  The mel L1 is 5% higher, and it moves between snapshots (0.76–0.98).
+- **The 48 kHz band above 12 kHz is untrained.** The fine-tuned decoder puts more energy at 16–24 kHz:
+  −54.5 dB relative to 0–4 kHz, against −68.1 dB for the released decoder. At 12–16 kHz the two are the same (−48.1
+  and −47.1 dB). As for VoxCPM2, use the decoder at 24 kHz, the default of `LatentVocoder`.
+
+### Watermark check
+
+The released decoder and the 40k decoder were run on the same latents: real latents of 24 held-out utterances, and
+generated latents of the first 24 Freya sentences. The watermark component `w = α · post(h)` and the audio `y` it is
+added to were compared at 48 kHz, before the clamp (medians over the 24 utterances).
+
+| | released, real latents | fine-tuned, real latents | released, generated latents | fine-tuned, generated latents |
+|---|---|---|---|---|
+| watermark RMS | −77.8 dBFS | −77.3 dBFS | −77.0 dBFS | −78.2 dBFS |
+| watermark / audio | −57.4 dB | −57.2 dB | −51.4 dB | −56.8 dB |
+| message-dependent part / audio | −62.6 dB | −62.1 dB | −56.1 dB | −63.6 dB |
+| correlation with the released watermark | – | 0.84 (min 0.68) | – | 0.72 (min 0.63) |
+| correlation with the released audio | – | 0.99 | – | 0.01 |
+| watermark energy below 12 kHz | 78% | 72% | 70% | 81% |
+
+- **The watermark weights are the released ones.** All 76 watermark tensors (14.7M parameters) are bit-identical to
+  the release in every snapshot, from 2.5k to 40k steps; all 86 audio-path tensors changed.
+- **The watermark is the released one.** The fine-tuned decoder's watermark equals the released generator applied
+  to the fine-tuned audio, `W_released(y_ft)`, exactly (maximum difference 0). The decoded output equals
+  `clamp(y + w)` exactly: the watermark is added at inference.
+- **Its strength is unchanged.** The watermark keeps the same absolute level, about −77 to −78 dBFS. On generated
+  speech it sits 56.8 dB below the audio, and its message-dependent part 63.6 dB below. The released decoder gives
+  57.4 and 62.6 dB on real speech. The released decoder's −51.4 dB on generated latents only reflects its quieter,
+  noise-like output (−25.5 dBFS, against −21.3 dBFS once fine-tuned).
+- **Much of the watermark does not depend on the audio.** On generated latents, the fine-tuned and released outputs
+  are uncorrelated (0.01), yet their watermarks still correlate at 0.72.
+- **It survives the 24 kHz pipeline.** 70–81% of the watermark's energy is below 12 kHz, so it is kept when the
+  output is resampled to 24 kHz.
+- **No detector can be run yet.** Meta has not released a detector for this watermark: the model card says the
+  detector API will come later. AudioSeal's public detector (`audioseal_detector_16bits`) is a different model. It
+  detects AudioSeal's own watermark in 24 / 24 recordings, but flags none of the released DAC-VAE outputs, the
+  fine-tuned ones or the recordings (0 / 24 each, mean score 0.002). Detection rates before and after fine-tuning can
+  be measured once the detector is out. The evidence above rests on the frozen generator and the component
+  analysis.
+
+Open issues:
+- **Naturalness is not saturated.** Freya-24 UTMOSv2 is still around 2.7 after 40k steps, and 0.22 below v3.1 on
+  Freya-100. Longer training may help a little. As for VoxCPM2, most of the remaining gap is likely in the generated
+  latents themselves.
+- **Upper band.** The decoder is meant for 24 kHz output; its 16–24 kHz band is not trained.
+- **UTMOSv2 is only a relative proxy.** It is trained on English, so listen before choosing a checkpoint.
