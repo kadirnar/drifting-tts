@@ -111,6 +111,37 @@ Measured on an RTX 5090 that was shared with two other training runs (so the thr
 
 The drift computation (51 feature maps × 2 pairings per step) takes about half of the step.
 
+## SSL adversarial fine-tuning (experimental, #41)
+
+`slm.enabled` adds StyleTTS 2's SLM adversary (arXiv 2306.07691) to the drift objective, for fine-tuning a trained
+model (`drifting_tts/slm.py`, `configs/tts_v3_slm.yaml`). It is off by default, and the step is then bit-identical
+to the plain recipe.
+
+```bash
+drifting-tts train --config configs/tts_v3_slm.yaml --workdir runs/slm_pilot        # from v3.1, 25k steps
+```
+
+- **Fake input:** `slm.crops_per_cond` generated crops per condition, either extra samples at CFG scale `slm.alpha`
+  and noise temperature `slm.temperature` (drawn in the same generator call), or with `alpha: null` a random subset
+  of the drift samples. They are denormalised and vocoded by the **frozen** `vocos-ft` through its differentiable
+  ISTFT head (`Vocoder.differentiable`). `slm.trim_frames` frames are dropped at both ends: crop-edge artefacts of
+  the vocoder reach 12–16 frames (−18 dB at frame 12, −33 dB at 16, against whole-utterance vocoding). The audio is
+  resampled to 16 kHz and encoded by a **frozen** WavLM (`microsoft/wavlm-base-plus`, all 13 hidden states).
+- **Real input:** the recorded audio of the same crops (`real: audio`, BigVGAN framing: `F` frames ↔ `F·256`
+  samples from `s·256`), or the real mel crop through the same vocoder (`real: vocoded`), which hides the vocoder's
+  own artefacts from the discriminator.
+- **Discriminator:** StyleTTS 2's `WavLMDiscriminator` (1-D convolutions over the 13 × 768 stacked channels, 1.2 M
+  parameters), LSGAN, its own AdamW (`disc_lr`, betas (0, 0.99)). It trains alone for `disc_warmup` steps.
+- **Generator terms:** `weight` × LSGAN and `fm_weight` × the L1 distance between the WavLM states of each generated
+  crop and its real segment (the crops are generated under the ground-truth alignment and pitch, so they line up).
+  The gradient with respect to the generated crops is computed `chunk` crops at a time inside the step and handed
+  back as a surrogate loss, so WavLM's activations (~0.12 GB per crop) never sit on top of the drift graph.
+- **Logged:** `slm_disc`, `slm_d_real`, `slm_d_fake` (LSGAN targets 1 / 0), `slm_adv`, `slm_fm`.
+- **Exports:** `train.keep_snapshots` keeps `model_ema_<step>.pt`; `train.init_calibration` copies the init
+  checkpoint's per-voice duration factors and temperature, so that snapshots compare with v3.1 on Freya-100.
+- `scripts/slm_probe.py` measures peak memory, step rate and the gradient norms of the drift, adversarial and
+  feature-matching terms at the real batch.
+
 ## What to look at while training
 
 - **`train/centroid_mse`** should keep decreasing.

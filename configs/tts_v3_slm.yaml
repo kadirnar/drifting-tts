@@ -1,0 +1,34 @@
+# Fine-tune v3.1 with an SSL adversarial term (issue #41; drifting_tts/slm.py): StyleTTS 2's WavLM discriminator on
+# vocoded crops of the generated mels, next to the drift, prior, duration and pitch losses. Vocos-ft and WavLM stay
+# frozen; the discriminator has its own AdamW and trains alone for the first `slm.disc_warmup` steps.
+# Needs the training data with audio (`prepare --save-audio`). Run from the directory that holds data/ and runs/:
+#   drifting-tts train --config configs/tts_v3_slm.yaml --workdir runs/slm_pilot
+base: tts_v3.yaml
+
+data:
+  root: data/tr12_eleven     # v3.1's corpus (studio voice 722 repeated twice)
+
+drift:
+  kyutai:
+    tau_init: 0.0636         # v3.1's learned kernel temperature (the release checkpoint does not store it)
+
+slm:
+  enabled: true
+  weight: 1.0
+  fm_weight: 0.0
+  crops_per_cond: 2          # 32 vocoded crops per step
+  alpha: 1.0                 # extra samples at CFG scale 1, noise temperature 1: the data distribution, which the
+  temperature: 1.0           # discriminator compares against (CFG > 1 samples are off it by design)
+  real: audio
+  disc_warmup: 1000
+
+train:
+  init_from: runs/release/drifting_tts_v3.1.pt
+  init_calibration: true     # keep v3.1's per-voice duration factors and T = 0.3 in the exports
+  steps: 25000
+  lr: 0.0001
+  warmup: 1000
+  num_workers: 2
+  sample_every: 5000
+  save_every: 2500
+  keep_snapshots: true       # model_ema_<step>.pt: pick the snapshot on Freya-100

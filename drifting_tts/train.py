@@ -13,7 +13,9 @@ One optimisation step (cf. Algorithm 1 of the paper and ``train_step`` of the of
 5. the drifting loss is computed in the multi-scale feature space of the frozen Mel-MAE and
    averaged over feature maps (``drift.reduce: mean``, as in the configs) or summed (``sum``, the
    official code); ``drift.mode``: ``official`` fixed temperatures, ``kyutai`` learned temperature as in
-   Kyutai's released code, ``learned`` their blog pseudo-code.
+   Kyutai's released code, ``learned`` their blog pseudo-code;
+6. optionally (``slm.enabled``, for fine-tuning): an SSL adversarial term on vocoded crops, StyleTTS 2's WavLM
+   discriminator with its own optimiser and update in the same step (:mod:`drifting_tts.slm`).
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import time
 from pathlib import Path
 
@@ -34,11 +37,13 @@ from .drift import feature_drift_loss
 from .latents import VAE_BACKENDS
 from .models.text_encoder import align, duration_loss, expand, prior_loss, token_pitch
 from .models.tts import DriftingTTS
+from .slm import audio_segments, needs_audio, slm_enabled
 from .train_mae import load_mae
 from .utils import EMA, count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
 
 # official: fixed temperatures (paper); kyutai: Kyutai's released learned-tau recipe; learned: their blog pseudo-code
 DRIFT_MODES = ("official", "kyutai", "learned")
+CALIB_KEYS = ("duration_scale", "duration_scales", "temperature")  # stored by `calibrate-durations`
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -111,7 +116,8 @@ def split_features(feats: dict, B: int, S: int) -> dict:
 def build_loader(cfg: Config, split: str = "train") -> tuple[MelDataset, DataLoader]:
     d, t = cfg.data, cfg.train
     ds = MelDataset(d.root, split, min_quality=d.min_quality, min_frames=cfg.drift.crop_frames,
-                    max_frames=d.max_frames, with_f0=pitch_enabled(cfg), filters=d.get("filters"))
+                    max_frames=d.max_frames, with_f0=pitch_enabled(cfg), with_audio=needs_audio(cfg),
+                    filters=d.get("filters"))
     sampler = BucketBatchSampler([ds.frames(i) for i in range(len(ds))], max_frames=t.batch_frames,
                                  max_batch=t.batch_size, seed=t.seed)
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=t.num_workers,
@@ -120,9 +126,10 @@ def build_loader(cfg: Config, split: str = "train") -> tuple[MelDataset, DataLoa
 
 
 def training_step(
-    model: DriftingTTS, mae, batch: dict, bank: CropBank, cfg: Config, device, log_taus=None, taus=None
+    model: DriftingTTS, mae, batch: dict, bank: CropBank, cfg: Config, device, log_taus=None, taus=None, slm=None
 ) -> tuple:
-    """One step. ``log_taus``: ``drift.mode: learned``; ``taus`` (from :func:`build_taus`): ``drift.mode: kyutai``."""
+    """One step. ``log_taus``: ``drift.mode: learned``; ``taus`` (from :func:`build_taus`): ``drift.mode: kyutai``;
+    ``slm``: an :class:`drifting_tts.slm.SLMAdversary` (``slm.enabled``), whose discriminator is updated here."""
     dc, lc = cfg.drift, cfg.loss
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
@@ -155,16 +162,35 @@ def training_step(
     alpha = sample_cfg(B, dc.cfg_min, dc.cfg_max, dc.cfg_power, dc.no_cfg_frac, device)
     z = torch.randn(B * G, y.shape[1], L, device=device)
     cond_g, spk_g, alpha_g = cond.repeat_interleave(G, 0), spk.repeat_interleave(G, 0), alpha.repeat_interleave(G, 0)
+    E = 0 if slm is None else slm.extra_per_cond
+    if E:  # SLM samples at a fixed CFG scale and noise temperature, in the same generator call
+        z = torch.cat([z, slm.temperature * torch.randn(B * E, y.shape[1], L, device=device)])
+        cond_g = torch.cat([cond_g, cond.repeat_interleave(E, 0)])
+        spk_g = torch.cat([spk_g, spk.repeat_interleave(E, 0)])
+        alpha_g = torch.cat([alpha_g, alpha.new_full((B * E,), float(slm.alpha))])
     K = model.generator.num_steps
     j = int(torch.randint(0, K, (1,))) if K > 1 else 0
     with amp:
         g = model.generator
-        noise_labels = torch.randint(0, g.noise_classes, (B * G, max(1, g.noise_coords)), device=device)
+        noise_labels = torch.randint(0, g.noise_classes, (z.shape[0], max(1, g.noise_coords)), device=device)
         if j > 0:  # on-policy rollout (DriftTTS): reach state x_j with the current generator, no gradient
             with torch.no_grad():
                 z = model.rollout(z, cond_g.detach(), spk_g, alpha_g, j, noise_labels=noise_labels).float()
         x = model.generate(z, cond_g, spk_g, alpha_g, noise_labels=noise_labels, step=j)
     x = x.float()
+    if E:
+        x, x_slm = x[: B * G], x[B * G:]
+
+    # 3b. SSL adversary on vocoded crops (fine-tuning), before the drift graph is built: updates its discriminator
+    #     and returns a surrogate generator loss whose gradient w.r.t. the crops it already computed
+    slm_metrics = {}
+    if slm is not None:
+        if not E:  # a random subset of the drift samples of every condition
+            pick = torch.rand(B, G, device=device).argsort(1)[:, : slm.crops_per_cond]
+            x_slm = x.view(B, G, *x.shape[1:])[torch.arange(B, device=device)[:, None], pick].flatten(0, 1)
+        real_audio = audio_segments(batch["audio"].to(device, non_blocking=True), starts, L) \
+            if slm.real == "audio" else None
+        l_slm, slm_metrics, slm_terms = slm.step(x_slm, y_c, real_audio)
 
     # 4. positives (target + perturbed views) and unconditional negatives: real crops of *other* utterances,
     #    drawn before this batch enters the bank so that no condition gets its own target as a negative
@@ -193,6 +219,10 @@ def training_step(
     loss = lc.drift * l_drift + lc.prior * l_prior + lc.duration * l_dur + lc.recon * l_recon
     loss = loss + lc.get("pitch", 0.1) * l_pitch
 
+    if slm is not None:
+        loss = loss + l_slm
+        info["slm"] = slm_terms
+
     with torch.no_grad():
         metrics = {
             "loss": loss.detach(), "drift": l_drift.detach(), "prior": l_prior.detach(), "duration": l_dur.detach(),
@@ -200,7 +230,7 @@ def training_step(
             "centroid_mse": ((xg.mean(1) - y_c) ** 2).mean(),
             "sample_mse": ((xg - y_c[:, None]) ** 2).mean(),
             "across_sample_std": xg.std(1).mean(),
-            "alpha": alpha.mean(), "rollout_step": float(j),
+            "alpha": alpha.mean(), "rollout_step": float(j), **slm_metrics,
         }
         if log_taus is None and taus is None:
             for R in dc.temperatures:  # raw (pre-normalisation) drift norms: the real convergence signal
@@ -290,6 +320,14 @@ def run(args) -> None:
     mae = load_mae(cfg.mae.path, device)
     print(f"DriftingTTS: encoder {count_params(model.encoder):.2f}M + generator {count_params(model.generator):.2f}M "
           f"params; Mel-MAE {count_params(mae):.2f}M (frozen); {len(ds)} training utterances", flush=True)
+    slm = None
+    if slm_enabled(cfg):
+        from .slm import build_slm
+
+        slm = build_slm(cfg, ds.stats, ds.backend, device)
+        print(f"SLM adversary: {cfg.slm.get('wavlm')} {count_params(slm.wavlm):.1f}M and vocoder "
+              f"{slm.vocoder.name} {slm.vocoder.num_params / 1e6:.1f}M (frozen), discriminator "
+              f"{count_params(slm.disc):.2f}M", flush=True)
 
     groups = [{"params": list(model.parameters())}]
     mode = cfg.drift.get("mode", "official")
@@ -327,12 +365,14 @@ def run(args) -> None:
         loader.batch_sampler.epoch = ck.get("epoch", 0)
         if "bank" in ck:  # older checkpoints: the bank refills within uncond_bank / batch_size steps
             bank.load_state_dict(ck["bank"])
+        if slm is not None and ck.get("slm"):
+            slm.load_state_dict(ck["slm"])
         print(f"resumed from step {step}", flush=True)
     # carry over what `calibrate-durations` stored (duration_scale, temperature), although measured on an earlier model
     calib = {}
     if (work / "model_ema.pt").exists():
         prev = torch.load(work / "model_ema.pt", map_location="cpu", weights_only=False)
-        calib = {k: prev[k] for k in ("duration_scale", "duration_scales", "temperature") if prev.get(k) is not None}
+        calib = {k: prev[k] for k in CALIB_KEYS if prev.get(k) is not None}
     duration_scale = calib.get("duration_scale")
     if duration_scale is not None:
         print(f"model_ema.pt keeps duration_scale={duration_scale:.3f} from an earlier calibration; it goes stale as "
@@ -347,6 +387,9 @@ def run(args) -> None:
         if taus is not None and init.get("taus") and set(init["taus"]) == set(taus.state_dict()):
             taus.load_state_dict(init["taus"])  # fine-tuning continues at the learned kernel temperature
             print(f"kernel temperature from {tc.init_from}: {temps_summary(taus)}", flush=True)
+        if tc.get("init_calibration", False) and not calib:  # e.g. the release's per-voice duration factors
+            calib = {k: init[k] for k in CALIB_KEYS if init.get(k) is not None}
+            print(f"calibration from {tc.init_from}: {sorted(calib)}", flush=True)
 
     vocoder = None
     if tc.sample_every > 0 and device == "cuda":
@@ -366,7 +409,7 @@ def run(args) -> None:
     t0, agg = time.time(), {}
     while step < tc.steps:
         batch = next(it)
-        loss, metrics, _ = training_step(model, mae, batch, bank, cfg, device, log_taus, taus)
+        loss, metrics, _ = training_step(model, mae, batch, bank, cfg, device, log_taus, taus, slm)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         # clip encoder and generator separately so drift gradients cannot starve the prior / duration terms
@@ -389,7 +432,8 @@ def run(args) -> None:
                 writer.add_scalar(f"train/{k}", v, step)
             writer.add_scalar("train/lr", sched.get_last_lr()[0], step)
             keys = ["loss", "drift", "prior", "duration", "pitch", "centroid_mse", "across_sample_std", "force_0.05",
-                    "force", "tau_mean", "p_data", "grad_norm", "grad_norm_enc"]
+                    "force", "tau_mean", "p_data", "grad_norm", "grad_norm_enc", "slm_disc", "slm_d_real",
+                    "slm_d_fake", "slm_adv", "slm_fm"]
             print(f"step {step} " + " ".join(f"{k}={agg[k]:.4g}" for k in keys if k in agg)
                   + f" ({rate:.2f} it/s)", flush=True)
             agg, t0 = {}, time.time()
@@ -402,10 +446,13 @@ def run(args) -> None:
                             log_taus=None if log_taus is None else log_taus.state_dict(),
                             taus=None if taus is None else taus.state_dict(),
                             epoch=loader.batch_sampler.epoch, bank=bank.state_dict(), rng=rng_state(),
-                            config=cfg.to_dict(), num_speakers=ds.num_speakers)
+                            config=cfg.to_dict(), num_speakers=ds.num_speakers,
+                            **({} if slm is None else {"slm": slm.state_dict()}))
             save_checkpoint(work / "model_ema.pt", ema=ema.model.state_dict(), config=cfg.to_dict(),
                             num_speakers=ds.num_speakers, step=step, taus=None if taus is None else taus.state_dict(),
                             n_mels=ds.dim, stats=dataset_stats(ds), **calib)
+            if tc.get("keep_snapshots", False):  # every export also as model_ema_<step>.pt
+                shutil.copyfile(work / "model_ema.pt", work / f"model_ema_{step}.pt")
     stale = "" if duration_scale is None else " (stale duration_scale: re-run `drifting-tts calibrate-durations`)"
     print(f"done: {work / 'model_ema.pt'}{stale}", flush=True)
 
