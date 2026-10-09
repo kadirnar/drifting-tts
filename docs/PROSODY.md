@@ -344,15 +344,15 @@ predictors.
 | system | F0 std | range | DTW F0 r | F0 RMSE | pauses/utt | pause s | syl/s | dur ratio | CER | WER | UTMOSv2 | SIM |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | recording | 4.37 | 14.2 | – | – | 4.56 | 0.495 | 3.93 | – | 0.75% | 3.46% | 3.248 | – |
-| copy | 4.08 | 13.0 | 0.818 | 2.55 | 4.64 | 0.491 | 3.93 | 0.999 | – | – | – | – |
+| copy | 4.08 | 13.0 | 0.818 | 2.55 | 4.64 | 0.491 | 3.93 | 0.999 | 0.68% | 3.11% | 2.499 | 0.874 |
 | predicted | 3.25 | 10.2 | 0.521 | 3.83 | 3.28 | 0.302 | 4.30 | 0.916 | 0.75% | 4.28% | 2.306 | 0.756 |
 | onepass | 3.23 | 10.1 | 0.526 | 3.81 | 3.21 | 0.313 | 4.29 | 0.917 | 0.74% | 4.22% | 2.330 | 0.755 |
-| oracle-dur | 3.22 | 10.1 | 0.530 | 3.79 | 4.32 | 0.451 | 4.09 | 0.961 | – | – | – | – |
-| oracle-pitch | 4.19 | 13.2 | 0.751 | 2.99 | 3.22 | 0.320 | 4.30 | 0.916 | – | – | – | – |
+| oracle-dur | 3.22 | 10.1 | 0.530 | 3.79 | 4.32 | 0.451 | 4.09 | 0.961 | 3.13% | 8.91% | 2.410 | 0.763 |
+| oracle-pitch | 4.19 | 13.2 | 0.751 | 2.99 | 3.22 | 0.320 | 4.30 | 0.916 | 0.76% | 4.70% | 2.497 | 0.766 |
 | oracle-both | 4.14 | 13.2 | 0.783 | 2.76 | 4.36 | 0.455 | 4.08 | 0.963 | 4.13% | 9.68% | 2.515 | 0.780 |
 | pitch-gain-1.4 | 3.94 | 12.4 | 0.534 | 4.02 | 3.21 | 0.319 | 4.30 | 0.916 | 0.76% | 4.42% | 2.495 | 0.757 |
 | pause-punct | 3.25 | 10.2 | 0.521 | 3.83 | 3.28 | 0.342 | 4.24 | 0.931 | 0.70% | 4.01% | 2.302 | 0.756 |
-| pause-punct-j1 | 3.24 | 10.2 | 0.521 | 3.83 | 3.26 | 0.341 | 4.24 | 0.930 | – | – | – | – |
+| pause-punct-j1 | 3.24 | 10.2 | 0.521 | 3.83 | 3.26 | 0.341 | 4.24 | 0.930 | 0.85% | 4.35% | 2.308 | 0.756 |
 
 Token level, `onepass`:
 
@@ -367,13 +367,14 @@ Token level, `onepass`:
   oracle durations 4.3 of 0.45 s. Its sentence joins get 0.67 s inserted under the policy; few of these texts have
   several sentences, so the averages move little.
 - **The oracle is only as good as the alignment.** 19 of the 100 oracle renditions lose or garble words (CER 4.1%,
-  against 0.74% with predicted durations and 2 such utterances): on this voice's podcast-style data the MAS durations
-  are sometimes wrong (in one, a whole phrase of the transcript is missing from the audio; in another Whisper loops
-  on a long silence). Its oracle intelligibility is not a fair number; the studio voice's oracle rows are within
-  0.25% CER* of the predicted ones.
-- **UTMOSv2 rewards the wider melody on this voice too**: pitch gain ×1.4 gives 2.495 against 2.330 (oracle 2.515).
-  Speaker similarity is low for every generated row (0.76; 0.93 for the studio voice) and higher with oracle
-  prosody (0.78).
+  against 0.74% with predicted durations and 2 such utterances). The loss comes from the durations: oracle durations
+  alone give 3.1%, oracle pitch alone 0.76%. On this voice's podcast-style data the MAS durations are sometimes wrong
+  (in one utterance a whole phrase of the transcript is missing from the audio; in another Whisper loops on a long
+  silence). Its oracle intelligibility is not a fair number; the studio voice's oracle rows are within 0.25% CER* of
+  the predicted ones.
+- **UTMOSv2 rewards the wider melody on this voice too**: pitch gain ×1.4 gives 2.495 against 2.330, the level of
+  copy synthesis (2.499) and of the oracle pitch (2.497). Speaker similarity to the recording is 0.76 for every
+  generated row (copy synthesis 0.87; 0.93 for the studio voice) and higher with oracle prosody (0.78).
 
 ## Reproduction checks
 
