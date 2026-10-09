@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from ..alignment import sequence_mask
 from ..text import SYMBOLS
 from .generator import DriftDiT
-from .text_encoder import DurationPredictor, TextEncoder, durations_to_alignment, expand
+from .text_encoder import DurationPredictor, TextEncoder, durations_to_alignment, expand, frames_to_alignment
 
 
 class DriftingTTS(nn.Module):
@@ -76,14 +76,20 @@ class DriftingTTS(nn.Module):
     def synthesize(self, text: Tensor, text_len: Tensor, spk: Tensor, cfg_scale: float = 1.0,
                    temperature: float = 1.0, length_scale: float = 1.0, noise_labels: Tensor | None = None,
                    generator: torch.Generator | None = None, attn_window: int | None = None,
-                   pitch_shift: float = 0.0, steps: int | None = None) -> tuple[Tensor, Tensor]:
+                   pitch_shift: float = 0.0, steps: int | None = None, durations: Tensor | None = None,
+                   pitch: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Generate mels with ``steps`` generator evaluations (default: the trained number, 1 = one-step).
 
-        ``z`` and the style codes both come from ``generator``. Returns normalised mels and lengths."""
+        ``z`` and the style codes both come from ``generator``. Returns normalised mels and lengths.
+        Prosody overrides (:mod:`drifting_tts.prosody`): ``durations`` (frames per token ``[B, N]``, used as they are,
+        without ``length_scale``) and ``pitch`` (normalised token log-F0 ``[B, 1, N]``) replace the predicted ones."""
         h, mu, logw, x_mask = self.encoder(text, text_len, spk)
         if self.pitch_enabled:
-            h, _ = self.pitch_condition(h, x_mask, spk, pitch_shift=pitch_shift)
-        attn, y_len = durations_to_alignment(logw, x_mask, length_scale)
+            h, _ = self.pitch_condition(h, x_mask, spk, pitch, pitch_shift=pitch_shift)
+        if durations is None:
+            attn, y_len = durations_to_alignment(logw, x_mask, length_scale)
+        else:
+            attn, y_len = frames_to_alignment(durations, x_mask)
         cond = self.frame_condition(h, mu, attn)
         z = torch.randn(cond.shape[0], mu.shape[1], cond.shape[-1], device=cond.device, generator=generator)
         mask = sequence_mask(y_len, cond.shape[-1])
