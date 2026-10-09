@@ -1,0 +1,25 @@
+# Vocos on the BigVGAN mels of a trained TTS model, second recipe (docs/VOCODERS.md, "Training Vocos further"):
+# continues a finished `vocoder_vocos_bigvgan.yaml` run with the discriminators rebalanced (MRD weight 1, feature
+# matching x 2), BigVGAN-v2's multi-scale mel loss (x 15) instead of the single-scale one (x 45), and a cosine-decayed
+# learning rate. Same generator, ISTFT head and streaming context as `vocos-ft`.
+base: vocoder_vocos_bigvgan.yaml
+
+vocoder:
+  discriminators: [mpd, mrd]       # Vocos's, resumed with their optimizer state from train.init_from
+
+train:
+  init_from: runs/vocos_bigvgan/last.pt   # the finished first-recipe run (40k steps): generator, MPD, MRD, AdamW
+  steps: 160000
+  lr: 5.0e-5               # generator peak (first recipe: 1e-4 constant)
+  lr_disc: 1.0e-4          # discriminators
+  warmup_steps: 1000       # linear generator warm-up: the loss changes from the first recipe's
+  lr_schedule: cosine      # every rate decays to lr_min_ratio of its peak over train.steps
+  lr_min_ratio: 0.1
+  mel_loss: multiscale     # BigVGAN-v2's 7-scale log10-mel L1 (first recipe: Vocos's single 100-band log-mel)
+  mel_loss_coeff: 15.0     # first recipe: 45 (single scale)
+  mrd_loss_coeff: 1.0      # first recipe: 0.1 (the Vocos authors advise 1.0 against buzz)
+  fm_loss_coeff: 2.0
+  disc_warmup_steps: 0     # the discriminators are already trained
+  num_workers: 2
+  save_every: 5000
+  keep_snapshots: true     # every export also as vocos_ft_<step>.pt: pick the snapshot on Freya-100

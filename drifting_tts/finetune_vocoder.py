@@ -162,7 +162,7 @@ class VocosGAN:
     def _schedule(self, opt, generator: bool):
         """Factor on the peak learning rate at step ``s``: linear warm-up (generator), then constant or cosine."""
         tc = self.cfg.train
-        kind, floor, steps = tc.get("lr_schedule", "constant"), tc.get("lr_min_ratio", 0.0), tc.steps
+        kind, floor, steps = tc.get("lr_schedule", "constant"), tc.get("lr_min_ratio", 0.0), tc.get("steps", 1)
         warmup = tc.get("warmup_steps", 0) if generator else 0
         if kind not in ("constant", "cosine"):
             raise ValueError(f"train.lr_schedule must be constant or cosine, got {kind!r}")
