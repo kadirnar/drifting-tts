@@ -28,6 +28,11 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 Or try any text in the **[online demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo)**, or run the model
 **[in your browser with WebGPU](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)**.
 
+**Experimental:** the same model trained in the latent space of the VoxCPM2 audio VAE, with the VAE decoder fine-tuned
+on its latents ([`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2),
+[docs/LATENTS.md](docs/LATENTS.md)). [This Space](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare) plays it
+next to v3.1. It is faster but not yet as natural (UTMOSv2 2.53 against 2.93).
+
 ## Quick start
 
 ```bash
