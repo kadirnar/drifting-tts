@@ -436,7 +436,14 @@ and v3.1 + vocos-ft.
 | TTFA `fast` (short / paragraph) | 12.3 / 13.6 ms | {{…}} | {{…}} |
 
 **Dry run** (Freya-100, studio voice, the 10k-step Vocos v2 pilot standing in for the long run's snapshot, busy shared
-GPU): {{DRYRUN}}.
+GPU, `scripts/eval_release.sh` with `STAGES=freya100` on the staged files). Both reference rows reproduce the known
+ones exactly:
+
+| system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL | RTF (busy GPU) |
+|---|---|---|---|---|---|
+| v3.1 + BigVGAN-v2-ft | 0.66% [0.22, 1.22] | 0.14% | 2.934 [2.892, 2.975] | 3.327 | 0.0244 |
+| v3.1 + vocos-ft | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 3.307 | 0.0074 |
+| v3.2 (Vocos v2 10k pilot) | 0.66% [0.11, 1.33] | 0.14% | **2.976** [2.941, 3.012] | **3.360** | 0.0092 |
 
 **Engineering:**
 - **Names instead of files.** `vocoder="vocos-v2"` and `prosody="drift"` resolve to `vocos_v2.pt` and

@@ -47,6 +47,9 @@ the re-run reproduces them within {{…}}.
 | v3.1 + BigVGAN-v2-ft | {{…}} (known: 0.66%) | {{…}} (0.14%) | {{…}} (2.934) | {{…}} (3.33) | {{…}} |
 | v3.1 + vocos-ft | {{…}} (known: 1.10%) | {{…}} (0.22%) | {{…}} (2.627) | {{…}} (3.31) | {{…}} |
 | **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+| v3.2 with the 10k-step Vocos v2 pilot (dry run) | 0.66% [0.11, 1.33] | 0.14% | 2.976 [2.941, 3.012] | 3.360 | 0.0092 |
+
+The dry run reproduced both reference rows exactly (0.66% / 0.14% / 2.934 / 3.327 and 1.10% / 0.22% / 2.627 / 3.307).
 
 **Prosody** (`drifting-tts prosody`, the 100 studio `val` recordings against each system's rendition of their texts,
 sentence by sentence; harvest F0 in semitones; [PROSODY.md](PROSODY.md#how-it-is-measured) defines the columns):
