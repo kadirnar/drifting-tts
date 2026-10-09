@@ -114,6 +114,8 @@ class VocosGAN:
     - ``train.iaf_loss_coeff``: :func:`phase_derivative_loss` against the recording (instantaneous frequency, which a
       time shift of the output does not change), on recorded-mel batches, or on every batch with
       ``train.iaf_on_gta``.
+    - ``train.gta_mel_loss_coeff``: the mel weight on generated-mel batches (default ``mel_loss_coeff``), whose
+      mels do not determine the recording's detail.
     """
 
     batch_is_gta = True  # set by ``run`` before each step: whether the batch holds generated mels
@@ -243,7 +245,8 @@ class VocosGAN:
         if step >= tc.disc_warmup_steps:  # generator frozen while the fresh discriminators warm up
             audio_hat = self.generate(mel)
             l_mel = self.mel_loss(audio_hat, audio)
-            l_g, l_fm = tc.mel_loss_coeff * l_mel, 0.0
+            c_mel = tc.get("gta_mel_loss_coeff", tc.mel_loss_coeff) if self.batch_is_gta else tc.mel_loss_coeff
+            l_g, l_fm = c_mel * l_mel, 0.0
             c_iaf = tc.get("iaf_loss_coeff", 0.0)
             if c_iaf > 0 and (tc.get("iaf_on_gta", False) or not self.batch_is_gta):
                 l_iaf = phase_derivative_loss(audio_hat, audio)
