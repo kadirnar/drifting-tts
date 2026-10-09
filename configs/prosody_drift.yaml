@@ -42,6 +42,7 @@ train:
   steps: 20000
   batch_size: 16
   accum: 1               # gradient accumulation (utterances per step: accum x batch_size)
+  max_gpu_gb: 0          # > 0: cap this process's GPU memory (shared GPU; an over-budget step fails instead)
   lr: 0.0003
   weight_decay: 0.0
   warmup: 500
@@ -56,3 +57,4 @@ calibrate:                 # per-voice duration factors at the end of training (
   enabled: true            # on training utterances); re-run: train-prosody --calibrate-only calibrate.temperature=T
   temperature: 1.0
   spread: 1.0              # output-space temperature of the operating point (the length depends on it)
+  pitch_temperature: null  # --calibrate-only: also store a preferred temperature of the pitch channel

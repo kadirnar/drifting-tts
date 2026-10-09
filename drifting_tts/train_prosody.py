@@ -471,6 +471,9 @@ def run(args) -> None:
     seed_everything(tc.seed)
     device = "cuda" if torch.cuda.is_available() and not tc.get("cpu", False) else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
+    if device == "cuda" and tc.get("max_gpu_gb"):  # a shared GPU: the caching allocator stays under this budget
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(min(1.0, float(tc.max_gpu_gb) / total))
     tts = load_frozen_tts(cfg.tts, device)
     cache = torch.load(cfg.cache, map_location="cpu", weights_only=False)
     cal = cfg.get("calibrate", {})
@@ -482,6 +485,7 @@ def run(args) -> None:
                                           spread=cal.get("spread", 1.0))
         ck["calibrate_temperature"], ck["calibrate_spread"] = cal.get("temperature", 1.0), cal.get("spread", 1.0)
         ck["temperature"] = cal.get("temperature", 1.0)  # the default of Synthesizer(prosody_temperature=None)
+        ck["pitch_temperature"] = cal.get("pitch_temperature")  # None: the pitch channel at the same temperature
         save_checkpoint(path, **ck)
         print(f"stored duration_scales {ck['duration_scales']} in {path}")
         return
@@ -563,8 +567,9 @@ def run(args) -> None:
             agg = {k: float(v) / tc.log_every for k, v in agg.items()}
             for k, v in agg.items():
                 writer.add_scalar(f"train/{k}", v, step)
+            mem = f", peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB" if device == "cuda" else ""
             print(f"step {step} " + " ".join(f"{k}={v:.4g}" for k, v in agg.items())
-                  + f" ({tc.log_every / (time.time() - t0):.2f} it/s)", flush=True)
+                  + f" ({tc.log_every / (time.time() - t0):.2f} it/s{mem})", flush=True)
             agg, t0 = {}, time.time()
         if len(dev) and (step % tc.eval_every == 0 or step == tc.steps):
             live = pred.net
