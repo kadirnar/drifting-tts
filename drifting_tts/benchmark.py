@@ -25,7 +25,7 @@ import soundfile as sf
 import torch
 
 from .audio import SAMPLE_RATE
-from .synthesize import add_vocoder_args
+from .synthesize import add_prosody_channel_args, add_vocoder_args
 from .voices import DEFAULT_VOICE, VOICES
 
 FREYA = "freyavoice/freya-tr-eval"
@@ -49,6 +49,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prosody", default=None, help="stochastic prosody predictor checkpoint (train-prosody)")
     p.add_argument("--prosody-temperature", type=float, default=None, help="default: the checkpoint's preferred one")
     p.add_argument("--prosody-spread", type=float, default=1.0)
+    add_prosody_channel_args(p)
     p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled")
     p.add_argument("--out", default="outputs/benchmark")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -89,7 +90,9 @@ def run(args) -> None:
     items = items[: args.num] if args.num else items
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel, fast=args.fast,
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
-                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations)
+                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations,
+                        prosody_pitch_temperature=args.prosody_pitch_temperature,
+                        prosody_pitch_spread=args.prosody_pitch_spread)
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
 
@@ -126,7 +129,9 @@ def run(args) -> None:
                "stream": args.stream or args.fast, "fast": args.fast,
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
                "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
-               "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations}
+               "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations,
+               "prosody_pitch_temperature": synth.prosody_pitch_temperature if args.prosody else None,
+               "prosody_pitch_spread": args.prosody_pitch_spread}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")
     print(format_table([res]))

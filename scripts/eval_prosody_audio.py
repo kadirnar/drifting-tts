@@ -1,8 +1,10 @@
 """`drifting-tts prosody` (drifting_tts.prosody_eval) with the stochastic prosody predictor as extra systems (#39).
 
-Adds systems ``<name>-T<t>[-S<spread>][-pitch]`` for every ``--prosody-model name=checkpoint``: one pass over the whole
-text, durations and token pitch sampled by that predictor at prosody temperature t (and output-space spread), with
-its own per-voice duration factor, the generator noise as for the other one-pass systems. They join the prosody
+Adds systems ``<name>-T<t>[-P<pitch t>][-S<spread>][-F<frames>][-R<ratio>][-pitch]`` for every
+``--prosody-model name=checkpoint``: one pass over the whole text, durations and token pitch sampled by that predictor
+at prosody temperature t (``-P``: the pitch channel at its own temperature) and output-space spread, with its own
+per-voice duration factor (``-F`` / ``-R``: letters raised to at least that many frames / that ratio of the
+regressors' durations, ``floor_letters``), the generator noise as for the other one-pass systems. They join the prosody
 evaluation of prosody-eval, so every row uses the same metrics, judges and recordings. Each sampled prosody is
 cached per (utterance, seed): the runner asks for it several times (synthesis, token report, F0 alignment, seed
 diversity). ``-pitch``: only the token pitch is sampled; the durations stay the regressors' (with v3.1's per-voice
@@ -27,11 +29,14 @@ _parse_system = pe.parse_system
 
 
 def parse_system(name: str):
-    """``<predictor>-T<t>``, else the systems of :func:`drifting_tts.prosody_eval.parse_system`."""
-    m = re.fullmatch(r"([A-Za-z0-9_]+)-T([\d.]+)(?:-S([\d.]+))?(-pitch)?", name)
+    """``<predictor>-T<t>...``, else the systems of :func:`drifting_tts.prosody_eval.parse_system`."""
+    m = re.fullmatch(r"([A-Za-z0-9_]+)-T([\d.]+)(?:-P([\d.]+))?(?:-S([\d.]+))?(?:-F([\d.]+))?(?:-R([\d.]+))?(-pitch)?",
+                     name)
     if m and m.group(1) in Runner.predictors:
-        spec = ("sampler", m.group(1), float(m.group(2)), float(m.group(3) or 1.0))
-        return pe.System(name, "onepass", dur=("pred",) if m.group(4) else spec, pitch=spec)
+        t = float(m.group(2))
+        spec = ("sampler", m.group(1), t, float(m.group(4) or 1.0), float(m.group(3) or t), float(m.group(5) or 0),
+                float(m.group(6) or 0))
+        return pe.System(name, "onepass", dur=("pred",) if m.group(7) else spec, pitch=spec)
     return _parse_system(name)
 
 
@@ -59,7 +64,9 @@ class Runner(pe.Runner):
             g = torch.Generator(device=self.device).manual_seed(seed)
             tempo = pred.duration_scales.get(self.speaker, 1.0)
             frames, pitch = pred.predict(self.model, u.ids, torch.tensor([u.ids.shape[1]], device=self.device),
-                                         self.spk, s.pitch[2], tempo, generator=g, spread=s.pitch[3])
+                                         self.spk, s.pitch[2], tempo, generator=g, spread=s.pitch[3],
+                                         pitch_temperature=s.pitch[4], min_letter_frames=s.pitch[5],
+                                         rel_letter_floor=s.pitch[6])
             self._cache[key] = (frames, pitch)
         return self._cache[key]
 

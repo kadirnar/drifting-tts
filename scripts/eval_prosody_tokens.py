@@ -36,6 +36,10 @@ def main() -> None:
     p.add_argument("--prosody", nargs="*", default=[], help="name=checkpoint")
     p.add_argument("--temperatures", type=float, nargs="+", default=[1.0])
     p.add_argument("--spreads", type=float, nargs="+", default=[1.0], help="output-space temperatures")
+    p.add_argument("--pitch-temperatures", type=float, nargs="+", default=None,
+                   help="temperatures of the pitch channel (default: the same as --temperatures); the durations use "
+                        "--temperatures")
+    p.add_argument("--min-letter-frames", type=float, default=0.0, help="floor_letters on the sampled durations")
     p.add_argument("--seeds", type=int, default=8)
     p.add_argument("--scales", action="store_true", help="apply the checkpoints' per-voice duration factors")
     p.add_argument("--out", required=True)
@@ -66,17 +70,22 @@ def main() -> None:
             temps = [1.0] if pred.kind == "mse" else args.temperatures
             seeds = [0] if pred.kind == "mse" else list(range(args.seeds))
             spreads = [1.0] if pred.kind == "mse" else args.spreads
-            for T in temps:
-                for lam in spreads:
-                    label = name if lam == 1.0 else f"{name} (spread {lam:g})"
-                    if (set_name, label, None if pred.kind == "mse" else T) in done:
-                        continue
-                    s = sample_split(pred, tts, data, seeds, T, args.device, apply_scales=args.scales, spread=lam)
-                    res = token_metrics(s, data)
-                    if pred.kind == "mse":
-                        res.update(div_p=0.0, div_ld=0.0, div_total=0.0)
-                    add({"set": set_name, "system": label, "T": None if pred.kind == "mse" else T, **res})
-                    print(set_name, label, T, {k: round(v, 3) for k, v in res.items() if v == v}, flush=True)
+            pitch_temps = args.pitch_temperatures or [None]
+            for T, lam, tp in ((t, s, q) for t in temps for s in spreads for q in pitch_temps):
+                label = name if lam == 1.0 else f"{name} (spread {lam:g})"
+                if tp is not None and tp != T:
+                    label += f" (pitch T {tp:g})"
+                if args.min_letter_frames:
+                    label += f" (floor {args.min_letter_frames:g})"
+                if (set_name, label, None if pred.kind == "mse" else T) in done:
+                    continue
+                s = sample_split(pred, tts, data, seeds, T, args.device, apply_scales=args.scales, spread=lam,
+                                 pitch_temperature=tp, min_letter_frames=args.min_letter_frames)
+                res = token_metrics(s, data)
+                if pred.kind == "mse":
+                    res.update(div_p=0.0, div_ld=0.0, div_total=0.0)
+                add({"set": set_name, "system": label, "T": None if pred.kind == "mse" else T, **res})
+                print(set_name, label, T, {k: round(v, 3) for k, v in res.items() if v == v}, flush=True)
     lines = []
     for set_name in sets:
         lines += [f"### {set_name}", "", "| system | T | " + " | ".join(c[1] for c in COLS) + " |",
