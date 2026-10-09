@@ -14,6 +14,7 @@ COMMANDS: dict[str, str] = {
     "train": "drifting_tts.train",
     "synthesize": "drifting_tts.synthesize",
     "evaluate": "drifting_tts.evaluate",
+    "prosody": "drifting_tts.prosody_eval",
     "benchmark": "drifting_tts.benchmark",
     "merge-data": "drifting_tts.merge_data",
     "calibrate-durations": "drifting_tts.calibrate",
