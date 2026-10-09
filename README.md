@@ -192,6 +192,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 
 | | |
 |---|---|
+| [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | **experiment log**: every experiment since v3.1, what worked and what did not, pitfalls, open work |
 | [docs/RESULTS.md](docs/RESULTS.md) | benchmark details, voices, latency and parameter counts |
 | [docs/SPEAKERS.md](docs/SPEAKERS.md) | WER, CER, DNSMOS, UTMOSv2, pitch and speaking rate of all 723 speaker IDs |
 | [docs/VOCODERS.md](docs/VOCODERS.md) | the vocoder registry and a comparison on the same mels: quality, speed, streaming |
