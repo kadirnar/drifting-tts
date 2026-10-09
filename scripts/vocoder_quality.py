@@ -175,7 +175,7 @@ def against(f0s, pers, ref_f0s, ref_pers) -> dict:
 def run_freya(args, specs: dict, res: dict, pool, out: Path) -> None:
     from compare_vocoders import cached_mels, score, vocode
 
-    from drifting_tts.benchmark import FREYA, load_texts
+    from drifting_tts.benchmark import FREYA, band_match, load_texts
     from drifting_tts.evaluate import _plain
     from drifting_tts.vocoder import load_vocoder
 
@@ -193,7 +193,8 @@ def run_freya(args, specs: dict, res: dict, pool, out: Path) -> None:
     for name in names:
         spec = specs.get(name, name)
         cache = out / "pitch" / f"freya{args.num}_{name}.pt"
-        if name in table and not args.force and cache.exists():
+        judged = args.no_asr or table.get(name, {}).get("wer") is not None
+        if name in table and not args.force and cache.exists() and judged:
             pitch_cache[name] = torch.load(cache, weights_only=False)
             continue
         t0 = time.perf_counter()
@@ -216,8 +217,15 @@ def run_freya(args, specs: dict, res: dict, pool, out: Path) -> None:
             from drifting_tts.judges import load_judges
             from drifting_tts.score import DnsMos
 
-            judges, dnsmos = load_judges("large-v3", None, "utmosv2", args.device), DnsMos(args.device)
-        q = score(wavs, refs, judges, dnsmos, 8000, out / f"freya{args.num}_{name}.jsonl")
+            judges = load_judges(None if args.no_asr else "large-v3", None, "utmosv2", args.device)
+            dnsmos = DnsMos(args.device)
+        if args.no_asr:  # UTMOSv2 and DNSMOS only (2 GB of GPU memory instead of 5)
+            w16 = [band_match(w, 0) for w in wavs]
+            d = dnsmos.score(w16)
+            q = {"mos": float(np.mean([judges.mos(w) for w in w16])), "dnsmos_ovrl": float(d[:, 2].mean()),
+                 "dnsmos_p808": float(d[:, 3].mean()), "wer": None, "wer_ci": None, "cer": None}
+        else:
+            q = score(wavs, refs, judges, dnsmos, 8000, out / f"freya{args.num}_{name}.jsonl")
         table[name] = {"spec": spec, "wer": q["wer"], "wer_ci": q["wer_ci"], "cer": q["cer"], "utmosv2": q["mos"],
                        "dnsmos_ovrl": q["dnsmos_ovrl"], "dnsmos_p808": q["dnsmos_p808"],
                        **pitch_summary(f0s, pers)}
@@ -328,7 +336,8 @@ def tables(res: dict, order: list[str]) -> str:
                 f"vs {ref}: VDE | GPE | cents | periodicity RMSE |\n|---" + "|---" * 11 + "|\n")
         for n in [n for n in order if n in f] + [n for n in f if n not in order]:
             r, v = f[n], f[n].get(f"vs_{ref}", {})
-            out += (f"| `{n}` | {100 * r['wer']:.2f}% | {100 * r['cer']:.2f}% | {r['utmosv2']:.3f} | "
+            wer = "– | –" if r["wer"] is None else f"{100 * r['wer']:.2f}% | {100 * r['cer']:.2f}%"
+            out += (f"| `{n}` | {wer} | {r['utmosv2']:.3f} | "
                     f"{r['dnsmos_ovrl']:.3f} | {r['dnsmos_p808']:.3f} | {r['micro']:.3f} | "
                     f"{r['periodicity_voiced']:.3f} | "
                     + (f"{100 * v['vde']:.1f}% | {100 * v['gpe']:.2f}% | {v['cents']:.1f} | {v['per_rmse']:.3f} |"
@@ -372,6 +381,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=3, help="processes for WORLD harvest")
     p.add_argument("--save-wavs", type=int, default=0, help="Freya outputs to keep per vocoder")
     p.add_argument("--force", action="store_true", help="recompute rows already in results.json")
+    p.add_argument("--no-asr", action="store_true", help="Freya without Whisper (no WER / CER; less GPU memory)")
     p.add_argument("--table", action="store_true", help="only print the tables")
     p.add_argument("--out", default="outputs/vocoder_quality")
     p.add_argument("--device", default="cuda")

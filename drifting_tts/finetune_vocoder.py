@@ -101,7 +101,7 @@ class VocosGAN:
     - ``vocoder.discriminators``: which of Vocos's discriminators to train (default ``[mpd, mrd]``; ``[]`` for none).
     - ``vocoder.bigvgan_discriminators``: NVIDIA's BigVGAN-v2 discriminators next to them (``mpd``, ``cqtd``: the
       multi-scale sub-band CQT discriminator), with the released weights (``vocoder.bigvgan_pretrained``, default
-      true) and, when both are used, the AdamW moments of the released 5M-step run. They keep their LSGAN loss,
+      true) and their AdamW moments from the released 5M-step run. They keep their LSGAN loss,
       weighted ``train.bigvgan_loss_coeff``: averaged over sub-discriminators like the Vocos terms
       (``train.bigvgan_reduce: mean``) or summed with feature matching x 2 as in BigVGAN (``sum``).
     - Loss balance: ``train.mel_loss: multiscale`` (BigVGAN-v2's 7-scale log10-mel L1 instead of Vocos's single
@@ -175,8 +175,8 @@ class VocosGAN:
         return torch.optim.lr_scheduler.LambdaLR(opt, factor)
 
     def _bigvgan_discriminators(self, kinds: list[str], device) -> dict:
-        """NVIDIA's BigVGAN-v2 MPD / CQT-D (released weights unless ``vocoder.bigvgan_pretrained: false``) and their
-        optimizer ``opt_db`` (AdamW (0.8, 0.99); the released moments when both are used)."""
+        """NVIDIA's BigVGAN-v2 MPD / CQT-D (released weights and AdamW moments unless ``vocoder.bigvgan_pretrained:
+        false``) and their optimizer ``opt_db`` (AdamW (0.8, 0.99))."""
         vc, tc = self.cfg.vocoder, self.cfg.train
         repo = vc.get("bigvgan_repo", BIGVGAN_REPO)
         h = discriminator_hparams(repo, vc.get("bigvgan_hparams"))  # overrides: e.g. smaller test models
@@ -195,10 +195,12 @@ class VocosGAN:
                             weights_only=False)
             for k, d in discs.items():
                 d.load_state_dict(ck["mrd" if k == "cqtd" else "mpd"])  # stored as "mrd" in the released file
-            if len(discs) == 2:
-                _load_optimizer(self.opt_db, ck["optim_d"])
-            print(f"BigVGAN discriminators {list(discs)}: released weights (step {ck['steps']})"
-                  f"{' and AdamW moments' if len(discs) == 2 else ''}", flush=True)
+            # the released optimizer holds the CQT-D's parameters, then the MPD's: the slice of the ones used
+            total = len(ck["optim_d"]["param_groups"][0]["params"])
+            first = 0 if "cqtd" in discs else total - len(params)
+            _load_optimizer(self.opt_db, _optimizer_slice(ck["optim_d"], first, first + len(params)))
+            print(f"BigVGAN discriminators {list(discs)}: released weights and AdamW moments (step {ck['steps']})",
+                  flush=True)
         return discs
 
     def segments(self, mel: torch.Tensor, audio: torch.Tensor, mel_len: torch.Tensor):
@@ -343,6 +345,12 @@ def phase_derivative_loss(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 102
 def tc_scheduled(tc) -> bool:
     """Whether a learning-rate schedule is configured (else the saved state keeps the original layout)."""
     return tc.get("lr_schedule", "constant") != "constant" or bool(tc.get("warmup_steps", 0))
+
+
+def _optimizer_slice(state: dict, start: int, stop: int) -> dict:
+    """The optimizer state of parameters ``start .. stop - 1`` (single parameter group), renumbered from 0."""
+    group = {**state["param_groups"][0], "params": list(range(stop - start))}
+    return {"state": {i - start: v for i, v in state["state"].items() if start <= i < stop}, "param_groups": [group]}
 
 
 def _load_optimizer(opt, state: dict) -> None:
