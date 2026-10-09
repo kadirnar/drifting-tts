@@ -10,7 +10,9 @@ held-out recordings (docs/VOCODERS.md, "Training Vocos further").
   split (``val``: all speakers, the set of ``resynthesis_benchmark.py``) or of speaker 722 in it (``studio``):
   log-mel L1 (the BigVGAN front end), multi-resolution log-STFT L1, UTMOSv2, DNSMOS OVRL, and against the
   recording's WORLD harvest F0: voicing decision error (VDE), gross pitch error (GPE, > 20% off), the RMS of the
-  other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output and recording.
+  other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output and recording. ``*_gta``
+  sets vocode the acoustic model's mels of the same utterances under their ground-truth alignment and pitch (what
+  the vocoder is fine-tuned on) instead; ``mel L1 to input`` compares the output's log-mel with the input mel.
 
 Pitch: WORLD harvest, 10 ms frames, 60-500 Hz. Periodicity: 1 - the minimum of YIN's cumulative mean normalised
 difference over 2-16.7 ms lags (a 32 ms window per 10 ms frame), in [0, 1]; frames within 40 dB of an utterance's
@@ -114,10 +116,15 @@ class LogStft(torch.nn.Module):
         super().__init__()
         self.mel = BigVGANLogMel()
 
-    def forward(self, y: torch.Tensor, ref: torch.Tensor) -> dict:
+    def forward(self, y: torch.Tensor, ref: torch.Tensor, mel_in: torch.Tensor | None = None) -> dict:
+        """Against the recording ``ref``, and (``mel_in_l1``) the log-mel of ``y`` against the vocoder's input."""
         n = min(y.shape[-1], ref.shape[-1])
         y, ref = y[..., :n].float(), ref[..., :n].float()
-        out = {"mel_l1": float((self.mel(y) - self.mel(ref)).abs().mean())}
+        mel_y = self.mel(y)
+        out = {"mel_l1": float((mel_y - self.mel(ref)).abs().mean())}
+        if mel_in is not None:
+            k = min(mel_y.shape[-1], mel_in.shape[-1])
+            out["mel_in_l1"] = float((mel_y[..., :k] - mel_in[..., :k]).abs().mean())
         dist = []
         for fft in (512, 1024, 2048):
             w = torch.hann_window(fft, device=y.device)
@@ -234,14 +241,16 @@ def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
     from drifting_tts.score import DnsMos
     from drifting_tts.vocoder import load_vocoder
 
-    ds = MelDataset(args.data, "val", min_frames=1, max_frames=10**9, with_audio=True)
-    idx = [i for i, e in enumerate(ds.items) if which == "val" or e["spk_id"] == 722][: args.copy_num]
+    ds = MelDataset(args.data, "val", min_frames=1, max_frames=10**9, with_audio=True, with_f0=True)
+    speakers, gta = which.removesuffix("_gta"), which.endswith("_gta")
+    idx = [i for i, e in enumerate(ds.items) if speakers == "val" or e["spk_id"] == 722][: args.copy_num]
     items = [ds[i] for i in idx]
     rec = [it["audio"] for it in items]
-    mels = [ds.stats.denormalize(it["mel"]) for it in items]
+    mels = gta_mels(args, items, out / f"gta_mels_{speakers}{len(idx)}.pt") if gta else \
+        [ds.stats.denormalize(it["mel"]) for it in items]
     key = f"copy_{which}"
     table = res.setdefault(key, {})
-    rec_cache = out / "pitch" / f"{key}{len(idx)}_recording.pt"
+    rec_cache = out / "pitch" / f"copy_{speakers}{len(idx)}_recording.pt"
     if rec_cache.exists():
         rec_f0, rec_per = torch.load(rec_cache, weights_only=False)
     else:
@@ -270,10 +279,11 @@ def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
         wavs = [voc(m[None])[0, : len(r)].cpu() for m, r in zip(mels, rec)]
         del voc
         free()
-        d = [dist(w.to(args.device), r.to(args.device)) for w, r in zip(wavs, rec)]
+        d = [dist(w.to(args.device), r.to(args.device), m.to(args.device)) for w, r, m in zip(wavs, rec, mels)]
         f0s = pool_f0(pool, wavs)
         pers = [periodicity(w.to(args.device)) for w in wavs]
         table[name] = {"spec": spec, "mel_l1": mean_of(d, "mel_l1"), "stft_l1": mean_of(d, "stft_l1"),
+                       "mel_in_l1": mean_of(d, "mel_in_l1"),
                        **judge(wavs), **against(f0s, pers, rec_f0, rec_per), **pitch_summary(f0s, pers)}
         print(f"{key} {name}: " + json.dumps({k: round(v, 4) for k, v in table[name].items()
                                                if isinstance(v, float)}) + f" ({time.perf_counter() - t0:.0f} s)",
@@ -281,6 +291,28 @@ def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
         save(res, out)
     del mos, dns
     free()
+
+
+@torch.no_grad()
+def gta_mels(args, items: list[dict], path: Path) -> list[torch.Tensor]:
+    """The acoustic model's mels of the recordings under their ground-truth alignment and pitch (as in vocoder
+    fine-tuning): ``--model``, T ``--temperature``, alpha ``--cfg``, seed = item index. Cached at ``path``."""
+    if path.exists():
+        return torch.load(path)
+    from drifting_tts.data import MelStats, collate
+    from drifting_tts.finetune_vocoder import gta_mels as teacher_forced
+    from drifting_tts.train import load_tts
+
+    tts, _, stats = load_tts(args.model, args.device)
+    mel_stats, out = MelStats(stats["mean"], stats["std"]), []
+    for i, it in enumerate(items):
+        g = torch.Generator(device=args.device).manual_seed(i)
+        m = teacher_forced(tts, collate([it]), args.temperature, args.device, cfg_scale=args.cfg, generator=g)
+        out.append(mel_stats.denormalize(m)[0].cpu())
+    torch.save(out, path)
+    del tts
+    free()
+    return out
 
 
 def save(res: dict, out: Path) -> None:
@@ -301,19 +333,20 @@ def tables(res: dict, order: list[str]) -> str:
                     f"{r['periodicity_voiced']:.3f} | "
                     + (f"{100 * v['vde']:.1f}% | {100 * v['gpe']:.2f}% | {v['cents']:.1f} | {v['per_rmse']:.3f} |"
                        if v else "– | – | – | – |") + "\n")
-    for key in ("copy_studio", "copy_val"):
+    for key in ("copy_studio", "copy_studio_gta", "copy_val"):
         if key not in res:
             continue
         c = res[key]
-        out += (f"\n{key}:\n\n| system | mel L1 | log-STFT L1 | UTMOSv2 | DNSMOS OVRL | VDE | GPE | cents | "
-                "periodicity RMSE | periodicity bias | F0 micro-var (st) |\n|---" + "|---" * 10 + "|\n")
+        out += (f"\n{key}:\n\n| system | mel L1 | mel L1 to input | log-STFT L1 | UTMOSv2 | DNSMOS OVRL | VDE | GPE | "
+                "cents | periodicity RMSE | periodicity bias | F0 micro-var (st) |\n|---" + "|---" * 11 + "|\n")
         for n in [n for n in ["recording", *order] if n in c] + [n for n in c if n not in order and n != "recording"]:
             r = c[n]
             if n == "recording":
-                out += (f"| recording | – | – | {r['utmosv2']:.3f} | {r['dnsmos_ovrl']:.3f} | – | – | – | – | – | "
+                out += (f"| recording | – | – | – | {r['utmosv2']:.3f} | {r['dnsmos_ovrl']:.3f} | – | – | – | – | – | "
                         f"{r['micro']:.3f} |\n")
                 continue
-            out += (f"| `{n}` | {r['mel_l1']:.4f} | {r['stft_l1']:.4f} | {r['utmosv2']:.3f} | {r['dnsmos_ovrl']:.3f} | "
+            out += (f"| `{n}` | {r['mel_l1']:.4f} | {r.get('mel_in_l1', float('nan')):.4f} | {r['stft_l1']:.4f} | "
+                    f"{r['utmosv2']:.3f} | {r['dnsmos_ovrl']:.3f} | "
                     f"{100 * r['vde']:.1f}% | {100 * r['gpe']:.2f}% | {r['cents']:.1f} | {r['per_rmse']:.4f} | "
                     f"{r['per_bias']:+.4f} | {r['micro']:.3f} |\n")
     return out
@@ -324,12 +357,14 @@ def main() -> None:
     p.add_argument("--vocoders", nargs="*", default=["vocos-ft"], help="registry names or checkpoint paths")
     p.add_argument("--extra", nargs="+", default=[], metavar="NAME=PATH", help="more vocoders: checkpoint paths")
     p.add_argument("--phases", nargs="+", default=["freya", "copy"], choices=["freya", "copy"])
-    p.add_argument("--copy-sets", nargs="+", default=["studio"], choices=["studio", "val"])
+    p.add_argument("--copy-sets", nargs="+", default=["studio"], choices=["studio", "studio_gta", "val", "val_gta"],
+                   help="recorded mels of speaker 722 (studio) or of all speakers (val) in the val split; _gta: the "
+                   "acoustic model's mels of the same utterances under their ground-truth alignment and pitch")
     p.add_argument("--copy-num", type=int, default=100)
     p.add_argument("--num", type=int, default=100, help="Freya sentences")
     p.add_argument("--ref", default="bigvgan-v2-ft", help="reference vocoder for the Freya F0 / periodicity")
     p.add_argument("--mels", default=None, help="cached Freya mels of compare_vocoders.py (the first --num are used)")
-    p.add_argument("--model", default=None, help="TTS checkpoint (only to generate the mels without --mels)")
+    p.add_argument("--model", default=None, help="TTS checkpoint: the Freya mels without --mels, the _gta sets")
     p.add_argument("--speaker", default="studio")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--cfg", type=float, default=2.0)

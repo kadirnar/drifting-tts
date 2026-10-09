@@ -100,3 +100,27 @@ def test_unknown_discriminator(tmp_path):
         VocosGAN(_cfg(tmp_path, discriminators=["msd"]), "cpu")
     with pytest.raises(ValueError):
         VocosGAN(_cfg(tmp_path, discriminators=[]), "cpu")
+
+
+def test_phase_derivative_loss_ignores_shifts_and_sees_jitter():
+    from drifting_tts.finetune_vocoder import phase_derivative_loss
+
+    t = torch.arange(4 * 4096) / 24000
+    tone = lambda f: sum(torch.sin(2 * torch.pi * k * f * t) / k for k in (1, 2, 3))[None]  # noqa: E731
+    y = tone(120.0)
+    assert phase_derivative_loss(y, y) < 1e-6
+    shifted = torch.roll(y, 37, -1)  # a constant delay: the phase advance per frame does not change
+    jitter = tone(120.0 * (1 + 0.03 * torch.sin(2 * torch.pi * 9 * t)))  # +-3% vibrato at 9 Hz
+    assert phase_derivative_loss(shifted, y) < 0.1 * phase_derivative_loss(jitter, y)
+    y_hat = y.clone().requires_grad_()
+    phase_derivative_loss(y_hat + 0.01 * torch.randn_like(y), y).backward()
+    assert torch.isfinite(y_hat.grad).all()
+
+
+def test_iaf_term_on_recorded_batches_only(tmp_path):
+    gan = VocosGAN(_cfg(tmp_path, {"iaf_loss_coeff": 5.0}), "cpu", mel="bigvgan")
+    mel, audio = _batch()
+    gan.batch_is_gta = True
+    assert "iaf" not in gan.step(mel, audio, 1)
+    gan.batch_is_gta = False
+    assert "iaf" in gan.step(mel, audio, 1)

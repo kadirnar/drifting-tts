@@ -111,7 +111,12 @@ class VocosGAN:
       of its peak over ``train.steps``.
     - ``train.init_from``: start from another fine-tune's ``last.pt`` at step 0 (the generator, the discriminators it
       has and, for an unchanged set, their optimizer states), used when this run has no ``last.pt`` of its own.
+    - ``train.iaf_loss_coeff``: :func:`phase_derivative_loss` against the recording (instantaneous frequency, which a
+      time shift of the output does not change), on recorded-mel batches, or on every batch with
+      ``train.iaf_on_gta``.
     """
+
+    batch_is_gta = True  # set by ``run`` before each step: whether the batch holds generated mels
 
     backend, export_name = "vocos", "vocos_ft.pt"
     VOCOS_DISCS, BIGVGAN_DISCS = ("mpd", "mrd"), ("mpd", "cqtd")
@@ -239,6 +244,11 @@ class VocosGAN:
             audio_hat = self.generate(mel)
             l_mel = self.mel_loss(audio_hat, audio)
             l_g, l_fm = tc.mel_loss_coeff * l_mel, 0.0
+            c_iaf = tc.get("iaf_loss_coeff", 0.0)
+            if c_iaf > 0 and (tc.get("iaf_on_gta", False) or not self.batch_is_gta):
+                l_iaf = phase_derivative_loss(audio_hat, audio)
+                l_g = l_g + c_iaf * l_iaf
+                metrics["iaf"] = l_iaf.item()
             for w, (_, g, f_r, f_g) in self._vocos_terms(audio, audio_hat):
                 adv, adv_k = self.gen_loss(disc_outputs=g)
                 fm = self.fm_loss(fmap_r=f_r, fmap_g=f_g) / len(f_r)
@@ -306,6 +316,25 @@ class VocosGAN:
     def export(self, path: Path, step: int) -> None:
         save_checkpoint(path, vocos=self.vocos.state_dict(), init=self.cfg.vocoder.init, step=step, mel=self.mel,
                         head_padding=self.vocos.head.istft.padding)
+
+
+def phase_derivative_loss(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 1024, hop: int = 256) -> torch.Tensor:
+    """Instantaneous-frequency loss (APNet's IAF term, smooth form): ``1 - cos`` of the difference between the
+    frame-to-frame phase advance of ``y_hat`` and of ``y`` in every STFT bin, weighted by the magnitude of ``y``
+    (mean weight 1). A constant time shift of ``y_hat`` leaves it unchanged. Phasors are softened by 1e-4 of the peak
+    magnitude so that near-silent bins give bounded gradients."""
+    window = torch.hann_window(n_fft, device=y.device)
+    s_hat, s = (torch.stft(x.float(), n_fft, hop, n_fft, window, return_complex=True) for x in (y_hat, y))
+
+    def advance(spec: torch.Tensor) -> torch.Tensor:
+        mag = spec.abs()
+        unit = spec / (mag + 1e-4 * mag.amax(dim=(1, 2), keepdim=True))
+        return unit[..., 1:] * unit[..., :-1].conj()
+
+    mag, a, b = s.abs(), advance(s_hat), advance(s)
+    w = (mag[..., 1:] * mag[..., :-1]).sqrt()
+    w = w / w.mean().clamp_min(1e-8)
+    return (w * (a.abs() * b.abs() - (a * b.conj()).real)).mean()  # |a| |b| (1 - cos), 0 for y_hat = y
 
 
 def tc_scheduled(tc) -> bool:
@@ -852,6 +881,7 @@ def run(args) -> None:
         x, audio = gan.segments(mel, batch["audio"].to(device), batch["mel_len"])
         # fixed segment shapes: faster convolutions (GAN; the drift trainer opts out, see DriftVocoder)
         with torch.backends.cudnn.flags(enabled=True, benchmark=getattr(gan, "cudnn_benchmark", True)):
+            gan.batch_is_gta = bool(use_gta)
             metrics = gan.step(x, audio, step)
         step += 1
         if "mel" in metrics:  # the mel loss on generated and on recorded frames, separately
