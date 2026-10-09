@@ -175,9 +175,13 @@ large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduce
 |---|---:|---:|---:|---:|
 | v3.1 (regressors) | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 0.0153 |
 | flow matching, T 1 | 1.10% [0.44, 1.86] | 0.24% | 2.742 [2.695, 2.788] | 0.0272 |
+| flow matching, T 1, pitch only | 0.77% [0.22, 1.52] | 0.19% | 2.723 [2.683, 2.761] | 0.0210 |
 | drift, T 1 | 2.63% [1.61, 3.88] | 0.58% | 2.688 [2.642, 2.733] | 0.0182 |
 | drift, T 1, spread 0.8 | 1.87% [0.89, 2.98] | 0.48% | 2.702 [2.652, 2.754] | 0.0148 |
-| drift, T 0.5 | 0.66% [0.11, 1.32] | 0.14% | 2.722 [2.675, 2.771] | 0.0200 |
+| drift, T 0.7 | 1.21% [0.54, 2.00] | 0.26% | 2.706 [2.654, 2.759] | 0.0147 |
+| drift, T 0.5 (factors of T 1) | 0.66% [0.11, 1.32] | 0.14% | 2.722 [2.675, 2.771] | 0.0200 |
+| **drift, T 0.5, factors calibrated at T 0.5 (final)** | 0.99% [0.33, 1.73] | 0.22% | 2.712 [2.668, 2.757] | 0.0147 |
+| drift, T 1, pitch only | 0.77% [0.11, 1.55] | 0.13% | 2.693 [2.647, 2.738] | 0.0144 |
 | drift + BERTurk, T 1 | 4.50% [2.53, 6.69] | 1.09% | 2.647 [2.594, 2.699] | 0.0294 |
 | drift + BERTurk, T 1, pitch only | 0.66% [0.22, 1.21] | 0.16% | 2.643 [2.594, 2.688] | 0.0231 |
 
@@ -186,10 +190,12 @@ large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduce
   doymak, oldu → olu, ağrıyor → arıyor and salona → salonu. The recordings have 10% of their letters at ≤ 2 frames,
   and the samplers reproduce that share (v3.1: 0.1%, because `ceil` and log-mean regression avoid short letters).
   The DiT renders those short phones less reliably on out-of-domain text, and more so when they land in the wrong
-  place. At T 0.5 the samples are more typical: WER 0.66% and CER 0.14%, within the v3.1 intervals.
-- **UTMOSv2 rises with sampled durations, not with sampled pitch.** All samplers with their own durations score
-  2.69–2.74, above the v3.1 interval. The pitch-only modes stay at v3.1's 2.64, although their intonation range is
-  the same as the full sampler's. UTMOSv2 hears rhythm and is nearly blind to intonation, as noted in EXPERIMENTS.md.
+  place. At T 0.5 the samples are more typical: WER 0.66–0.99% and CER 0.14–0.22% (two calibrations), within the v3.1
+  intervals; T 0.7 lies in between (1.21%).
+- **UTMOSv2 rises with every character-level sampler** (2.69–2.74, at or above the upper end of the v3.1
+  interval [2.585, 2.669]), including the pitch-only modes (drift 2.693, flow 2.723). The BERTurk pitch-only row
+  stays at v3.1's level (2.643). UTMOSv2 is a weak judge of intonation (EXPERIMENTS.md), so these are guard rails,
+  not evidence of naturalness.
 - Flow matching at T 1 is as intelligible as v3.1 with the highest UTMOSv2 (2.742), but it is flatter
   (F0 std 3.59) and costs 8 network evaluations.
 
@@ -232,10 +238,10 @@ steps.
 
 **Recommended setting** (from the tables above): the drift sampler at prosody temperature 0.5 with its own voice
 factors (`train-prosody --calibrate-only calibrate.temperature=0.5` stores both, so `--prosody` alone selects it).
-It keeps Freya-100 intelligibility (WER / CER within the v3.1 intervals), raises UTMOSv2 beyond the v3.1 interval and
+It keeps Freya-100 intelligibility (WER 0.99%, CER 0.22%, v3.1 1.10% / 0.22%), raises UTMOSv2 (2.712 vs 2.627) and
 gives the held-out studio sentences the recordings' intonation range. `--prosody-durations regressor` (pitch only)
-is the conservative option: v3.1's rhythm and UTMOSv2, the new intonation. The default stays the regressors until
-a listening test.
+is the conservative option: v3.1's rhythm and pauses with the new intonation (Freya-100 WER 0.77%, UTMOSv2 2.693).
+The default stays the regressors until a listening test.
 
 ```bash
 # 1. targets of a trained pitch-conditioned model (~2 min)
@@ -286,7 +292,7 @@ equals the drift run (12k steps).
 
 | | pitch CRPS (all / studio) | pitch r (all / studio) | pitch spread | jitter | pre-mI / fall (st) | Freya-100 WER, T 1 / T 0.5 / pitch only |
 |---|---|---|---|---|---|---|
-| drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / (pending) |
+| drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / 0.77% |
 | drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / (pending) / 0.66% |
 | recordings | 0 | 1 | 1 | 1 | +0.05 / −4.24 | – |
 
