@@ -171,9 +171,27 @@ durations and token pitch. `-pitch` samples only the token pitch and keeps the r
 `drifting-tts benchmark --num 100 --speaker 722 --vocoder vocos-ft` (T 0.3, α 2, sentence by sentence, Whisper
 large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduces the published one exactly.
 
-FREYA_TABLE
+| prosody | WER | CER | UTMOSv2 | RTF (shared GPU) |
+|---|---:|---:|---:|---:|
+| v3.1 (regressors) | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 0.0153 |
+| flow matching, T 1 | 1.10% [0.44, 1.86] | 0.24% | 2.742 [2.695, 2.788] | 0.0272 |
+| drift, T 1 | 2.63% [1.61, 3.88] | 0.58% | 2.688 [2.642, 2.733] | 0.0182 |
+| drift, T 1, spread 0.8 | 1.87% [0.89, 2.98] | 0.48% | 2.702 [2.652, 2.754] | 0.0148 |
+| drift, T 0.5 | 0.66% [0.11, 1.32] | 0.14% | 2.722 [2.675, 2.771] | 0.0200 |
+| drift + BERTurk, T 1 | 4.50% [2.53, 6.69] | 1.09% | 2.647 [2.594, 2.699] | 0.0294 |
+| drift + BERTurk, T 1, pitch only | 0.66% [0.22, 1.21] | 0.16% | 2.643 [2.594, 2.688] | 0.0231 |
 
-FREYA_NOTES
+- **The prosody temperature decides intelligibility.** With durations sampled at T 1, the drift sampler loses
+  intelligibility on these everyday sentences (WER 2.63%). The errors are single-phoneme slips such as duymak →
+  doymak, oldu → olu, ağrıyor → arıyor and salona → salonu. The recordings have 10% of their letters at ≤ 2 frames,
+  and the samplers reproduce that share (v3.1: 0.1%, because `ceil` and log-mean regression avoid short letters).
+  The DiT renders those short phones less reliably on out-of-domain text, and more so when they land in the wrong
+  place. At T 0.5 the samples are more typical: WER 0.66% and CER 0.14%, within the v3.1 intervals.
+- **UTMOSv2 rises with sampled durations, not with sampled pitch.** All samplers with their own durations score
+  2.69–2.74, above the v3.1 interval. The pitch-only modes stay at v3.1's 2.64, although their intonation range is
+  the same as the full sampler's. UTMOSv2 hears rhythm and is nearly blind to intonation, as noted in EXPERIMENTS.md.
+- Flow matching at T 1 is as intelligible as v3.1 with the highest UTMOSv2 (2.742), but it is flatter
+  (F0 std 3.59) and costs 8 network evaluations.
 
 ### Turkish polar questions (#40 diagnostic)
 
@@ -268,8 +286,8 @@ equals the drift run (12k steps).
 
 | | pitch CRPS (all / studio) | pitch r (all / studio) | pitch spread | jitter | pre-mI / fall (st) | Freya-100 WER, T 1 / T 0.5 / pitch only |
 |---|---|---|---|---|---|---|
-| drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / PITCH_ONLY_DRIFT |
-| drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / BERT_T05 / 0.66% |
+| drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / (pending) |
+| drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / (pending) / 0.66% |
 | recordings | 0 | 1 | 1 | 1 | +0.05 / −4.24 | – |
 
 - **Word context makes the sampled tune more text-specific.** Pitch CRPS improves by 5%, correlation rises by
