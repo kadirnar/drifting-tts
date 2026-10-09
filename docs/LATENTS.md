@@ -572,3 +572,23 @@ Open issues:
   latents themselves.
 - **Upper band.** The decoder is meant for 24 kHz output; its 16–24 kHz band is not trained.
 - **UTMOSv2 is only a relative proxy.** It is trained on English, so listen before choosing a checkpoint.
+
+## All systems on one protocol
+
+Freya-TR-Eval, first 100 sentences, speaker 722, T = 0.3, α = 2, seed = sentence index.
+- WER / CER: Whisper large-v3 on 8 kHz band-matched audio.
+- UTMOSv2 and DNSMOS OVRL on the full band.
+
+The comparison Space [`Vyvo/drifting-tts-tr-compare`](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-compare)
+plays every row.
+
+| model | vocoder / decoder | WER | CER | UTMOSv2 | DNSMOS OVRL |
+|---|---|---|---|---|---|
+| v3.1 (mels) | `bigvgan-v2-ft` (112 M) | **0.66%** | **0.14%** | **2.934** | 3.33 |
+| v3.1 (mels) | `bigvgan-base-ft` (14 M) | 0.77% | 0.18% | 2.892 | **3.34** |
+| v3.1 (mels) | `vocos-ft` (13.5 M) | 1.10% | 0.22% | 2.627 | 3.31 |
+| v3.1 (mels) | `revox` (4.5 M, non-commercial) | 0.77% | 0.16% | 2.244 | 3.10 |
+| DAC-VAE latents, 10k | DAC-VAE decoder, fine-tuned 40k (#32) | 1.32% | 0.30% | 2.710 | 3.26 |
+| VoxCPM2 latents, 10k | VoxCPM2 decoder, fine-tuned 35k (#27) | 1.87% | 0.43% | 2.530 | 3.25 |
+| DAC-VAE latents, 10k | released DAC-VAE decoder | 9.55% | 2.91% | 1.837 | 1.48 |
+| VoxCPM2 latents, 10k | released VoxCPM2 decoder | 4.94% | 1.39% | 2.052 | 1.49 |
