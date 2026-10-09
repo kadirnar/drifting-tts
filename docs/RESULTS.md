@@ -68,6 +68,22 @@ sentence by sentence; harvest F0 in semitones; [PROSODY.md](PROSODY.md#how-it-is
 | v3.2 | `stream` (eager acoustic model) | {{…}} | {{…}} | {{…}} | {{…}} |
 | **v3.2** | **`fast`** | {{…}} | {{…}} | {{…}} | {{…}} |
 
+Measured so far only on the shared GPU, with two trainings running (2 rounds × 50 runs, interleaved; the 10k-step
+Vocos v2 pilot, which has the same network as the final one). The busy GPU inflates every TTFA about 4× (v3.1 +
+BigVGAN-v2-ft: 50.5 ms here, 12.3 ms idle), so read the rows against each other:
+
+| system (busy GPU) | mode | TTFA short | long sentence | paragraph | RTF paragraph |
+|---|---|---|---|---|---|
+| v3.1 + BigVGAN-v2-ft (`--cuda-kernel`) | `fast` | 50.5–51.1 ms | 56.2–57.4 ms | 56.8–57.0 ms | 0.034 |
+| v3.1 + vocos-ft | `fast` | 30.6–30.7 ms | 32.2 ms | 30.9–31.6 ms | 0.0089 |
+| v3.1 + Vocos v2 | `fast` | 30.6–30.7 ms | 32.1–32.2 ms | 31.6–31.7 ms | 0.0089 |
+| v3.2 | `stream` (eager acoustic model) | 48.3–48.7 ms | 50.3–50.5 ms | 49.7–49.9 ms | 0.013 |
+| **v3.2** | **`fast`** | **31.5 ms** | **37.5–37.6 ms** | **32.6 ms** | **0.010** |
+
+- **The prosody predictor costs ~1 ms of TTFA in CUDA graphs** (+5 ms on the 197-token sentence, whose sampled
+  durations fall in a larger frame bucket), against ~17 ms when it runs eagerly. Here v3.2 starts speaking about
+  40% sooner than v3.1 with BigVGAN-v2-ft, because Vocos's first window is cheaper (idle GPU, short sentence:
+  vocos-ft 4.9 ms against 12.4 ms, [VOCODERS.md](VOCODERS.md)).
 - **The prosody predictor in CUDA graphs.** One pass of the drift sampler (`drift` / `mse` kinds, no word features,
   spread 1) runs inside the text encoder's graph; its noise is drawn outside the graph in the eager order, so a seed
   gives the same frame counts as the eager path, and mels equal to 77–207 dB SNR (bit-identical on most sentences;
