@@ -126,6 +126,7 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     monkeypatch.setenv(HUB_DIR_ENV, str(hub))
     synth = Synthesizer.from_pretrained("v3.2", "cpu", vocoder="griffin-lim")  # vocos-v2 needs the Hub
     assert synth.prosody is not None and synth.pause == "punct" and synth.vocoder.name == "griffin-lim"
+    assert synth.prosody_durations == "regressor"  # v3.2 samples the token pitch only
     v31 = Synthesizer.from_pretrained("v3.1", "cpu", vocoder="griffin-lim")
     assert v31.prosody is None and v31.pause == 0.15
     with pytest.raises(ValueError, match="v3.2"):
@@ -137,11 +138,13 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     add_args(p)
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--vocoder", "griffin-lim"]))
     assert a == {"model_path": str(hub / "drifting_tts_v3.2.pt"), "vocoder": "griffin-lim", "prosody": "drift",
-                 "pause": "punct"}
+                 "prosody_durations": "regressor", "pause": "punct"}
+    a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody-durations", "sampled"]))
+    assert a["prosody_durations"] == "sampled"
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody", "none", "--pause", "0.2"]))
     assert a["prosody"] is None and a["pause"] == 0.2 and a["vocoder"] == "vocos-v2"
     a = pipeline_args(p.parse_args(["--model", "m.pt"]))  # no release: v3.1 behaviour
-    assert a == {"model_path": "m.pt", "vocoder": None, "prosody": None, "pause": 0.15}
+    assert a == {"model_path": "m.pt", "vocoder": None, "prosody": None, "prosody_durations": "sampled", "pause": 0.15}
     a = pipeline_args(p.parse_args(["--model", "m.pt", "--pause-policy", "punct", "--pause-jitter", "1"]))
     assert a["pause"] == "punct:1.0"
 

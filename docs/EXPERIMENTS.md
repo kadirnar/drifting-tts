@@ -59,8 +59,9 @@ is the index and the place to start before planning new work.
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
 | prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
 | prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
-| release | **v3.2** = v3.1's acoustic model + the drift prosody predictor (T 0.5) + Vocos v2 + punctuation pauses | Freya-495 studio WER {{V32_WER}}, UTMOSv2 {{V32_UTMOS}}; F0 std {{V32_F0_STD}} st (recordings 3.68); 89 M parameters instead of 180 M | ✅ `Synthesizer.from_pretrained("v3.2")` | [§9](#9-release-v32), [RESULTS.md](RESULTS.md#v32-sampled-prosody-vocos-v2-punctuation-pauses) |
-| latency | the prosody predictor inside the acoustic model's CUDA graphs; graphs captured under `no_grad` | `fast=True` works with the predictor (TTFA {{V32_TTFA}}); `fast=True` memory ~6 GB → 0.65 GB | ✅ | [§9](#9-release-v32) |
+| release | **v3.2** = v3.1's acoustic weights + token pitch sampled by the drift predictor (T 0.5; durations stay v3.1's) + Vocos v2 (160k) + punctuation pauses | Freya-495 WER / UTMOSv2: studio 1.33% / 3.021 (v3.1 1.23% / 2.935), male 2.28% / 2.896 (1.74% / 2.814), female 3.99% / 2.722 (3.02% / 2.752); F0 std 3.53 st (recordings 3.68, v3.1 3.21); 89 M parameters instead of 180 M | ✅ `Synthesizer.from_pretrained("v3.2")` | [§9](#9-release-v32), [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses) |
+| release | the same with **sampled durations** too | Freya-495 WER male 5.78%, female 11.28% (studio 1.89%): word slips on new text for the voices with little data | ❌ as the default; opt-in for the studio voice, T ≤ 0.5 | [§9](#9-release-v32) |
+| latency | the prosody predictor inside the acoustic model's CUDA graphs; graphs captured under `no_grad` | `fast=True` works with the predictor (v3.2 TTFA 5.8–7.4 ms on an idle RTX 5090, v3.1 + BigVGAN-v2-ft 12.3–13.8 ms); `fast=True` memory ~6 GB → 0.65 GB | ✅ | [§9](#9-release-v32) |
 | prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
 **Best systems on one protocol** (Freya-100):
@@ -396,7 +397,7 @@ test should gate every naturalness claim.
 
 | where | what |
 |---|---|
-| [`Vyvo/drifting-tts-tr`](https://huggingface.co/Vyvo/drifting-tts-tr) | v3.1 (`drifting_tts_v3.1.pt`); vocoders `bigvgan_v2_ft.pt`, `bigvgan_base_ft.pt`, `vocos_ft.pt`; `onnx/`; `mlx/` (incl. `bigvgan_base_ft.safetensors`, `vocos_ft.safetensors`); v3.2 (planned): `vocos_v2.pt`, `prosody_drift_v3.2.pt` |
+| [`Vyvo/drifting-tts-tr`](https://huggingface.co/Vyvo/drifting-tts-tr) | v3.1 (`drifting_tts_v3.1.pt`); vocoders `bigvgan_v2_ft.pt`, `bigvgan_base_ft.pt`, `vocos_ft.pt`; `onnx/`; `mlx/` (incl. `bigvgan_base_ft.safetensors`, `vocos_ft.safetensors`); v3.2 (planned): `drifting_tts_v3.2.pt` (v3.1's weights, sanitised config), `vocos_v2.pt`, `prosody_drift_v3.2.pt` |
 | [`Vyvo/drifting-tts-tr-dacvae`](https://huggingface.co/Vyvo/drifting-tts-tr-dacvae) | DAC-VAE latent model (10k) and the fine-tuned decoder (40k, watermark kept) |
 | [`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2) | VoxCPM2 latent models (10k, 50k) and the fine-tuned decoder (35k) |
 | [`Vyvo/drifting-tts-tr-demo`](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo) | Gradio demo of v3.1 |
@@ -417,33 +418,42 @@ Scripts used for the tables:
 
 ## 9. Release v3.2
 
-**What it is.** v3.1's acoustic model (unchanged{{V32_ACOUSTIC_NOTE}}) with three opt-in results of #37 made the
-default of a new release: the stochastic prosody predictor trained with drifting (#39, prosody temperature 0.5, its own
-per-voice duration factors), Vocos v2 as the vocoder (#47, the long run's snapshot {{VOCOS_V2_STEP}}) and
-punctuation-aware pauses (#38). `Synthesizer.from_pretrained("v3.2")`, `drifting-tts synthesize --release v3.2`; v3.1
-stays available (`from_pretrained("v3.1")`), and every default of the explicit API is unchanged.
+**What it is.** v3.1's acoustic weights (`drifting_tts_v3.2.pt`: the same weights with a sanitised config) with
+three results of #37 made the default of a new release: the token pitch sampled by the stochastic prosody predictor
+trained with drifting (#39, prosody temperature 0.5), Vocos v2 as the vocoder (#47, the long run's final snapshot,
+160k steps) and punctuation-aware pauses (#38). The durations stay v3.1's regressors, with v3.1's per-voice factors.
+`Synthesizer.from_pretrained("v3.2")`, `drifting-tts synthesize --release v3.2`; v3.1 stays available
+(`from_pretrained("v3.1")`), and every default of the explicit API is unchanged.
 
-**Evaluation** (`scripts/eval_release.sh`, [RESULTS.md](RESULTS.md#v32-sampled-prosody-vocos-v2-punctuation-pauses)):
+**Evaluation** (`scripts/eval_release.sh`, [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)):
 Freya-495 for the three voices, Freya-100 and the prosody protocol, each against v3.1 + BigVGAN-v2-ft (as released)
 and v3.1 + vocos-ft.
 
-| | v3.1 + BigVGAN-v2-ft | v3.1 + vocos-ft | v3.2 |
-|---|---|---|---|
-| Freya-495 studio WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
-| Freya-495 male WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
-| Freya-495 female WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
-| studio val: F0 std (recordings 3.68) / pauses per utterance (1.39) | {{…}} | {{…}} | {{…}} |
-| TTFA `fast` (short / paragraph) | 12.3 / 13.6 ms | {{…}} | {{…}} |
+| | v3.1 + BigVGAN-v2-ft | v3.1 + vocos-ft | v3.2 | v3.2, sampled durations |
+|---|---|---|---|---|
+| Freya-495 studio WER / UTMOSv2 | 1.23% / 2.935 | 1.56% / 2.627 | 1.33% / 3.021 | 1.89% / 3.028 |
+| Freya-495 male WER / UTMOSv2 | 1.74% / 2.814 | 1.61% / 2.335 | 2.28% / 2.896 | 5.78% / 2.953 |
+| Freya-495 female WER / UTMOSv2 | 3.02% / 2.752 | 3.25% / 2.091 | 3.99% / 2.722 | 11.28% / 2.801 |
+| studio val: F0 std (recordings 3.68) / pauses per utterance (1.39) | 3.21 / 1.58 | 3.36 / 1.58 | 3.53 / 1.54 | 3.56 / 2.35 |
+| TTFA `fast` (short / paragraph) | 12.3 / 13.5 ms | 4.9 / 6.0 ms | 5.8 / 7.1 ms | – |
 
-**Dry run** (Freya-100, studio voice, the 10k-step Vocos v2 pilot standing in for the long run's snapshot, busy shared
-GPU, `scripts/eval_release.sh` with `STAGES=freya100` on the staged files). Both reference rows reproduce the known
-ones exactly:
+- **Sampled durations were the first candidate.** With Vocos v2 they keep the studio voice usable (1.89%) but give
+  the male and female voices word slips on new text (5.78%, 11.28%); the female voice with the first Vocos fine-tune
+  gives 10.89%, so the vocoder is not the cause. Sampling only the pitch keeps most of the intonation gain at a small
+  intelligibility cost: female 3.99% against 3.27% for v3.1's regressors through Vocos v2.
+- **What is left for the male and female voices.** Their WER stays above v3.1 + BigVGAN-v2-ft (2.28% vs 1.74%, 3.99%
+  vs 3.02%). Part of it is the vocoder (female, regressors: BigVGAN-v2-ft 3.02%, Vocos v2 3.27%), part the sampled
+  pitch.
+
+**Dry run** (Freya-100, studio voice, sampled durations, the 10k-step Vocos v2 pilot standing in for the long run's
+snapshot, busy shared GPU, `scripts/eval_release.sh` with `STAGES=freya100` on the staged files). Both reference rows
+reproduce the known ones exactly:
 
 | system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL | RTF (busy GPU) |
 |---|---|---|---|---|---|
 | v3.1 + BigVGAN-v2-ft | 0.66% [0.22, 1.22] | 0.14% | 2.934 [2.892, 2.975] | 3.327 | 0.0244 |
 | v3.1 + vocos-ft | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 3.307 | 0.0074 |
-| v3.2 (Vocos v2 10k pilot) | 0.66% [0.11, 1.33] | 0.14% | **2.976** [2.941, 3.012] | **3.360** | 0.0092 |
+| v3.2 candidate (sampled durations, Vocos v2 10k pilot) | 0.66% [0.11, 1.33] | 0.14% | 2.976 [2.941, 3.012] | 3.360 | 0.0092 |
 
 **Engineering:**
 - **Names instead of files.** `vocoder="vocos-v2"` and `prosody="drift"` resolve to `vocos_v2.pt` and
@@ -452,11 +462,11 @@ ones exactly:
 - **`fast=True` with the prosody predictor.** The drift sampler (one pass) runs inside the text encoder's CUDA graph,
   its noise drawn outside in the eager order: same frame counts, mels within float noise of the eager path.
 - **Pause edges belong to the duration source.** `PausePolicy` inserts the measured pause minus the edge silence
-  of the generated sentences, which was measured with v3.1's regressors. The sampled durations leave longer edges
+  of the generated sentences, which was measured with v3.1's regressors. Sampled durations leave longer edges
   (leading + trailing silence of 200 held-out sentences, with the Vocos v2 pilot): studio 0.202 s (v3.1 0.161),
-  male 0.184 (0.176), female 0.123 (0.070), so the v3.1 table would make v3.2's gaps 0.01–0.05 s too long.
-  `prepare_release.py` measures them and stores them in the prosody checkpoint (`pause_edges`); `pause="punct"`
-  uses them whenever that predictor's durations are used.
+  male 0.184 (0.176), female 0.123 (0.070). `prepare_release.py` measures them and stores them in the prosody
+  checkpoint (`pause_edges`); `pause="punct"` uses them only when that predictor's durations are used. v3.2 keeps
+  v3.1's durations, so it uses v3.1's table.
 - **`Synthesizer.variant`** gives v3.1 next to v3.2 on one acoustic model (the demo's toggle) and replaces the
   attribute swapping of the comparison Space; `prosody_temperature` can be set per call.
 

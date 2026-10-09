@@ -1,8 +1,8 @@
 """Drifting TTS demo: one-step Turkish text to speech, release v3.2 by default and v3.1 for comparison.
 
-v3.2: text -> Turkish normaliser -> text encoder -> stochastic prosody predictor (durations and pitch sampled with the
-drifting objective) -> ONE DriftDiT pass -> Vocos v2, sentences joined by punctuation-aware pauses.
-v3.1: the same acoustic model with its deterministic duration / pitch regressors, BigVGAN-v2-ft and 0.15 s pauses.
+v3.2: text -> Turkish normaliser -> text encoder (durations) -> stochastic prosody predictor (token pitch sampled,
+trained with the drifting objective) -> ONE DriftDiT pass -> Vocos v2, sentences joined by punctuation-aware pauses.
+v3.1: the same acoustic weights with the deterministic pitch regressor, BigVGAN-v2-ft and 0.15 s pauses.
 Code: https://github.com/kadirnar/drifting-tts. The weights are downloaded from https://huggingface.co/Vyvo/drifting-tts-tr
 (``Synthesizer.from_pretrained``); `scripts/deploy_space.sh` copies this app and the package into the Space.
 """
@@ -25,11 +25,11 @@ except ImportError:  # running locally
     gpu = lambda f: f  # noqa: E731
 
 DEVICE = os.environ.get("DEMO_DEVICE", "cuda")
-v32 = Synthesizer.from_pretrained("v3.2", DEVICE)  # vocos-v2, prosody="drift", pause="punct"
+v32 = Synthesizer.from_pretrained("v3.2", DEVICE)  # vocos-v2, prosody="drift" (pitch only), pause="punct"
 v31 = v32.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)  # same acoustic model, loaded once
 RELEASES = {
-    "v3.2 (new): sampled prosody, Vocos v2, punctuation pauses": v32,
-    "v3.1: deterministic prosody, BigVGAN-v2": v31,
+    "v3.2 (new): sampled intonation, Vocos v2, punctuation pauses": v32,
+    "v3.1: deterministic intonation, BigVGAN-v2": v31,
 }
 VOICES = {"Studio male voice (recommended)": "studio", "Male voice": "male", "Female voice": "female"}
 MAX_CHARS = 600
@@ -45,16 +45,18 @@ EXAMPLES = [
 
 RESULTS_MD = """
 **Freya-TR-Eval** (495 everyday sentences never seen in training; Whisper large-v3 on 8 kHz audio, UTMOSv2 on the
-full band), studio voice, noise temperature 0.3, α = 2:
+full band; noise temperature 0.3, α = 2). WER / UTMOSv2:
 
-| release | prosody | vocoder | WER | CER | UTMOSv2 |
-|---|---|---|---|---|---|
-| **v3.2** | sampled (drifting), temperature 0.5 | Vocos v2 (13.5 M) | {{V32_WER}} | {{V32_CER}} | {{V32_UTMOS}} |
-| v3.1 | deterministic regressors | BigVGAN-v2-ft (112 M) | 1.23% | 0.24% | 2.94 |
+| voice | v3.2: sampled intonation + Vocos v2 (13.5 M) | v3.1: BigVGAN-v2-ft (112 M) |
+|---|---|---|
+| studio | 1.33% / 3.02 | 1.23% / 2.94 |
+| male | 2.28% / 2.90 | 1.74% / 2.81 |
+| female | 3.99% / 2.72 | 3.02% / 2.75 |
 
-On 100 held-out sentences of the studio voice, v3.2's pitch spread is {{V32_F0_STD}} semitones against 3.68 in the
-recordings and {{V31_F0_STD}} for v3.1: the intonation is less flat. Each seed reads the text with another
-plausible tune and rhythm; the prosody temperature trades that variety against clarity (0.5 is the tested setting).
+v3.2 samples only the intonation: the rhythm (durations) stays v3.1's. On 100 held-out sentences of the studio
+voice its pitch spread is 3.53 semitones against 3.68 in the recordings and 3.21 for v3.1, so
+the intonation is less flat; each seed gives another plausible tune. The male and female voices are somewhat less
+intelligible than in v3.1.
 """
 
 
@@ -85,8 +87,8 @@ with gr.Blocks(title="Drifting TTS: one-step Turkish TTS") as demo:
         "A single network evaluation turns text into a mel spectrogram; there are no diffusion steps. The model was "
         "trained with a **drifting** objective ([Deng et al., 2026](https://arxiv.org/abs/2602.04770)) using Kyutai's "
         "learned-temperature field. **New in v3.2:** a small prosody model, also trained with drifting, samples the "
-        "duration and pitch of every sound, so the intonation is no longer the same flat average every time (change "
-        "the seed to hear another reading); a retrained Vocos vocoder (13.5 M) and pauses that follow the "
+        "pitch of every sound, so the intonation is no longer the same flat average every time (change the seed to "
+        "hear another tune; the rhythm stays v3.1's); a retrained Vocos vocoder (13.5 M) and pauses that follow the "
         "punctuation. v3.1 is one click away for comparison. "
         "[Code](https://github.com/kadirnar/drifting-tts) · [Model](https://huggingface.co/Vyvo/drifting-tts-tr)"
     )
@@ -103,8 +105,8 @@ with gr.Blocks(title="Drifting TTS: one-step Turkish TTS") as demo:
                                      info="Classifier-free guidance learned at training time (free at inference)")
                 prosody_temperature = gr.Slider(
                     0.0, 1.0, value=v32.prosody_temperature, step=0.05, label="Prosody temperature (v3.2)",
-                    info="How freely durations and pitch are sampled: 0.5 is the tested setting; higher is more "
-                         "varied but less clear")
+                    info="How freely the pitch (intonation) is sampled: 0.5 is the tested setting; higher is "
+                         "more varied, 0 is the predictor's most typical tune")
                 rate = gr.Slider(0.7, 1.4, value=1.0, step=0.05, label="Speaking rate")
                 seed = gr.Number(value=0, precision=0, label="Seed")
             button = gr.Button("Synthesise", variant="primary")

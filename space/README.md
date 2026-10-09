@@ -12,6 +12,6 @@ models:
 - Vyvo/drifting-tts-tr
 ---
 
-One-step Turkish text to speech: one DriftDiT pass per sentence. Release v3.2 (default): durations and pitch sampled
-by a prosody model trained with drifting, Vocos v2, punctuation-aware pauses; v3.1 (BigVGAN-v2) for comparison.
+One-step Turkish text to speech: one DriftDiT pass per sentence. Release v3.2 (default): the intonation (token pitch) is
+sampled by a prosody model trained with drifting, Vocos v2, punctuation-aware pauses; v3.1 (BigVGAN-v2) for comparison.
 Model: [Vyvo/drifting-tts-tr](https://huggingface.co/Vyvo/drifting-tts-tr) · Code: [kadirnar/drifting-tts](https://github.com/kadirnar/drifting-tts)

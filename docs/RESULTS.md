@@ -1,55 +1,66 @@
 # Results
 
-Detailed results of the current release, **v3.2** (next section), and of v3.1, whose acoustic model it keeps: the v3
-model plus the fine-tuned `studio` voice. The [README](../README.md) has the summary.
+Detailed results of the current release, **v3.2** (next section), and of v3.1, whose acoustic weights it keeps: the
+v3 model plus the fine-tuned `studio` voice. The [README](../README.md) has the summary.
 
-## v3.2: sampled prosody, Vocos v2, punctuation pauses
+## v3.2: sampled intonation, Vocos v2, punctuation pauses
 
-v3.2 keeps v3.1's acoustic model and changes what surrounds it. `{{...}}` marks numbers of the final evaluation
-(`scripts/eval_release.sh`, below) that are not filled in yet.
+v3.2 keeps v3.1's acoustic weights and changes what surrounds them:
 
 | | v3.1 | v3.2 |
 |---|---|---|
-| durations and token pitch | deterministic regressors (MSE) | sampled by an 8.1 M prosody predictor trained with drifting, prosody temperature 0.5 ([PROSODY_MODEL.md](PROSODY_MODEL.md)) |
-| vocoder | BigVGAN-v2-ft (112.4 M) | Vocos v2 (13.5 M): `vocos-ft` trained further with the second recipe ([VOCODERS.md](VOCODERS.md#training-vocos-further)) |
-| pause between sentences | 0.15 s | by the sentence's final punctuation, measured per voice ([PROSODY.md](PROSODY.md#pauses)), minus the edge silence of v3.2's own sentences (stored with the prosody predictor) |
-| acoustic model | `drifting_tts_v3.1.pt` | the same file{{V32_ACOUSTIC_NOTE}} |
+| token pitch (intonation) | deterministic regressor | sampled by an 8.1 M prosody predictor trained with drifting, prosody temperature 0.5 ([PROSODY_MODEL.md](PROSODY_MODEL.md)) |
+| durations (rhythm) | deterministic regressor, per-voice factors | the same: v3.1's |
+| vocoder | BigVGAN-v2-ft (112.4 M) | Vocos v2 (13.5 M): `vocos-ft` trained 160k steps further with the second recipe ([VOCODERS.md](VOCODERS.md#training-vocos-further)) |
+| pause between sentences | 0.15 s | by the sentence's final punctuation, measured per voice ([PROSODY.md](PROSODY.md#pauses)) |
+| acoustic model file | `drifting_tts_v3.1.pt` | `drifting_tts_v3.2.pt`: the same weights with a sanitised config |
 | parameters at inference | 180.1 M | 89.3 M (67.7 M acoustic + 8.1 M prosody + 13.5 M vocoder) |
-| per-voice duration factors | the regressors' (`calibrate-durations`) | the prosody predictor's own (`train-prosody --calibrate-only`, at prosody temperature 0.5) |
 
 ```python
-tts = Synthesizer.from_pretrained("v3.2", "cuda")        # = model v3.1, vocoder="vocos-v2", prosody="drift", pause="punct"
+tts = Synthesizer.from_pretrained("v3.2", "cuda")   # vocoder="vocos-v2", prosody="drift", prosody_durations="regressor", pause="punct"
 v31 = tts.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)   # v3.1, sharing the acoustic model
 ```
 
 **Freya-TR-Eval** (Freya-495: all 495 sentences, T = 0.3, α = 2, seed = sentence index, Whisper large-v3 on 8 kHz
-audio, UTMOSv2 and DNSMOS P.835 on the full band):
+audio, UTMOSv2 and DNSMOS P.835 on the full band). "Sampled durations" is the predictor sampling the durations too
+(`prosody_durations="sampled"`); it is not the release setting:
 
 | voice | system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL |
 |---|---|---|---|---|---|
-| studio | v3.1 + BigVGAN-v2-ft (v3.1 as released) | {{F495_STUDIO_V31B_WER}} | {{…}} | {{…}} | {{…}} |
-| studio | v3.1 + vocos-ft | {{F495_STUDIO_V31V_WER}} | {{…}} | {{…}} | {{…}} |
-| studio | **v3.2** | {{F495_STUDIO_V32_WER}} | {{…}} | {{…}} | {{…}} |
-| male | v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} |
-| male | v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} |
-| male | **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} |
-| female | v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} |
-| female | v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} |
-| female | **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} |
+| studio | v3.1 + BigVGAN-v2-ft (v3.1 as released) | 1.23% [0.82, 1.68] | 0.24% | 2.935 [2.916, 2.954] | 3.317 |
+| studio | v3.1 + vocos-ft | 1.56% [1.13, 2.05] | 0.29% | 2.627 [2.605, 2.649] | 3.299 |
+| studio | **v3.2** | 1.33% [0.91, 1.80] | 0.27% | 3.021 [3.002, 3.040] | 3.346 |
+| studio | v3.2, sampled durations | 1.89% [1.38, 2.50] | 0.36% | 3.028 [3.009, 3.046] | 3.347 |
+| male | v3.1 + BigVGAN-v2-ft | 1.74% [1.24, 2.30] | 0.38% | 2.814 [2.792, 2.836] | 3.302 |
+| male | v3.1 + vocos-ft | 1.61% [1.13, 2.16] | 0.32% | 2.335 [2.315, 2.356] | 3.251 |
+| male | **v3.2** | 2.28% [1.72, 2.91] | 0.45% | 2.896 [2.875, 2.917] | 3.342 |
+| male | v3.2, sampled durations | 5.78% [4.97, 6.75] | 1.41% | 2.953 [2.930, 2.975] | 3.386 |
+| female | v3.1 + BigVGAN-v2-ft | 3.02% [2.38, 3.71] | 0.70% | 2.752 [2.729, 2.776] | 3.219 |
+| female | v3.1 + vocos-ft | 3.25% [2.56, 3.96] | 0.77% | 2.091 [2.068, 2.116] | 3.120 |
+| female | **v3.2** | 3.99% [3.27, 4.73] | 0.97% | 2.722 [2.699, 2.745] | 3.236 |
+| female | v3.2, sampled durations | 11.28% [10.06, 12.49] | 3.41% | 2.801 [2.775, 2.826] | 3.316 |
 
-The published v3.1 rows were 1.23% / 2.94 (studio), 1.74% / 2.81 (male) and 3.02% / 2.75 (female) in WER / UTMOSv2;
-the re-run reproduces them within {{…}}.
+- **The v3.1 rows reproduce the published ones** (1.23% / 2.94, 1.74% / 2.81, 3.02% / 2.75).
+- **Studio voice:** as intelligible as v3.1 (the intervals overlap), UTMOSv2 3.021 against 2.935.
+- **Male and female voices:** v3.2 loses some intelligibility against v3.1 (2.28% vs 1.74%, 3.99% vs 3.02%). For the
+  female voice, v3.1's regressors through Vocos v2 give 3.27% / 2.638: sampling the pitch costs about 0.7 points of
+  WER there and adds 0.08 UTMOSv2. v3.2 is far above v3.1 + `vocos-ft` for every voice (UTMOSv2 +0.39 to +0.63),
+  mostly from Vocos v2 (female voice, v3.1's regressors through Vocos v2: +0.55).
+- **Why the durations stay v3.1's.** Sampled durations cost intelligibility on new text for the voices with little
+  data: WER 5.78% (male) and 11.28% (female). With the first Vocos fine-tune the female voice gives 10.89%, so the
+  durations cause it, not Vocos v2. The errors are single-phone slips where the sampler places very short sounds
+  ([PROSODY_MODEL.md](PROSODY_MODEL.md#guard-rails-freya-100)). `prosody_durations="sampled"` stays an opt-in for
+  the studio voice at prosody temperature ≤ 0.5 (studio at 0.3: 1.46% / 3.035).
 
 **Freya-100** (the first 100 sentences, studio voice; the protocol of [EXPERIMENTS.md](EXPERIMENTS.md#protocols-and-judges)):
 
-| system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL | RTF (shared GPU) |
-|---|---|---|---|---|---|
-| v3.1 + BigVGAN-v2-ft | {{…}} (known: 0.66%) | {{…}} (0.14%) | {{…}} (2.934) | {{…}} (3.33) | {{…}} |
-| v3.1 + vocos-ft | {{…}} (known: 1.10%) | {{…}} (0.22%) | {{…}} (2.627) | {{…}} (3.31) | {{…}} |
-| **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
-| v3.2 with the 10k-step Vocos v2 pilot (dry run) | 0.66% [0.11, 1.33] | 0.14% | 2.976 [2.941, 3.012] | 3.360 | 0.0092 |
-
-The dry run reproduced both reference rows exactly (0.66% / 0.14% / 2.934 / 3.327 and 1.10% / 0.22% / 2.627 / 3.307).
+| system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL |
+|---|---|---|---|---|
+| v3.1 + BigVGAN-v2-ft | 0.66% [0.22, 1.22] | 0.14% | 2.934 [2.892, 2.975] | 3.327 |
+| v3.1 + vocos-ft | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 3.307 |
+| **v3.2** | **0.44%** [0.11, 0.90] | **0.11%** | **2.998** [2.955, 3.041] | 3.356 |
+| v3.2, sampled durations | 0.77% [0.22, 1.44] | 0.16% | 3.026 [2.984, 3.068] | 3.360 |
+| v3.2, sampled durations, 10k-step Vocos v2 pilot (dry run) | 0.66% [0.11, 1.33] | 0.14% | 2.976 [2.941, 3.012] | 3.360 |
 
 **Prosody** (`drifting-tts prosody`, the 100 studio `val` recordings against each system's rendition of their texts,
 sentence by sentence; harvest F0 in semitones; [PROSODY.md](PROSODY.md#how-it-is-measured) defines the columns):
@@ -57,41 +68,55 @@ sentence by sentence; harvest F0 in semitones; [PROSODY.md](PROSODY.md#how-it-is
 | system | F0 std | F0 range | micro | pauses/utt | pause s | syl/s | DTW F0 r | CER | WER | UTMOSv2 | SIM |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | recording | 3.68 | 11.9 | 0.42 | 1.39 | 0.139 | 6.22 | – | 0.88% | 2.06% | 3.093 | – |
-| v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
-| v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
-| **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+| v3.1 + BigVGAN-v2-ft | 3.21 | 10.1 | 0.41 | 1.58 | 0.320 | 5.90 | 0.589 | 0.44% | 1.98% | 2.870 | 0.924 |
+| v3.1 + vocos-ft | 3.36 | 10.8 | 0.47 | 1.58 | 0.316 | 5.90 | 0.606 | 0.50% | 2.21% | 2.614 | 0.931 |
+| **v3.2** | 3.53 | 11.3 | 0.44 | 1.54 | 0.175 | 6.01 | 0.579 | 0.42% | 2.02% | 2.990 | 0.940 |
+| v3.2, sampled durations | 3.56 | 11.4 | 0.45 | 2.35 | 0.186 | 6.08 | 0.572 | 0.50% | 2.32% | 3.000 | 0.943 |
 
-**Latency** (`scripts/bench_ttfa.py`, RTX 5090, studio voice, T = 0.3, α = 2, median of 100 runs after warm-up;
-`fast`: `Synthesizer(fast=True).stream`, with the prosody predictor inside the acoustic model's CUDA graphs):
+- **Intonation.** Sampling the pitch raises the F0 standard deviation from 3.21 semitones (v3.1 as released) to 3.53
+  (recordings 3.68) and the 5–95% range from 10.1 to 11.3 (11.9); sampled durations add little (3.56 / 11.4). Part
+  of the gain over v3.1 is the vocoder: v3.1's regressors through `vocos-ft` give 3.36.
+- **Pauses.** Punctuation pauses bring the gap between sentences from 0.32 s to 0.175 s (recordings 0.139 s) and the
+  length ratio to the recordings from 1.054 to 1.035. The rhythm inside sentences stays v3.1's (pauses per
+  utterance 1.54; sampled durations: 2.35, recordings 1.39).
+- **Guard rails.** On these sentences v3.2 is as intelligible as v3.1 (CER 0.42% / WER 2.02% against 0.44% / 1.98%),
+  with UTMOSv2 2.990 (2.870) and speaker similarity 0.940 (0.924). The DTW F0 correlation with the particular
+  recording drops slightly (0.589 → 0.579): each sample is one plausible tune among several. F0 micro-variation is
+  0.44 st (BigVGAN-v2-ft 0.41, recordings 0.42).
 
-| system | mode | TTFA short | TTFA long sentence | TTFA paragraph | RTF paragraph |
+**Latency** (`scripts/bench_ttfa.py`, RTX 5090 with nothing else running, studio voice, T = 0.3, α = 2, median of
+100 runs after warm-up; `fast`: `Synthesizer(fast=True).stream`, the prosody predictor inside the acoustic model's
+CUDA graphs):
+
+| system | mode | TTFA short | TTFA long sentence | TTFA paragraph | RTF short / long / paragraph |
 |---|---|---|---|---|---|
-| v3.1 + BigVGAN-v2-ft (`--cuda-kernel`) | `fast` | 12.3 ms | 13.9 ms | 13.6 ms | – |
-| v3.1 + vocos-ft | `fast` | {{…}} | {{…}} | {{…}} | {{…}} |
-| v3.2 | `stream` (eager acoustic model) | {{…}} | {{…}} | {{…}} | {{…}} |
-| **v3.2** | **`fast`** | {{…}} | {{…}} | {{…}} | {{…}} |
+| v3.1 + BigVGAN-v2-ft (`--cuda-kernel`) | `fast` | 12.3 ms | 13.8 ms | 13.5 ms | 0.0185 / 0.0098 / 0.0101 |
+| v3.1 + vocos-ft | `fast` | 4.9 ms | 6.3 ms | 6.0–6.1 ms | 0.0043 / 0.0015 / 0.0018 |
+| v3.2 | `stream` (eager acoustic model) | 14.8 ms | 15.2 ms | 15.2 ms | 0.0119 / 0.0030 / 0.0039 |
+| **v3.2** | **`fast`** | **5.8 ms** | **7.4 ms** | **7.1 ms** | **0.0051 / 0.0017 / 0.0020** |
 
-Measured so far only on the shared GPU, with two trainings running (2 rounds × 50 runs, interleaved; the 10k-step
-Vocos v2 pilot, which has the same network as the final one). The busy GPU inflates every TTFA about 4× (v3.1 +
-BigVGAN-v2-ft: 50.5 ms here, 12.3 ms idle), so read the rows against each other:
+Two rounds of 100 runs agree within 0.1 ms, and the v3.1 + BigVGAN-v2-ft row reproduces the published one
+(12.3 / 13.9 / 13.6 ms, [below](#latency-and-size)). v3.2 starts speaking about twice as fast as v3.1 because Vocos's
+first window is cheaper than BigVGAN's, and generates 200–600× faster than real time (v3.1: 55–100×). The files were
+the staged release (`DRIFTING_TTS_HUB_DIR`, `scripts/bench_ttfa.py --model drifting_tts_v3.2.pt --mode fast --vocoder
+vocos-v2 --prosody drift --prosody-durations regressor`).
+
+Earlier, on the GPU shared with two trainings (2 interleaved rounds × 50 runs; durations sampled, the 10k-step Vocos
+v2 pilot), every TTFA was about 4× higher, but the rows compare:
 
 | system (busy GPU) | mode | TTFA short | long sentence | paragraph | RTF paragraph |
 |---|---|---|---|---|---|
 | v3.1 + BigVGAN-v2-ft (`--cuda-kernel`) | `fast` | 50.5–51.1 ms | 56.2–57.4 ms | 56.8–57.0 ms | 0.034 |
 | v3.1 + vocos-ft | `fast` | 30.6–30.7 ms | 32.2 ms | 30.9–31.6 ms | 0.0089 |
-| v3.1 + Vocos v2 | `fast` | 30.6–30.7 ms | 32.1–32.2 ms | 31.6–31.7 ms | 0.0089 |
-| v3.2 | `stream` (eager acoustic model) | 48.3–48.7 ms | 50.3–50.5 ms | 49.7–49.9 ms | 0.013 |
-| **v3.2** | **`fast`** | **31.5 ms** | **37.5–37.6 ms** | **32.6 ms** | **0.010** |
+| v3.2, sampled durations | `stream` (eager acoustic model) | 48.3–48.7 ms | 50.3–50.5 ms | 49.7–49.9 ms | 0.013 |
+| v3.2, sampled durations | `fast` | 31.5 ms | 37.5–37.6 ms | 32.6 ms | 0.010 |
 
-- **The prosody predictor costs ~1 ms of TTFA in CUDA graphs** (+5 ms on the 197-token sentence, whose sampled
-  durations fall in a larger frame bucket), against ~17 ms when it runs eagerly. Here v3.2 starts speaking about
-  40% sooner than v3.1 with BigVGAN-v2-ft, because Vocos's first window is cheaper (idle GPU, short sentence:
-  vocos-ft 4.9 ms against 12.4 ms, [VOCODERS.md](VOCODERS.md)).
 - **The prosody predictor in CUDA graphs.** One pass of the drift sampler (`drift` / `mse` kinds, no word features,
   spread 1) runs inside the text encoder's graph; its noise is drawn outside the graph in the eager order, so a seed
   gives the same frame counts as the eager path, and mels equal to 77–207 dB SNR (bit-identical on most sentences;
   the remaining float differences come from attention kernels on padded buckets, as for v3.1's `fast` path on short
-  sentences). Before, `fast=True` with a prosody model ran the acoustic model eagerly.
+  sentences). It adds about 1 ms of TTFA (v3.2 5.8 ms against 4.9 ms for v3.1 + vocos-ft); with the acoustic model
+  eager, v3.2 needs 14.8 ms. Before, `fast=True` with a prosody model ran the acoustic model eagerly.
 - **Memory of `fast=True`.** The graphs were captured with autograd on, so each frame bucket kept its activations
   alive: about 6 GB of GPU memory for the full set. They are now captured under `no_grad`: 0.65 GB allocated with or
   without the prosody predictor.
@@ -99,8 +124,8 @@ BigVGAN-v2-ft: 50.5 ms here, 12.3 ms idle), so read the rows against each other:
 **Reproduce:** stage the files with `scripts/prepare_release.py`, then
 
 ```bash
-scripts/eval_release.sh runs/release/drifting_tts_v3.1.pt runs/rel_publish/prosody_drift_v3.2.pt \
-    runs/rel_publish/vocos_v2.pt runs/rel_eval_v3.2      # Freya-100, Freya-495 x 3 voices, prosody; summary.md
+scripts/eval_release.sh runs/rel_publish/drifting_tts_v3.2.pt runs/rel_publish/prosody_drift_v3.2.pt \
+    runs/rel_publish/vocos_v2.pt runs/rel_eval_v3.2   # Freya-100, Freya-495 x 3 voices, prosody; summary.md
 ```
 
 ## Freya-TR-Eval

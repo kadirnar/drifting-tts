@@ -210,8 +210,8 @@ the pilots took 0.6–1.5 h per 10k steps.
 `configs/vocoder_vocos_v2.yaml` (the P3 recipe) runs 160k steps from `vocos-ft`, 200k steps in total. The cosine
 decays the rates to 10% of their peaks, and a snapshot is kept every 5k steps. The snapshot to publish is chosen on
 Freya-100 (UTMOSv2, DNSMOS, WER) and copy-synthesis (F0 error, periodicity), because the last step is not always the
-best. The chosen snapshot is published as `vocos_v2.pt` (`scripts/prepare_release.py` keeps only what
-`load_vocoder` reads); until then, pass a snapshot's path as the vocoder.
+best. The final snapshot (160k steps) is the vocoder of release v3.2, published as `vocos_v2.pt`
+(`scripts/prepare_release.py` keeps only what `load_vocoder` reads).
 
 ## Revox Vocoder 1.0 (non-commercial)
 

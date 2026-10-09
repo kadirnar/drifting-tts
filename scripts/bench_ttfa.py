@@ -6,12 +6,13 @@ TTFA runs from the input text to the first audio on the host. ``--mode``:
 - ``fast``: ``stream`` with CUDA graphs (``Synthesizer(fast=True)``); ``--compile`` / ``--tf32`` add
   ``torch.compile`` / TF32 matmuls.
 
-``--prosody`` samples the durations and token pitch with a stochastic prosody predictor (``drift`` or a checkpoint):
-in ``fast`` mode it runs inside the acoustic model's CUDA graphs.
+``--prosody`` samples the token pitch (and, unless ``--prosody-durations regressor``, the durations) with a stochastic
+prosody predictor (``drift`` or a checkpoint); in ``fast`` mode it runs inside the acoustic model's CUDA graphs.
 
     python scripts/bench_ttfa.py --mode fast --cuda-kernel     # weights from huggingface.co/Vyvo/drifting-tts-tr
     python scripts/bench_ttfa.py --mode fast --vocoder bigvgan-base --cuda-kernel   # any vocoder of the registry
-    python scripts/bench_ttfa.py --mode fast --vocoder vocos-v2 --prosody drift      # release v3.2
+    python scripts/bench_ttfa.py --model drifting_tts_v3.2.pt --mode fast --vocoder vocos-v2 --prosody drift \
+        --prosody-durations regressor                                                # release v3.2
 """
 
 import argparse
@@ -89,6 +90,8 @@ def main() -> None:
     p.add_argument("--mode", choices=["sentence", "stream", "fast"], default="sentence")
     p.add_argument("--prosody", default=None, help="stochastic prosody predictor: drift or a checkpoint")
     p.add_argument("--prosody-temperature", type=float, default=None, help="default: the checkpoint's")
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled",
+                   help="regressor: only the token pitch is sampled (release v3.2)")
     p.add_argument("--compile", action="store_true", help="--mode fast: also torch.compile the DiT")
     p.add_argument("--tf32", action="store_true", help="--mode fast: TF32 matmuls")
     p.add_argument("--runs", type=int, default=100)
@@ -104,7 +107,7 @@ def main() -> None:
     t = time.perf_counter()
     synth = Synthesizer(args.model, "cuda", vocoder=args.vocoder, cuda_kernel=args.cuda_kernel,
                         fast=args.mode == "fast", compile=args.compile, tf32=args.tf32, prosody=args.prosody,
-                        prosody_temperature=args.prosody_temperature)
+                        prosody_temperature=args.prosody_temperature, prosody_durations=args.prosody_durations)
     load_s = time.perf_counter() - t
     kw = dict(speaker=voice_id(args.speaker), temperature=args.temperature, cfg=args.cfg)
     fn = run if args.mode == "sentence" else run_stream
@@ -114,7 +117,8 @@ def main() -> None:
         fn(synth, TEXTS["4-sentence paragraph"], 1, **kw)
     res = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda_kernel": args.cuda_kernel,
            "mode": args.mode, "compile": args.compile, "tf32": args.tf32, "vocoder": args.vocoder,
-           "prosody": args.prosody, "prosody_graphed": synth.prosody is not None and synth.acoustic is not None,
+           "prosody": args.prosody, "prosody_durations": args.prosody_durations if args.prosody else None,
+           "prosody_graphed": synth.prosody is not None and synth.acoustic is not None,
            "peak_gb": None, "load_s": round(load_s, 1),
            "cold_ttfa_ms": round(1000 * cold["ttfa"], 1), "rows": {}}
     print(f"{res['gpu']}, mode {args.mode}, compile {args.compile}, tf32 {args.tf32}, cuda kernel {args.cuda_kernel}, "

@@ -11,16 +11,19 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 
 | | |
 |---|---|
-| **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **{{V32_WER}}** (v3.2; v3.1 1.23%; Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 {{V32_UTMOS}} |
-| **Prosody** (v3.2) | durations and pitch **sampled** by a small model trained with drifting: pitch spread {{V32_F0_STD}} semitones on held-out sentences (recordings 3.68, v3.1 {{V31_F0_STD}}) |
-| **Speed** (RTX 5090) | first audio after **{{V32_TTFA}}** for any sentence length (streaming, CUDA graphs), {{V32_RTF_X}}× faster than real time |
-| **Size** | 67.7 M acoustic model + 8.1 M prosody model + 13.5 M Vocos vocoder (v3.1: + 112 M BigVGAN-v2) |
+| **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **1.33%** (v3.2, studio voice; v3.1 1.23%; Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 **3.02** (v3.1 2.94) |
+| **Intonation** (v3.2) | the pitch is **sampled** by a small model trained with drifting: pitch spread 3.53 semitones on held-out sentences (recordings 3.68, v3.1 3.21) |
+| **Speed** (RTX 5090) | first audio after **6–7 ms** for any sentence length (v3.2, streaming, CUDA graphs; v3.1: 12–14 ms), 200–600× faster than real time |
+| **Size** | 67.7 M acoustic model + 8.1 M prosody model + 13.5 M Vocos vocoder (v3.1: 67.7 M + 112 M BigVGAN-v2) |
 | **Voices** | `studio` (default), `male` and `female` |
 
-**New in v3.2:** v3.1's acoustic model with a stochastic prosody predictor instead of its deterministic duration and
-pitch regressors (each seed is another natural reading), a retrained Vocos vocoder (Vocos v2) and pauses between
-sentences that follow the punctuation ([results](docs/RESULTS.md#v32-sampled-prosody-vocos-v2-punctuation-pauses)).
-v3.1 stays available unchanged.
+**New in v3.2:** v3.1's acoustic weights with three changes. The intonation (the pitch of every character) is
+sampled by a small prosody model trained with drifting, so each seed reads a sentence with another natural tune; the
+durations, i.e. the rhythm, stay v3.1's. A retrained Vocos vocoder (Vocos v2, 13.5 M) replaces BigVGAN-v2, and the
+pauses between sentences follow the punctuation. The studio voice is about as intelligible as in v3.1 and scores
+higher on UTMOSv2; the male and female voices lose some intelligibility (Freya WER 2.28% and 3.99%, against 1.74%
+and 3.02%) ([results](docs/RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)). v3.1 stays available
+unchanged.
 
 ## Listen
 
@@ -59,15 +62,19 @@ sf.write("merhaba.wav", wav.numpy(), 24000)
 
 - `speaker`: `"studio"` (default, the clearest voice), `"male"` or `"female"`. Any of the model's 723 speaker
   IDs also works, e.g. `speaker=17`; [docs/SPEAKERS.md](docs/SPEAKERS.md) scores every one of them.
-- `seed`: v3.2 samples the rhythm and the intonation, so another seed gives another natural reading of the same text.
+- `seed`: v3.2 samples the intonation, so another seed gives another tune for the same text (with the same rhythm).
 - `temperature`: the noise level of the acoustic model. 0.3 sounds clearest; higher values give more variety.
-- `prosody_temperature` (v3.2, default 0.5): how freely durations and pitch are sampled. Higher is more varied but
-  less clear (at 1.0 Freya WER rises to 2.6%, [PROSODY_MODEL.md](docs/PROSODY_MODEL.md#guard-rails-freya-100)).
+- `prosody_temperature` (v3.2, default 0.5, the tested setting): how freely the pitch is sampled; higher is more
+  varied.
+- `prosody_durations="sampled"` (opt-in): the prosody model also samples the durations, so the rhythm and the pauses
+  inside a sentence vary too. It costs intelligibility on new text for the voices with little data (Freya WER male
+  5.78%, female 11.28%); use it only with the studio voice (1.89%) and a prosody temperature of at most 0.5
+  ([details](docs/RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)).
 - `cfg_scale`: the guidance strength, learned during training, so it costs nothing at inference.
 - `pause`: the silence between sentences: `"punct"` (v3.2: by the final punctuation, measured per voice) or seconds
   (v3.1: 0.15).
-- **v3.1**, as released: `Synthesizer.from_pretrained("v3.1", "cuda")` (BigVGAN-v2-ft, deterministic durations and
-  pitch, 0.15 s pauses). Keyword arguments override a release's parts, e.g.
+- **v3.1**, as released: `Synthesizer.from_pretrained("v3.1", "cuda")` (BigVGAN-v2-ft, deterministic pitch and
+  durations, 0.15 s pauses). Keyword arguments override a release's parts, e.g.
   `from_pretrained("v3.2", vocoder="bigvgan-v2-ft")`; `tts.variant(...)` gives a second pipeline that shares the
   acoustic model. The explicit form still works:
   `Synthesizer(hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft")`.
@@ -75,7 +82,7 @@ sf.write("merhaba.wav", wav.numpy(), 24000)
   the Hub), as are `"vocos-ft"` and `"bigvgan-base-ft"`. Other names: the stock NVIDIA `"bigvgan-v2"`,
   `"bigvgan-v1"` and `"bigvgan-base"` (14 M), or the weight-free `"griffin-lim"`; a checkpoint path also works.
   [docs/VOCODERS.md](docs/VOCODERS.md) compares them.
-- `prosody`: `"drift"` (v3.2's predictor), `None` (the model's deterministic regressors) or a checkpoint.
+- `prosody`: `"drift"` (v3.2's predictor), `None` (the model's deterministic pitch regressor) or a checkpoint.
 - Numbers, dates, times, units, currencies and common abbreviations are read out in Turkish automatically.
 
 The same from the command line (`--release` downloads the parts; `--model`, `--vocoder`, `--prosody` and `--pause`
@@ -88,7 +95,7 @@ drifting-tts synthesize --release v3.2 --speaker female --cfg 2 --temperature 0.
 
 **Lowest latency: streaming.** `fast=True` runs the acoustic model, the prosody predictor included, as CUDA graphs,
 with the same output. `stream()` yields the audio in pieces, and on an RTX 5090 the first piece (0.34 s) is ready
-after about {{V32_TTFA}}. The vocoder streams in overlapping windows whose pieces join into the whole-sentence audio;
+after about 6–7 ms (v3.1 with BigVGAN-v2: 12–14 ms). The vocoder streams in overlapping windows whose pieces join into the whole-sentence audio;
 Freya WER and CER are unchanged ([details](docs/RESULTS.md#latency-and-size)):
 
 ```python
@@ -162,9 +169,9 @@ Whisper large-v3, and both texts normalised the same way. Lower is better.
 
 | system | parameters | WER | CER |
 |---|---|---|---|
-| **drifting-tts v3.2, studio voice** | 68 M + 8 M prosody + 14 M vocoder | **{{V32_WER}}** | **{{V32_CER}}** |
-| drifting-tts v3.2, male voice | 68 M + 8 M prosody + 14 M vocoder | {{V32_MALE_WER}} | {{V32_MALE_CER}} |
-| drifting-tts v3.2, female voice | 68 M + 8 M prosody + 14 M vocoder | {{V32_FEMALE_WER}} | {{V32_FEMALE_CER}} |
+| **drifting-tts v3.2, studio voice** | 68 M + 8 M prosody + 14 M vocoder | **1.33%** | **0.27%** |
+| drifting-tts v3.2, male voice | 68 M + 8 M prosody + 14 M vocoder | 2.28% | 0.45% |
+| drifting-tts v3.2, female voice | 68 M + 8 M prosody + 14 M vocoder | 3.99% | 0.97% |
 | drifting-tts v3.1, studio voice | 68 M + 112 M vocoder | 1.23% | 0.24% |
 | drifting-tts v3.1, male voice | 68 M + 112 M vocoder | 1.74% | 0.38% |
 | drifting-tts v3.1, female voice | 68 M + 112 M vocoder | 3.02% | 0.70% |
@@ -176,17 +183,19 @@ Whisper large-v3, and both texts normalised the same way. Lower is better.
 - Piper and MMS-TTS were re-run in this repository's harness. Their scores are close to those in the FreyaTTS
   report, so the numbers are comparable.
 - "report" values are copied from the FreyaTTS report (arXiv 2607.09530, Table 2).
-- Reproduce with `drifting-tts benchmark --model drifting_tts_v3.1.pt --vocoder vocos-v2 --prosody drift --pause punct
-  --speaker studio` (v3.2; v3.1: `--vocoder bigvgan-v2-ft` alone), or all rows with `scripts/eval_release.sh`.
+- Reproduce with `drifting-tts benchmark --model drifting_tts_v3.2.pt --vocoder vocos-v2 --prosody drift
+  --prosody-durations regressor --pause punct --speaker studio` (v3.2; v3.1: `--model drifting_tts_v3.1.pt --vocoder
+  bigvgan-v2-ft`), or all rows with `scripts/eval_release.sh`.
 
 ## How it works
 
 ```
-text ─► Turkish normaliser ─► text encoder ─► prosody model: durations + pitch ─► DriftDiT (1 pass) ─► mel ─► Vocos ─► audio
+text ─► Turkish normaliser ─► text encoder: durations ─► prosody model: pitch ─► DriftDiT (1 pass) ─► mel ─► Vocos ─► audio
 ```
 
-1. A text encoder reads the text. A small prosody model, also trained with drifting, samples how long each
-   character lasts and its pitch (v3.1: deterministic regressors), and the text is laid out over time.
+1. A text encoder reads the text and predicts how long each character lasts. A small prosody model, also trained
+   with drifting, samples the pitch of each character (v3.1: a deterministic regressor), and the text is laid out
+   over time.
 2. The **DriftDiT** generator turns random noise plus that layout into a mel spectrogram in one forward pass.
 3. Training uses a **drifting field**: generated samples are pulled toward real recordings and pushed away from each
    other, so the model's output distribution moves toward the data distribution. Similarity is measured in the
@@ -237,8 +246,11 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 ## Limitations
 
 - **Voices:** three built-in voices; no voice cloning from a reference recording.
-- **Prosody:** v3.2 samples durations and pitch per sentence, with the recordings' spread; each sentence is still
-  generated without the context of its neighbours, and a higher prosody temperature costs intelligibility.
+- **Prosody:** v3.2 samples the intonation with the recordings' spread, but the rhythm still comes from a
+  deterministic duration predictor, and each sentence is generated without the context of its neighbours. Sampling
+  the durations too (opt-in) costs intelligibility for the male and female voices.
+- **Intelligibility:** v3.2's male and female voices are less intelligible than v3.1's (Freya WER 2.28% and 3.99%
+  against 1.74% and 3.02%); `from_pretrained("v3.1")` remains available.
 - **Naturalness:** measured only with automatic scores (UTMOSv2, DNSMOS, F0 statistics), not by listeners.
 
 ## Citation and license

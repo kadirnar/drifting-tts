@@ -91,6 +91,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--release-prosody", default=None,
                    help="system 'release': the stochastic prosody predictor (drift or a checkpoint)")
     p.add_argument("--release-prosody-temperature", type=float, default=None, help="default: the checkpoint's")
+    p.add_argument("--release-prosody-durations", choices=["sampled", "regressor"], default="sampled",
+                   help="system 'release': regressor = only the token pitch is sampled (v3.2)")
     p.add_argument("--release-vocoder", default=None, help="system 'release': its vocoder (default: --vocoder)")
     p.add_argument("--release-model", default=None, help="system 'release': its acoustic model (default: --model)")
     add_vocoder_args(p, default="vocos-ft")
@@ -212,7 +214,8 @@ class Runner:
                 voc = None
             kw = {} if voc is None else {"vocoder": voc}
             if s.sampled:
-                kw.update(prosody=self.release["prosody"], prosody_temperature=self.release.get("prosody_temperature"))
+                kw.update(prosody=self.release["prosody"], prosody_temperature=self.release.get("prosody_temperature"),
+                          prosody_durations=self.release.get("prosody_durations", "sampled"))
             self._synths[key] = base.variant(**kw)
         return self._synths[key]
 
@@ -470,6 +473,7 @@ def run(args) -> None:
     speaker = synth.speaker_id(args.speaker)
     release = {"vocoder": args.release_vocoder, "prosody": args.release_prosody,
                "prosody_temperature": args.release_prosody_temperature,
+               "prosody_durations": args.release_prosody_durations,
                "model": args.release_model if args.release_model not in (None, args.model) else None}
     runner = Runner(synth, speaker, args.temperature, args.cfg, release)
     utts = load_utterances(args, synth, speaker)

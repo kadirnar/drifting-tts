@@ -60,8 +60,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="noise temperature of --prosody (default: its preferred one, else 1)")
     p.add_argument("--prosody-spread", type=float, default=1.0,
                    help="output-space temperature of --prosody (< 1: closer to its mean, flatter, less varied)")
-    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled",
-                   help="regressor: --prosody samples only the token pitch; durations stay the model's")
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default=None,
+                   help="regressor: --prosody samples only the token pitch; durations stay the model's (default: the "
+                        "release's, else sampled)")
     add_vocoder_args(p)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -402,14 +403,15 @@ def pipeline_args(args) -> dict:
         pause = "punct"
     if pause == "punct" and getattr(args, "pause_jitter", 0.0):
         pause = f"punct:{args.pause_jitter}"
+    durations = getattr(args, "prosody_durations", None) or rel.get("prosody_durations", "sampled")
     return {"model_path": model, "vocoder": args.vocoder or rel.get("vocoder"),
-            "prosody": None if str(prosody).lower() == "none" else prosody, "pause": pause}
+            "prosody": None if str(prosody).lower() == "none" else prosody, "prosody_durations": durations,
+            "pause": pause}
 
 
 def run(args) -> None:
     synth = Synthesizer(device=args.device, cuda_kernel=args.cuda_kernel, prosody_temperature=args.prosody_temperature,
-                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations,
-                        **pipeline_args(args))
+                        prosody_spread=args.prosody_spread, **pipeline_args(args))
     if args.list_speakers:
         for name, v in VOICES.items():
             default = " (default)" if name == DEFAULT_VOICE else ""

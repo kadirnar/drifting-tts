@@ -28,6 +28,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 MODEL=$1 PROSODY=$2 VOCODER=$3 OUT=$4
 STAGES=${STAGES:-freya100 freya495 prosody}
+PROSODY_DURATIONS=${PROSODY_DURATIONS:-regressor}  # v3.2 samples the token pitch only (hub.RELEASES)
 REF_MODEL=${REF_MODEL:-runs/release/drifting_tts_v3.1.pt}
 NEED_GB=${NEED_GB:-7} MAX_GB=${MAX_GB:-28} DEVICE=${DEVICE:-cuda} PY=${PY:-python}
 mkdir -p "$OUT"
@@ -57,7 +58,7 @@ systems() {  # systems <protocol> <voice> <extra benchmark args...>
   bench "${proto}_${voice}_v3.1-bigvgan" --model "$REF_MODEL" --vocoder bigvgan-v2-ft --speaker "$voice" "$@"
   bench "${proto}_${voice}_v3.1-vocos" --model "$REF_MODEL" --vocoder vocos-ft --speaker "$voice" "$@"
   bench "${proto}_${voice}_v3.2" --model "$MODEL" --vocoder "$VOCODER" --prosody "$PROSODY" --pause punct \
-    --speaker "$voice" "$@"
+    --prosody-durations "$PROSODY_DURATIONS" --speaker "$voice" "$@"
 }
 
 for stage in $STAGES; do
@@ -71,6 +72,7 @@ for stage in $STAGES; do
       $PY -m drifting_tts.cli prosody --model "$REF_MODEL" ${DATA:+--data "$DATA"} --split val --speaker 722 \
         --num 100 --vocoder vocos-ft --systems recording predicted predicted@voc=bigvgan-v2-ft release \
         --release-model "$MODEL" --release-prosody "$PROSODY" --release-vocoder "$VOCODER" --workers 2 \
+        --release-prosody-durations "$PROSODY_DURATIONS" \
         --device "$DEVICE" --out "$OUT/prosody_val722" >> "$LOG" 2>&1 ;;
     *) echo "unknown stage $stage" >&2; exit 1 ;;
   esac
