@@ -27,8 +27,13 @@ except ImportError:  # running locally
 DEVICE = os.environ.get("DEMO_DEVICE", "cuda")
 v32 = Synthesizer.from_pretrained("v3.2", DEVICE)  # vocos-v2, prosody="drift" (pitch only), pause="punct"
 v31 = v32.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)  # same acoustic model, loaded once
+# opt-in: the prosody model samples the durations (rhythm, pauses inside sentences) too; studio voice only, since the
+# voices with little data then slip on words (Freya-495 WER male 5.78%, female 11.28%)
+v32_rhythm = v32.variant(prosody=v32.prosody, prosody_durations="sampled")
+RHYTHM = "v3.2 + sampled rhythm (experimental, studio voice only)"
 RELEASES = {
     "v3.2 (new): sampled intonation, Vocos v2, punctuation pauses": v32,
+    RHYTHM: v32_rhythm,
     "v3.1: deterministic intonation, BigVGAN-v2": v31,
 }
 VOICES = {"Studio male voice (recommended)": "studio", "Male voice": "male", "Female voice": "female"}
@@ -57,6 +62,11 @@ v3.2 samples only the intonation: the rhythm (durations) stays v3.1's. On 100 he
 voice its pitch spread is 3.53 semitones against 3.68 in the recordings and 3.21 for v3.1, so
 the intonation is less flat; each seed gives another plausible tune. The male and female voices are somewhat less
 intelligible than in v3.1.
+
+**v3.2 + sampled rhythm** (experimental) lets the prosody model sample the durations as well: a livelier rhythm with
+more pauses inside sentences (held-out studio texts: 2.35 pauses per utterance, against 1.39 in the recordings and
+1.54 for v3.2). Studio voice, Freya-495: WER 1.89% / UTMOSv2 3.03 at prosody temperature 0.5, 1.46% / 3.04 at 0.3.
+The other voices have too little data for it, so with them this option falls back to v3.2.
 """
 
 
@@ -69,7 +79,9 @@ def generate(text, release, voice, temperature, guidance, prosody_temperature, r
         raise gr.Error(f"Please keep the text under {MAX_CHARS} characters.")
     if not normalize(text):
         raise gr.Error("Nothing to read after normalisation.")
-    synth = RELEASES[release]
+    synth, note = RELEASES[release], ""
+    if release == RHYTHM and VOICES[voice] != "studio":
+        synth, note = v32, " Sampled rhythm is for the studio voice only: this voice used v3.2 (sampled intonation)."
     t0 = time.time()
     wav, info = synth(text, speaker=VOICES[voice], cfg_scale=float(guidance), temperature=float(temperature),
                       length_scale=1.0 / float(rate), seed=int(seed),
@@ -77,7 +89,7 @@ def generate(text, release, voice, temperature, guidance, prosody_temperature, r
     took = time.time() - t0
     audio = (SAMPLE_RATE, np.clip(wav.float().numpy(), -1, 1))
     stats = (f"{info['seconds']:.1f} s of audio in {took:.2f} s, one generator pass per sentence. "
-             f"Normalised text: *{normalize(text)}*")
+             f"Normalised text: *{normalize(text)}*{note}")
     return audio, stats
 
 
@@ -105,8 +117,8 @@ with gr.Blocks(title="Drifting TTS: one-step Turkish TTS") as demo:
                                      info="Classifier-free guidance learned at training time (free at inference)")
                 prosody_temperature = gr.Slider(
                     0.0, 1.0, value=v32.prosody_temperature, step=0.05, label="Prosody temperature (v3.2)",
-                    info="How freely the pitch (intonation) is sampled: 0.5 is the tested setting; higher is "
-                         "more varied, 0 is the predictor's most typical tune")
+                    info="How freely the pitch (and, with sampled rhythm, the durations) is sampled: 0.5 is the "
+                         "tested setting; higher is more varied, 0 is the predictor's most typical reading")
                 rate = gr.Slider(0.7, 1.4, value=1.0, step=0.05, label="Speaking rate")
                 seed = gr.Number(value=0, precision=0, label="Seed")
             button = gr.Button("Synthesise", variant="primary")
