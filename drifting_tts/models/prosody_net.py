@@ -33,7 +33,7 @@ from .text_encoder import EncoderLayer
 KINDS = ("drift", "mse", "flow")
 # what ProsodyPredictor.load reads: a published checkpoint keeps only these (export_checkpoint)
 CHECKPOINT_KEYS = ("ema", "stats", "net_cfg", "cond_dim", "duration_scales", "temperature", "flow_steps",
-                   "tts_fingerprint")
+                   "tts_fingerprint", "pause_edges")
 SPACE_ID = SYMBOL_TO_ID[" "]
 PUNCT_IDS = [SYMBOL_TO_ID[c] for c in PUNCTUATION if c != " "]
 
@@ -212,6 +212,8 @@ class ProsodyPredictor(nn.Module):
         self.stats = ProsodyStats(self.net.word_dim)
         self.duration_scales: dict[int, float] = {}
         self.temperature: float | None = None  # preferred prosody temperature (train-prosody --calibrate-only)
+        # leading + trailing silence of its generated sentences per voice (PausePolicy.for_voice(edge=...))
+        self.pause_edges: dict[int, float] = {}
         self.flow_steps = 8
         self._word_encoder = None
 
@@ -332,6 +334,7 @@ class ProsodyPredictor(nn.Module):
         p.stats.load_state_dict(ck["stats"])
         p.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}
         p.temperature = ck.get("temperature")
+        p.pause_edges = {int(k): float(v) for k, v in ck.get("pause_edges", {}).items()}
         p.flow_steps = int(ck.get("flow_steps", 8))
         return p.to(device).eval()
 
@@ -359,6 +362,8 @@ def export_checkpoint(ck: dict, tts=None) -> dict:
         out[k] = {n: t.detach().cpu().contiguous().clone() for n, t in out[k].items()}
     out["net_cfg"] = dict(out["net_cfg"])
     out["duration_scales"] = {int(k): float(v) for k, v in out.get("duration_scales", {}).items()}
+    if "pause_edges" in out:
+        out["pause_edges"] = {int(k): float(v) for k, v in out["pause_edges"].items()}
     if tts is not None:
         out["tts_fingerprint"] = tts_fingerprint(tts)
     return out

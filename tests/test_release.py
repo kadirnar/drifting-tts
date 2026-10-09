@@ -224,3 +224,19 @@ def test_variant_shares_the_model_and_per_call_prosody_temperature(tmp_path):
     cold = [v32.mels(TEXT, speaker=2, seed=s, prosody_temperature=0.0) for s in (1, 2)]
     assert all(m1.shape == m2.shape for m1, m2 in zip(*cold))  # zero prosody noise: the same durations per seed
     assert v32.prosody_temperature == 0.5  # per call only
+
+
+def test_punct_pauses_use_the_prosody_predictors_edge_silence(tmp_path):
+    assert PausePolicy.for_voice(722, edge=0.0)("a.") == pytest.approx(PausePolicy.for_voice(722).gaps["."][0])
+    ck = _prosody_ck()
+    ck["pause_edges"] = {"0": 0.0}  # speaker 0 (corpus policy): no edge silence -> the whole measured gap
+    out = export_checkpoint(ck)
+    assert out["pause_edges"] == {0: 0.0}
+    torch.save(out, tmp_path / "prosody.pt")
+    synth = _synth(tmp_path, prosody=str(tmp_path / "prosody.pt"), pause="punct")
+    assert synth.prosody.pause_edges == {0: 0.0}
+    gap = PausePolicy.for_voice(0).gaps["."][0]
+    assert synth._pause(None, 0)("a.") == pytest.approx(gap)
+    assert synth._pause(None, 2)("a.") == PausePolicy.for_voice(2)("a.")  # no measured edge: the table's
+    synth.set_prosody(synth.prosody, durations="regressor")  # the regressors' durations: the table's edge again
+    assert synth._pause(None, 0)("a.") == PausePolicy.for_voice(0)("a.") < gap

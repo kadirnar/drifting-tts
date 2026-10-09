@@ -444,6 +444,12 @@ GPU): {{DRYRUN}}.
   row of `drifting_tts/hub.py: RELEASES`: a new acoustic model is a one-line change there.
 - **`fast=True` with the prosody predictor.** The drift sampler (one pass) runs inside the text encoder's CUDA graph,
   its noise drawn outside in the eager order: same frame counts, mels within float noise of the eager path.
+- **Pause edges belong to the duration source.** `PausePolicy` inserts the measured pause minus the edge silence
+  of the generated sentences, which was measured with v3.1's regressors. The sampled durations leave longer edges
+  (leading + trailing silence of 200 held-out sentences, with the Vocos v2 pilot): studio 0.202 s (v3.1 0.161),
+  male 0.184 (0.176), female 0.123 (0.070), so the v3.1 table would make v3.2's gaps 0.01–0.05 s too long.
+  `prepare_release.py` measures them and stores them in the prosody checkpoint (`pause_edges`); `pause="punct"`
+  uses them whenever that predictor's durations are used.
 - **`Synthesizer.variant`** gives v3.1 next to v3.2 on one acoustic model (the demo's toggle) and replaces the
   attribute swapping of the comparison Space; `prosody_temperature` can be set per call.
 

@@ -12,7 +12,7 @@ v3.2 keeps v3.1's acoustic model and changes what surrounds it. `{{...}}` marks 
 |---|---|---|
 | durations and token pitch | deterministic regressors (MSE) | sampled by an 8.1 M prosody predictor trained with drifting, prosody temperature 0.5 ([PROSODY_MODEL.md](PROSODY_MODEL.md)) |
 | vocoder | BigVGAN-v2-ft (112.4 M) | Vocos v2 (13.5 M): `vocos-ft` trained further with the second recipe ([VOCODERS.md](VOCODERS.md#training-vocos-further)) |
-| pause between sentences | 0.15 s | by the sentence's final punctuation, measured per voice ([PROSODY.md](PROSODY.md#pauses)) |
+| pause between sentences | 0.15 s | by the sentence's final punctuation, measured per voice ([PROSODY.md](PROSODY.md#pauses)), minus the edge silence of v3.2's own sentences (stored with the prosody predictor) |
 | acoustic model | `drifting_tts_v3.1.pt` | the same file{{V32_ACOUSTIC_NOTE}} |
 | parameters at inference | 180.1 M | 89.3 M (67.7 M acoustic + 8.1 M prosody + 13.5 M vocoder) |
 | per-voice duration factors | the regressors' (`calibrate-durations`) | the prosody predictor's own (`train-prosody --calibrate-only`, at prosody temperature 0.5) |
