@@ -12,6 +12,7 @@ from drifting_tts.vocoder import (
     REVOX_REPO,
     REVOX_REVISION,
     VOCODERS,
+    VOCOS_REPO,
     GriffinLim,
     RevoxLogMel,
     Vocoder,
@@ -61,6 +62,8 @@ def test_registry_entries():
             assert e.repo.startswith("nvidia/") and e.mel == "bigvgan"
     assert VOCODERS["griffin-lim"].context is None and VOCODERS["griffin-lim"].mel is None
     assert VOCODERS["bigvgan-base-ft"].repo == BASE_REPO and VOCODERS["vocos-ft"].mel == "bigvgan"
+    v2 = VOCODERS["vocos-ft2"]  # same network as vocos-ft: same mel and streaming context
+    assert (v2.kind, v2.mel, v2.context, v2.repo) == ("vocos", "bigvgan", VOCODERS["vocos-ft"].context, VOCOS_REPO)
     revox = VOCODERS["revox"]
     assert revox.context is None and revox.mel == "bigvgan" and revox.repo == REVOX_REPO
     assert "non-commercial" in revox.about and "Minori Live" in revox.about  # CC BY-NC-SA 4.0, attributed

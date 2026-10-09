@@ -58,6 +58,10 @@ VOCODERS: dict[str, VocoderEntry] = {
                                     "bigvgan_base_ft.pt", "runs/bigvgan_base_ft/bigvgan_ft.pt", context=16),
     "vocos-ft": VocoderEntry("vocos", "Vocos fine-tuned on this model's (BigVGAN-style) mels", VOCOS_REPO,
                              "vocos_ft.pt", "runs/vocos_bigvgan/vocos_ft.pt", context=32),
+    # vocos-ft trained further with configs/vocoder_vocos_v2.yaml (docs/VOCODERS.md); local only until published
+    "vocos-ft2": VocoderEntry("vocos", "Vocos-ft trained further: rebalanced GAN losses, multi-scale mel, "
+                              "instantaneous-frequency loss, cosine LR", VOCOS_REPO, "vocos_ft2.pt",
+                              "runs/vocos_v2/vocos_ft.pt", context=32),
     "vocos": VocoderEntry("vocos", "charactr/vocos-mel-24khz, for models trained on Vocos mels", VOCOS_REPO,
                           context=32, mel="vocos"),
     "griffin-lim": VocoderEntry("griffin-lim", "mel pseudo-inverse + NNLS, then fast Griffin-Lim (no weights)",
