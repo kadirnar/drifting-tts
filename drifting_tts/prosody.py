@@ -368,21 +368,34 @@ def token_report(t: dict, frame_rate: float, frames: Tensor | None = None, pitch
 
 
 def seed_diversity(f0s: list[np.ndarray], lengths: list[float] | None = None,
-                   durations: list[Tensor] | None = None, points: int = 200) -> dict:
+                   durations: list[Tensor] | None = None, features: list[np.ndarray] | None = None) -> dict:
     """Spread of K renditions of one text (one per seed).
 
-    ``f0_spread``: mean over time of the std across seeds of the F0 contours (semitones relative to the pooled
-    median, unvoiced gaps interpolated, time-normalised between the first and last voiced frame to ``points``
-    points); ``f0_std_cv``: coefficient of variation of the per-rendition F0 std; ``len_cv``: of ``lengths``
-    (e.g. seconds); ``token_dur_std``: mean per-token std of log-frames across seeds (``durations``: ``[N]`` each)."""
-    ref = np.median(np.concatenate([f[f > 0] for f in f0s]))
-    curves, stds = [], []
-    for f in f0s:
-        v = np.nonzero(f > 0)[0]
-        st = 12 * np.log2(f[v] / ref)
-        curves.append(np.interp(np.linspace(v[0], v[-1], points), v, st))
-        stds.append(st.std())
-    out = {"f0_spread": float(np.stack(curves).std(0).mean()), "f0_std_cv": float(np.std(stds) / np.mean(stds))}
+    The F0 tracks are aligned to the first rendition: frame by frame when they have the same length (identical
+    durations), else by DTW on ``features`` (e.g. :func:`mfcc`, ``[d, T]`` each), else by stretching to its length.
+    ``f0_spread``: median over the frames voiced in every rendition of the std across seeds (semitones; the median
+    keeps rare octave errors out), ``f0_spread_mean`` its mean; ``f0_std_cv``: coefficient of variation of the
+    per-rendition F0 std; ``len_cv``: of ``lengths`` (e.g. seconds); ``token_dur_std``: mean per-token std of
+    log-frames across seeds (``durations``: ``[N]`` each)."""
+    ref = f0s[0]
+    aligned = [ref]
+    for k, f in enumerate(f0s[1:], 1):
+        if len(f) == len(ref):
+            aligned.append(f)
+        elif features is not None:
+            path = dtw_path(features[0], features[k])
+            j = np.zeros(len(ref), dtype=int)
+            j[np.minimum(path[:, 0], len(ref) - 1)] = np.minimum(path[:, 1], len(f) - 1)  # last match per frame
+            aligned.append(f[j])
+        else:
+            aligned.append(f[np.minimum((np.arange(len(ref)) * len(f) / len(ref)).astype(int), len(f) - 1)])
+    a = np.stack(aligned)
+    both = (a > 0).all(0)
+    stds = [12 * np.log2(f[f > 0]).std() for f in f0s]
+    out = {"f0_std_cv": float(np.std(stds) / np.mean(stds))}
+    if both.sum() >= 10:
+        spread = (12 * np.log2(a[:, both])).std(0)
+        out.update(f0_spread=float(np.median(spread)), f0_spread_mean=float(spread.mean()))
     if lengths is not None:
         out["len_cv"] = float(np.std(lengths) / np.mean(lengths))
     if durations is not None:

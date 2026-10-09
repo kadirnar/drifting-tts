@@ -24,6 +24,7 @@ is the index and the place to start before planning new work.
 | **Freya-24** | first 24 of those | quick checks of training snapshots |
 | **Resynthesis-100** | 100 held-out recordings, encode → decode or mel → vocoder | ceilings of codecs and vocoders (`scripts/resynthesis_benchmark.py`) |
 | **Prosody-40** | 40 recordings of the studio voice against 40 generated sentences | F0 statistics; the texts differ, so treat it as a rough comparison |
+| **Prosody-val** | the 100 studio `val` recordings against the model's renditions of the same texts (`drifting-tts prosody`) | F0 statistics, DTW F0 correlation, pauses, oracle prosody ([PROSODY.md](PROSODY.md)) |
 
 **Judges:**
 - **Intelligibility:** Whisper large-v3 WER / CER on audio band-matched to 8 kHz (the FreyaTTS protocol).
@@ -48,10 +49,15 @@ is the index and the place to start before planning new work.
 | vocoders | GTA fine-tunes of BigVGAN-base and Vocos | BigVGAN-base-ft (14 M) ≈ BigVGAN-v2-ft (112 M); Vocos-ft fastest but less natural | ✅ on the Hub | [VOCODERS.md](VOCODERS.md) |
 | vocoders | Revox Vocoder 1.0 (third-party, non-commercial) | intelligible, least natural neural vocoder | opt-in only | [VOCODERS.md](VOCODERS.md#revox-vocoder-10-non-commercial) |
 | vocoders | GAN-free vocoder with the drifting objective | content learned, realism not (UTMOSv2 1.40–1.84) | ❌ (code kept, experimental) | [DESIGN.md §8](DESIGN.md#8-a-gan-free-vocoder-experimental) |
+| vocoders | Vocos-ft trained further: rebalanced losses, multi-scale mel, instantaneous-frequency loss, cosine LR (10k-step pilots) | Freya-100 UTMOSv2 2.63 → 2.92, WER 1.10% → 0.77%, F0 micro-variation 0.45 → 0.40 st (BigVGAN 0.395); same network and streaming | ✅ `configs/vocoder_vocos_v2.yaml`, `vocos-ft2` (local); 160k-step run in progress | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
+| vocoders | Vocos with NVIDIA's released MPD + CQT-D instead of its own | UTMOSv2 2.84, no better pitch; 3× slower, 12 GB at batch 8 | ❌ | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
 | latents | VoxCPM2 / DAC-VAE latent TTS (10k pilots) | speaks earlier than mels, but noisy with the released decoders | partly | [LATENTS.md](LATENTS.md#tts-pilots-17) |
 | latents | longer latent training (10k → 50k) | worse (WER 4.94% → 7.57%) | ❌ | [LATENTS.md](LATENTS.md#longer-training-and-the-released-model) |
 | latents | fine-tuning the VAE decoder on generated latents | **the fix for the noise**: DAC-VAE WER 9.55% → 1.32%, UTMOSv2 1.84 → 2.71 | ✅ on the Hub | [LATENTS.md](LATENTS.md#fine-tuning-the-dac-vae-decoder-on-generated-latents-32) |
 | prosody | temperature / CFG as prosody knobs | no effect on intonation or rhythm | – | [§5](#5-robotic-prosody-diagnosis-and-research) |
+| prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
+| prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
+| prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
 | prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
 **Best systems on one protocol** (Freya-100):
@@ -169,6 +175,14 @@ Details: [VOCODERS.md](VOCODERS.md).
   - The mel conversion is accurate: 0.91 dB against Revox's own mel.
   - The frame-level F0 step costs more than the network.
   - It cannot stream (its source phase resets every call).
+- **Vocos's gap was in its training, not its size** ([VOCODERS.md](VOCODERS.md#training-vocos-further)).
+  - Copy-synthesis showed it in pitch and periodicity: F0 error 88 vs 52 cents (BigVGAN-v2-ft), periodicity error
+    2.5×, rough voiced frames.
+  - Continuing the first recipe changed nothing. Rebalancing the losses lifted Freya-100 UTMOSv2 to 2.92 within 5k
+    steps: MRD × 1, feature matching × 2, BigVGAN-v2's multi-scale mel × 15 instead of 45 × single-scale, cosine LR.
+  - An instantaneous-frequency (phase-advance) loss against the recording then brought the F0 jitter to BigVGAN's
+    level.
+  - Per-step evaluation needs pitch measures: UTMOSv2 moved most where the pitch measures moved least.
 - **GAN-free drift vocoder: negative.** Three 20k-step pilots learned content (WER as low as 1.13%) but not realism.
   - The pairing (conditional and pooled vs pooled only) and fixed noise barely matter.
   - Tripling the drift weight helps (1.40 → 1.84) but stays far below the GAN fine-tune (2.63).
@@ -293,6 +307,11 @@ Listening feedback: the voices sound robotic. Measured on Prosody-40 (harvest F0
 
 The plan is in issues #37–#42 (below). The owner decided that the vocoder stays as it is for this work.
 
+**Measured on the same texts (#38, [PROSODY.md](PROSODY.md)).** On 100 held-out studio recordings, ground-truth token
+pitch through the frozen DiT lifts the DTW F0 correlation with the recording from 0.61 to 0.79 (copy synthesis 0.83)
+and the F0 std from 3.19 to 3.81 st (recordings 3.68). The DiT renders the token pitch it is given as faithfully as
+copy synthesis, so the deterministic pitch predictor, not the acoustic model, flattens the intonation.
+
 **Stochastic prosody predictor (#39, [PROSODY_MODEL.md](PROSODY_MODEL.md)).** An 8 M sampler, trained with the
 drifting objective on multi-scale feature maps of the per-token (log-duration, pitch) sequence, replaces the
 regressors at inference; the DiT is unchanged. On 100 held-out studio sentences the F0 std goes from 3.20 to 3.63 st
@@ -314,6 +333,10 @@ model (CRPS), but it is 10–14% flatter and needs 8 network evaluations. BERTur
 - **Speed tables.** Measure on an idle GPU: a busy GPU inflates RTF and TTFA 2–4×.
 - **Machine limits.** CPU quota ~7.7 cores: cap `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `NUMBA_NUM_THREADS` at 2–3
   and `num_workers` ≤ 3. Run pytest files one at a time under load; a combined run can exceed long timeouts.
+- **Losses on recordings meet digital silence.** A phase loss normalised by the STFT magnitude gave NaN on all-zero
+  training segments. Floor every normaliser (`phase_derivative_loss`).
+- **Measured GPU memory, not estimates.** NVIDIA's CQT-D at batch 16 × 16,384 samples needs 17 GB next to a Vocos
+  generator. Register the peak that `nvidia-smi` shows.
 - **Process management.** `pkill -f` / `pgrep -f` patterns can match the shell running them. Kill by PID, or use
   bracket patterns (`[p]attern`). Wait loops that `pgrep` their own pattern never end.
 

@@ -32,7 +32,7 @@ import math
 import os
 import re
 from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -276,7 +276,30 @@ def _features(path: str, text: str, method: str, ref_path: str | None, ref_f0: n
     return row
 
 
+def _diversity(paths: list[str], method: str, lengths: list[float], durations: list | None) -> dict:
+    from .prosody import f0_contour, mfcc, seed_diversity
+
+    wavs = [sf.read(p, dtype="float64")[0] for p in paths]
+    return seed_diversity([f0_contour(w, SAMPLE_RATE, method) for w in wavs], lengths, durations,
+                          [mfcc(w) for w in wavs])
+
+
 # --- judges ------------------------------------------------------------------------------------------------------
+
+
+def retry_oom(fn, *args, tries: int = 30, wait: float = 30.0, **kw):
+    """``fn(*args, **kw)``, retried after a CUDA out-of-memory error (a GPU shared with other jobs)."""
+    import time
+
+    for k in range(tries):
+        try:
+            return fn(*args, **kw)
+        except RuntimeError as e:  # torch.OutOfMemoryError, CTranslate2's "CUDA failed with error out of memory"
+            if "out of memory" not in str(e) or k == tries - 1:
+                raise
+            print(f"CUDA out of memory, retry {k + 1}/{tries} in {wait:g} s", flush=True)
+            torch.cuda.empty_cache()
+            time.sleep(wait)
 
 
 def judge(judges, wav: torch.Tensor, text: str, band: int, spk_ref: torch.Tensor | None):
@@ -297,6 +320,12 @@ def judge(judges, wav: torch.Tensor, text: str, band: int, spk_ref: torch.Tensor
     if judges.mos is not None:
         row["mos"] = judges.mos(full)
     return row, emb
+
+
+def missing_judges(row: dict, judges, system: str) -> bool:
+    """Whether a cached utterance row lacks a score that an enabled judge gives."""
+    return ((judges.asr is not None and "hyp" not in row) or (judges.mos is not None and "mos" not in row)
+            or (judges.sv is not None and system != "recording" and "speaker_sim" not in row))
 
 
 # --- aggregation -------------------------------------------------------------------------------------------------
@@ -397,7 +426,7 @@ def run(args) -> None:
     runner = Runner(synth, speaker, args.temperature, args.cfg)
     utts = load_utterances(args, synth, speaker)
     band = (8000 if args.texts else 0) if args.band is None else args.band
-    judges = load_judges(args.asr, args.sv if not args.texts else None, args.mos, args.device)
+    judges = retry_oom(load_judges, args.asr, args.sv if not args.texts else None, args.mos, args.device)
     pool = ProcessPoolExecutor(args.workers, mp_context=get_context("spawn"), initializer=_init_worker)
     with_rec = not args.texts
     if with_rec and systems[0].name != "recording":  # the reference for the paired metrics and similarity
@@ -429,14 +458,24 @@ def run(args) -> None:
         if cached.exists() and not args.overwrite:
             rows = [json.loads(line) for line in cached.read_text().splitlines()]
             if len(rows) == len(utts):
-                results[s.name] = {"system": s.name, **aggregate(rows)}
                 if s.name == "recording":
                     z = np.load(out / "wav" / s.name / "f0.npz")
                     rec_f0.update({int(k): z[k] for k in z.files})
                     if judges.sv is not None:  # the speaker references
                         from .benchmark import band_match
 
-                        spk_ref.update({u.index: judges.sv(band_match(u.audio, 0)) for u in utts})
+                        spk_ref.update({u.index: retry_oom(judges.sv, band_match(u.audio, 0)) for u in utts})
+                if missing_judges(rows[0], judges, s.name):  # e.g. a first pass with --asr / --mos / --sv none
+                    for r, u in zip(rows, utts):  # only the scores a row lacks
+                        need = replace(judges, asr=None if "hyp" in r else judges.asr,
+                                       mos=None if "mos" in r else judges.mos,
+                                       sv=None if s.name == "recording" or "speaker_sim" in r else judges.sv)
+                        wav = torch.from_numpy(sf.read(wav_path(s, u), dtype="float32")[0])
+                        r.update(retry_oom(judge, need, u.audio if s.name == "recording" else wav, u.text, band,
+                                           spk_ref.get(u.index))[0])
+                    cached.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+                    print(f"{s.name}: judges added", flush=True)
+                results[s.name] = {"system": s.name, **aggregate(rows)}
                 print(f"{s.name}: cached ({cached})", flush=True)
                 continue
         if s.name != "recording" and with_rec:  # paired metrics need every recording's F0
@@ -446,13 +485,13 @@ def run(args) -> None:
         (out / "wav" / s.name).mkdir(parents=True, exist_ok=True)
         rows, futs = [], []
         for u in utts:
-            wav = runner(u, s).float().cpu()
+            wav = retry_oom(runner, u, s).float().cpu()
             path = wav_path(s, u)
-            sf.write(path, wav.numpy(), SAMPLE_RATE)
+            sf.write(path, wav.numpy(), SAMPLE_RATE, subtype="FLOAT")  # lossless: judges may read it later
             ref = wav_path(parse_system("recording"), u) if with_rec else None
             futs.append(pool.submit(_features, str(path), u.text, args.f0, None if ref is None else str(ref),
                                     rec_f0.get(u.index), runner.alignment(u, s)))
-            row, emb = judge(judges, wav, u.text, band, spk_ref.get(u.index))
+            row, emb = retry_oom(judge, judges, wav, u.text, band, spk_ref.get(u.index))
             if s.name == "recording":
                 spk_ref[u.index] = emb
             row.update(index=u.index, text=u.text, seconds=wav.numel() / SAMPLE_RATE, **runner.token_report(u, s))
@@ -482,7 +521,8 @@ def run(args) -> None:
         md += format_table(tok, TOKEN_COLS)
     if diversity:
         md += "\n\nSeed diversity:\n\n" + format_table(diversity["rows"], [
-            ("f0_spread", "F0 spread st", 3), ("f0_std_cv", "F0 std CV", 3), ("len_cv", "length CV", 4),
+            ("f0_spread", "F0 spread st", 3), ("f0_spread_mean", "mean", 3), ("f0_std_cv", "F0 std CV", 3),
+            ("len_cv", "length CV", 4),
             ("token_dur_std", "token log-dur std", 4)])
     (out / "results.md").write_text(md + "\n")
     print(md)
@@ -491,18 +531,18 @@ def run(args) -> None:
 
 def run_diversity(args, runner: Runner, utts: list[Utterance], pool, out: Path) -> dict:
     """F0 / duration spread over ``--diversity`` seeds for the first ``--diversity-num`` texts."""
-    from .prosody import frames_from_logw, seed_diversity
+    from .prosody import frames_from_logw
 
     tmp = out / "wav" / "_diversity"
     tmp.mkdir(parents=True, exist_ok=True)
     rows = []
     for name in args.diversity_systems:
         s = parse_system(name)
-        per_text = []
+        jobs = []
         for u in utts[: args.diversity_num]:
             paths, lengths, durs = [], [], []
             for k in range(args.diversity):
-                wav = runner(u, s, seed=1000 * k + u.index).float().cpu()
+                wav = retry_oom(runner, u, s, seed=1000 * k + u.index).float().cpu()
                 path = tmp / f"{s.name}_{u.index:05d}_{k}.wav"
                 sf.write(path, wav.numpy(), SAMPLE_RATE)
                 paths.append(path)
@@ -510,9 +550,9 @@ def run_diversity(args, runner: Runner, utts: list[Utterance], pool, out: Path) 
                 if s.kind == "onepass":
                     d, _ = runner.prosody(u, s)
                     durs.append(frames_from_logw(u.targets["logw"], runner.tempo) if d is None else d[0])
-            f0s = [f.result()["_f0"].astype(np.float64)
-                   for f in [pool.submit(_features, str(p), u.text, args.f0, None, None) for p in paths]]
-            per_text.append(seed_diversity(f0s, lengths, durs or None))
+            jobs.append(pool.submit(_diversity, [str(p) for p in paths], args.f0, lengths,
+                                    [d.cpu() for d in durs] or None))
+        per_text = [j.result() for j in jobs]
         row = {"system": s.name, "texts": len(per_text), "seeds": args.diversity}
         row.update({k: float(np.mean([d[k] for d in per_text])) for k in per_text[0]})
         rows.append(row)
