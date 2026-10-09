@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import shutil
 import time
 from contextlib import nullcontext
@@ -93,26 +94,105 @@ def random_segments(mel: torch.Tensor, audio: torch.Tensor, mel_len: torch.Tenso
 
 
 class VocosGAN:
-    """Vocos generator + fresh MPD / MRD: hinge + feature matching + 45 x log-mel L1 (the Vocos recipe)."""
+    """Vocos generator + fresh MPD / MRD: hinge + feature matching + 45 x log-mel L1 (the Vocos recipe).
+
+    Opt-in extensions (the defaults keep the recipe):
+
+    - ``vocoder.discriminators``: which of Vocos's discriminators to train (default ``[mpd, mrd]``; ``[]`` for none).
+    - ``vocoder.bigvgan_discriminators``: NVIDIA's BigVGAN-v2 discriminators next to them (``mpd``, ``cqtd``: the
+      multi-scale sub-band CQT discriminator), with the released weights (``vocoder.bigvgan_pretrained``, default
+      true) and, when both are used, the AdamW moments of the released 5M-step run. They keep their LSGAN loss,
+      weighted ``train.bigvgan_loss_coeff``: averaged over sub-discriminators like the Vocos terms
+      (``train.bigvgan_reduce: mean``) or summed with feature matching x 2 as in BigVGAN (``sum``).
+    - Loss balance: ``train.mel_loss: multiscale`` (BigVGAN-v2's 7-scale log10-mel L1 instead of Vocos's single
+      100-band one), ``train.fm_loss_coeff`` (Vocos feature matching), ``train.mrd_loss_coeff``.
+    - Learning rates: ``train.lr`` (generator), ``train.lr_disc`` (discriminators, default ``lr``), a linear generator
+      warm-up over ``train.warmup_steps``; ``train.lr_schedule: cosine`` decays every rate to ``train.lr_min_ratio``
+      of its peak over ``train.steps``.
+    - ``train.init_from``: start from another fine-tune's ``last.pt`` at step 0 (the generator, the discriminators it
+      has and, for an unchanged set, their optimizer states), used when this run has no ``last.pt`` of its own.
+    """
 
     backend, export_name = "vocos", "vocos_ft.pt"
+    VOCOS_DISCS, BIGVGAN_DISCS = ("mpd", "mrd"), ("mpd", "cqtd")
 
     def __init__(self, cfg, device, mel: str = "vocos"):
         from vocos.discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator
         from vocos.loss import DiscriminatorLoss, FeatureMatchingLoss, GeneratorLoss, MelSpecReconstructionLoss
 
-        self.cfg, tc, self.mel = cfg, cfg.train, mel
-        self.vocos = build_vocos(cfg.vocoder.init).to(device).train()
+        self.cfg, vc, tc, self.mel = cfg, cfg.vocoder, cfg.train, mel
+        self.vocos = build_vocos(vc.init).to(device).train()
         if mel == "bigvgan":  # F frames <-> F * hop samples, frame i centred on i * hop + hop / 2
             self.vocos.head.istft.padding = "same"
-        self.mpd, self.mrd = MultiPeriodDiscriminator().to(device), MultiResolutionDiscriminator().to(device)
+        kinds, bkinds = list(vc.get("discriminators", self.VOCOS_DISCS)), list(vc.get("bigvgan_discriminators") or [])
+        for k, allowed in ((kinds, self.VOCOS_DISCS), (bkinds, self.BIGVGAN_DISCS)):
+            if set(k) - set(allowed):
+                raise ValueError(f"unknown discriminators {sorted(set(k) - set(allowed))}, expected {allowed}")
+        if not kinds and not bkinds:
+            raise ValueError("VocosGAN needs at least one discriminator")
+        self.mpd = MultiPeriodDiscriminator().to(device) if "mpd" in kinds else None
+        self.mrd = MultiResolutionDiscriminator().to(device) if "mrd" in kinds else None
         self.gen_params = list(self.vocos.backbone.parameters()) + list(self.vocos.head.parameters())
         self.opt_g = torch.optim.AdamW(self.gen_params, lr=tc.lr, betas=(0.8, 0.9))
-        self.opt_d = torch.optim.AdamW(list(self.mpd.parameters()) + list(self.mrd.parameters()), lr=tc.lr,
-                                       betas=(0.8, 0.9))
+        d_params = [p for d in (self.mpd, self.mrd) if d is not None for p in d.parameters()]
+        self.opt_d = torch.optim.AdamW(d_params, lr=tc.get("lr_disc", tc.lr), betas=(0.8, 0.9)) if d_params else None
+        self.bigvgan = self._bigvgan_discriminators(bkinds, device) if bkinds else {}
         self.disc_loss, self.gen_loss, self.fm_loss = DiscriminatorLoss(), GeneratorLoss(), FeatureMatchingLoss()
-        self.mel_loss = MelSpecReconstructionLoss(sample_rate=SAMPLE_RATE).to(device)
-        self.n_gen, self.n_disc = count_params(self.vocos), count_params(self.mpd) + count_params(self.mrd)
+        mel_loss = tc.get("mel_loss", "single")
+        if mel_loss not in ("single", "multiscale"):
+            raise ValueError(f"train.mel_loss must be single or multiscale, got {mel_loss!r}")
+        self.mel_loss = (MelSpecReconstructionLoss(sample_rate=SAMPLE_RATE) if mel_loss == "single" else
+                         bd.MultiScaleMelLoss(SAMPLE_RATE)).to(device)
+        if tc.get("bigvgan_reduce", "mean") not in ("mean", "sum"):
+            raise ValueError(f"train.bigvgan_reduce must be mean or sum, got {tc.bigvgan_reduce!r}")
+        self.scheds = [self._schedule(o, i == 0) for i, o in enumerate(self.optimizers())]
+        self.n_gen = count_params(self.vocos)
+        self.n_disc = sum(count_params(d) for d in (self.mpd, self.mrd, *self.bigvgan.values()) if d is not None)
+
+    def optimizers(self) -> list:
+        return [o for o in (self.opt_g, self.opt_d, getattr(self, "opt_db", None)) if o is not None]
+
+    def _schedule(self, opt, generator: bool):
+        """Factor on the peak learning rate at step ``s``: linear warm-up (generator), then constant or cosine."""
+        tc = self.cfg.train
+        kind, floor, steps = tc.get("lr_schedule", "constant"), tc.get("lr_min_ratio", 0.0), tc.steps
+        warmup = tc.get("warmup_steps", 0) if generator else 0
+        if kind not in ("constant", "cosine"):
+            raise ValueError(f"train.lr_schedule must be constant or cosine, got {kind!r}")
+
+        def factor(s: int) -> float:
+            decay = 1.0 if kind == "constant" else floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(s, steps)
+                                                                                           / steps))
+            return decay * min(1.0, (s + 1) / warmup) if warmup else decay
+
+        return torch.optim.lr_scheduler.LambdaLR(opt, factor)
+
+    def _bigvgan_discriminators(self, kinds: list[str], device) -> dict:
+        """NVIDIA's BigVGAN-v2 MPD / CQT-D (released weights unless ``vocoder.bigvgan_pretrained: false``) and their
+        optimizer ``opt_db`` (AdamW (0.8, 0.99); the released moments when both are used)."""
+        vc, tc = self.cfg.vocoder, self.cfg.train
+        repo = vc.get("bigvgan_repo", BIGVGAN_REPO)
+        h = discriminator_hparams(repo, vc.get("bigvgan_hparams"))  # overrides: e.g. smaller test models
+        discs = {}
+        if "cqtd" in kinds:  # the released optimizer's parameter order: CQT-D first
+            discs["cqtd"] = bd.MultiScaleSubbandCQTDiscriminator(h).to(device)
+        if "mpd" in kinds:
+            discs["mpd"] = bd.MultiPeriodDiscriminator(h).to(device)
+        params = [p for d in discs.values() for p in d.parameters()]
+        self.opt_db = torch.optim.AdamW(params, tc.get("lr_disc", tc.lr),
+                                        betas=tuple(tc.get("bigvgan_betas", (h["adam_b1"], h["adam_b2"]))))
+        if vc.get("bigvgan_pretrained", True):
+            from huggingface_hub import hf_hub_download
+
+            ck = torch.load(hf_hub_download(repo, "bigvgan_discriminator_optimizer.pt"), map_location="cpu",
+                            weights_only=False)
+            for k, d in discs.items():
+                d.load_state_dict(ck["mrd" if k == "cqtd" else "mpd"])  # stored as "mrd" in the released file
+            if len(discs) == 2:
+                _load_optimizer(self.opt_db, ck["optim_d"])
+            print(f"BigVGAN discriminators {list(discs)}: released weights (step {ck['steps']})"
+                  f"{' and AdamW moments' if len(discs) == 2 else ''}", flush=True)
+        return discs
 
     def segments(self, mel: torch.Tensor, audio: torch.Tensor, mel_len: torch.Tensor):
         return random_segments(mel, audio, mel_len, self.cfg.train.segment_frames, self.mel)
@@ -123,48 +203,127 @@ class VocosGAN:
     def generate(self, mel: torch.Tensor) -> torch.Tensor:  # Vocos.decode runs under inference_mode
         return self.vocos.head(self.vocos.backbone(mel))
 
+    def _vocos_terms(self, audio: torch.Tensor, audio_hat: torch.Tensor):
+        """``(weight, disc outputs)`` of Vocos's discriminators: MPD 1, MRD ``mrd_loss_coeff``."""
+        for d, w in ((self.mpd, 1.0), (self.mrd, self.cfg.train.mrd_loss_coeff)):
+            if d is not None:
+                yield w, d(y=audio, y_hat=audio_hat)
+
+    def _bigvgan_terms(self, audio: torch.Tensor, audio_hat: torch.Tensor):
+        for k, d in self.bigvgan.items():
+            yield k, d(audio[:, None], audio_hat[:, None])
+
     def step(self, mel: torch.Tensor, audio: torch.Tensor, step: int) -> dict:
         tc = self.cfg.train
+        c_b, c_fm = tc.get("bigvgan_loss_coeff", 1.0), tc.get("fm_loss_coeff", 1.0)
+        summed = tc.get("bigvgan_reduce", "mean") == "sum"
         with torch.no_grad():
             audio_hat = self.generate(mel)
-        r_mp, g_mp, _, _ = self.mpd(y=audio, y_hat=audio_hat)
-        r_mr, g_mr, _, _ = self.mrd(y=audio, y_hat=audio_hat)
-        l_mp, l_mp_r, _ = self.disc_loss(disc_real_outputs=r_mp, disc_generated_outputs=g_mp)
-        l_mr, l_mr_r, _ = self.disc_loss(disc_real_outputs=r_mr, disc_generated_outputs=g_mr)
-        l_d = l_mp / len(l_mp_r) + tc.mrd_loss_coeff * l_mr / len(l_mr_r)
-        self.opt_d.zero_grad(set_to_none=True)
-        l_d.backward()
-        self.opt_d.step()
+        l_d, l_db, metrics = 0.0, 0.0, {}
+        for w, (r, g, _, _) in self._vocos_terms(audio, audio_hat):
+            loss, losses_r, _ = self.disc_loss(disc_real_outputs=r, disc_generated_outputs=g)
+            l_d = l_d + w * loss / len(losses_r)
+        for k, (r, g, _, _) in self._bigvgan_terms(audio, audio_hat):
+            loss = bd.discriminator_loss(r, g) / (1 if summed else len(r))
+            metrics[f"disc_bigvgan_{k}"] = loss.item()
+            l_db = l_db + loss
+        for opt in self.optimizers()[1:]:
+            opt.zero_grad(set_to_none=True)
+        (l_d + l_db).backward()
+        for opt in self.optimizers()[1:]:
+            opt.step()
+        if self.opt_d is not None:
+            metrics["disc"] = l_d.item()
 
-        metrics = {"disc": l_d.item()}
         if step >= tc.disc_warmup_steps:  # generator frozen while the fresh discriminators warm up
             audio_hat = self.generate(mel)
-            _, g_mp, f_r_mp, f_g_mp = self.mpd(y=audio, y_hat=audio_hat)
-            _, g_mr, f_r_mr, f_g_mr = self.mrd(y=audio, y_hat=audio_hat)
-            lg_mp, lst_mp = self.gen_loss(disc_outputs=g_mp)
-            lg_mr, lst_mr = self.gen_loss(disc_outputs=g_mr)
-            l_fm = self.fm_loss(fmap_r=f_r_mp, fmap_g=f_g_mp) / len(f_r_mp) + \
-                tc.mrd_loss_coeff * self.fm_loss(fmap_r=f_r_mr, fmap_g=f_g_mr) / len(f_r_mr)
             l_mel = self.mel_loss(audio_hat, audio)
-            l_g = lg_mp / len(lst_mp) + tc.mrd_loss_coeff * lg_mr / len(lst_mr) + l_fm + tc.mel_loss_coeff * l_mel
+            l_g, l_fm = tc.mel_loss_coeff * l_mel, 0.0
+            for w, (_, g, f_r, f_g) in self._vocos_terms(audio, audio_hat):
+                adv, adv_k = self.gen_loss(disc_outputs=g)
+                fm = self.fm_loss(fmap_r=f_r, fmap_g=f_g) / len(f_r)
+                l_g, l_fm = l_g + w * (adv / len(adv_k) + c_fm * fm), l_fm + w * fm.detach()
+            for k, (_, g, f_r, f_g) in self._bigvgan_terms(audio, audio_hat):
+                if summed:  # BigVGAN: sums over sub-discriminators, feature matching x 2
+                    adv, fm = bd.generator_loss(g), bd.feature_loss(f_r, f_g)
+                else:  # Vocos's scale: means over sub-discriminators, no factor 2
+                    adv, fm = bd.generator_loss(g) / len(g), self.fm_loss(fmap_r=f_r, fmap_g=f_g) / len(f_r)
+                l_g = l_g + c_b * (adv + fm)
+                metrics.update({f"adv_bigvgan_{k}": adv.item(), f"fm_bigvgan_{k}": fm.item()})
             self.opt_g.zero_grad(set_to_none=True)
             l_g.backward()
-            torch.nn.utils.clip_grad_norm_(self.gen_params, tc.grad_clip)
+            grad = torch.nn.utils.clip_grad_norm_(self.gen_params, tc.grad_clip)
             self.opt_g.step()
-            metrics.update(gen=l_g.item(), mel=l_mel.item(), fm=l_fm.item())
+            metrics.update(gen=l_g.item(), mel=l_mel.item(), fm=float(l_fm), grad_gen=grad.item())
+        for sched in self.scheds:
+            sched.step()
+        if tc.get("lr_schedule", "constant") != "constant" or tc.get("warmup_steps", 0):
+            metrics["lr"] = self.scheds[0].get_last_lr()[0]
         return metrics
 
     def state_dict(self) -> dict:
-        return dict(vocos=self.vocos.state_dict(), mpd=self.mpd.state_dict(), mrd=self.mrd.state_dict(),
-                    opt_g=self.opt_g.state_dict(), opt_d=self.opt_d.state_dict())
+        out = dict(vocos=self.vocos.state_dict(), opt_g=self.opt_g.state_dict())
+        for k in ("mpd", "mrd", "opt_d", "opt_db"):
+            if getattr(self, k, None) is not None:
+                out[k] = getattr(self, k).state_dict()
+        out.update({f"bigvgan_{k}": d.state_dict() for k, d in self.bigvgan.items()})
+        if tc_scheduled(self.cfg.train):
+            out["scheds"] = [s.state_dict() for s in self.scheds]
+        return out
 
     def load_state_dict(self, ck: dict) -> None:
-        for k in ("vocos", "mpd", "mrd", "opt_g", "opt_d"):
-            getattr(self, k).load_state_dict(ck[k])
+        self.vocos.load_state_dict(ck["vocos"])
+        self.opt_g.load_state_dict(ck["opt_g"])
+        for k in ("mpd", "mrd", "opt_d", "opt_db"):
+            if getattr(self, k, None) is not None:
+                getattr(self, k).load_state_dict(ck[k])
+        for k, d in self.bigvgan.items():
+            d.load_state_dict(ck[f"bigvgan_{k}"])
+        for s, state in zip(self.scheds, ck.get("scheds", [])):
+            s.load_state_dict(state)
+
+    def init_from(self, path: str) -> None:
+        """Weights (and optimizer states where the parameter sets match) of a finished run's ``last.pt``; the
+        learning rates stay this run's."""
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        self.vocos.load_state_dict(ck["vocos"])
+        _load_optimizer(self.opt_g, ck["opt_g"])
+        loaded = ["generator"]
+        for k in ("mpd", "mrd"):
+            if getattr(self, k) is not None and k in ck:
+                getattr(self, k).load_state_dict(ck[k])
+                loaded.append(k)
+        same = all((getattr(self, k) is None) == (k not in ck) for k in ("mpd", "mrd"))
+        if self.opt_d is not None and same and "opt_d" in ck:
+            _load_optimizer(self.opt_d, ck["opt_d"])
+            loaded.append("opt_d")
+        for k, d in self.bigvgan.items():
+            if f"bigvgan_{k}" in ck:
+                d.load_state_dict(ck[f"bigvgan_{k}"])
+                loaded.append(f"bigvgan_{k}")
+        print(f"initialised from {path} (step {ck.get('step')}): {', '.join(loaded)}", flush=True)
 
     def export(self, path: Path, step: int) -> None:
         save_checkpoint(path, vocos=self.vocos.state_dict(), init=self.cfg.vocoder.init, step=step, mel=self.mel,
                         head_padding=self.vocos.head.istft.padding)
+
+
+def tc_scheduled(tc) -> bool:
+    """Whether a learning-rate schedule is configured (else the saved state keeps the original layout)."""
+    return tc.get("lr_schedule", "constant") != "constant" or bool(tc.get("warmup_steps", 0))
+
+
+def _load_optimizer(opt, state: dict) -> None:
+    """``opt.load_state_dict(state)`` (moments of the same parameters), keeping ``opt``'s hyperparameters."""
+    hp = [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+    opt.load_state_dict(state)
+    for g, h in zip(opt.param_groups, hp):
+        g.pop("initial_lr", None)
+        g.update(h)
+    for g in opt.param_groups:
+        for p in g["params"]:
+            if p in opt.state:
+                assert opt.state[p]["exp_avg"].shape == p.shape, "optimizer state does not match the model"
 
 
 class BigVGANGAN:
@@ -677,6 +836,10 @@ def run(args) -> None:
         step = ck["step"]
         sampler.epoch = ck.get("epoch", 0)
         print(f"resumed from step {step}", flush=True)
+    elif tc.get("init_from"):
+        if not hasattr(gan, "init_from"):
+            raise ValueError("train.init_from is supported for vocoder.arch: vocos (GAN) only")
+        gan.init_from(tc.init_from)
 
     it = infinite(loader)
     t0, agg = time.time(), {}
