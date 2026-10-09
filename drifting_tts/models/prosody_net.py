@@ -212,7 +212,8 @@ class ProsodyNet(nn.Module):
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
         self.kind, self.noise_tok, self.noise_glob, self.word_dim = kind, noise_tok, noise_glob, word_dim
-        self.sent_dim, self.cond_dim, self.ctx_pitch_only = sent_dim, cond_dim, ctx_pitch_only and word_dim + sent_dim > 0
+        self.sent_dim, self.cond_dim = sent_dim, cond_dim
+        self.ctx_pitch_only = bool(ctx_pitch_only and word_dim + sent_dim > 0)
         self.ctx_boundaries = bool(ctx_boundaries and self.ctx_pitch_only and sent_dim)
         ctx_dim = word_dim + sent_dim
         c_in = (cond_dim + (0 if self.ctx_pitch_only else ctx_dim) + (noise_tok if kind == "drift" else 0)

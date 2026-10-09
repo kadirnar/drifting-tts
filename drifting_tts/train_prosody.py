@@ -21,8 +21,14 @@ import torch.nn.functional as F
 
 from .config import load_config, save_config
 from .drift import key_weight, kyutai_drift_loss
-from .models.prosody_net import (ProsodyPredictor, floor_letters, prosody_features, sentence_tokens, summary_features,
-                                 word_index)
+from .models.prosody_net import (
+    ProsodyPredictor,
+    floor_letters,
+    prosody_features,
+    sentence_tokens,
+    summary_features,
+    word_index,
+)
 from .text import PAD_ID
 from .utils import EMA, count_params, lr_lambda, save_checkpoint, seed_everything
 

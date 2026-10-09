@@ -29,9 +29,9 @@ DIM = len(SENTENCE_FEATURES)
 SENTENCE_TYPES = ("statement", "polar_q", "wh_q", "other_q", "exclamation")
 
 MI = re.compile(r"m[ıiuü](?:s[ıiuü]n(?:[ıiuü]z)?|y[ıiuü][mz]|d[ıiuü]r(?:l[ae]r)?|yd[ıiuü][mnk]?|ym[ıiuü]ş|ys[ae])?")
-WH = re.compile(r"ne|neden|niye|niçin|nasıl|nasılsın(?:ız)?|ner[ea](?:de|ye|den|si|sinde|ye)?|nereli|kim(?:i|e|in|den|le|"
-                r"inle|ler|lerin?)?|hangi(?:si|sini|sine|sinde|lerini?)?|kaç(?:ta|ar|ıncı|ın[ıa]?)?|ney[ie]|neyle|"
-                r"nedir|niçindir")
+WH = re.compile(r"ne|neden|niye|niçin|nasıl|nasılsın(?:ız)?|ner[ea](?:de|ye|den|si|sinde)?|nereli|"
+                r"kim(?:i|e|in|den|le|inle|ler|lerin?)?|hangi(?:si|sini|sine|sinde|lerini?)?|kaç(?:ta|ar|ıncı|ın[ıa]?)?|"
+                r"ney[ie]|neyle|nedir|niçindir")
 
 
 def _bare(word: str) -> str:

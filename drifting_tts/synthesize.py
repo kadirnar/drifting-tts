@@ -114,8 +114,8 @@ class Synthesizer:
         output-space temperature ``prosody_spread`` (:meth:`ProsodyPredictor.sample`; the seed of each call drives
         it too). ``prosody_pitch_temperature`` / ``prosody_pitch_spread`` set the pitch channel apart (``None``: the
         checkpoint's preferred pitch temperature, else the same as the durations). ``prosody_durations="regressor"``
-        keeps the model's durations (and per-voice factors) and samples only the token pitch. Its per-voice duration factors replace the model's. It runs eagerly: with
-        ``fast`` only the vocoder windows use CUDA graphs."""
+        keeps the model's durations (and per-voice factors) and samples only the token pitch. Its per-voice duration
+        factors replace the model's. It runs eagerly: with ``fast`` only the vocoder windows use CUDA graphs."""
         from .train import load_tts
         from .vocoder import load_vocoder
 

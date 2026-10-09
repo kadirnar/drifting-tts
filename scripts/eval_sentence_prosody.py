@@ -46,7 +46,7 @@ import torch
 from drifting_tts.models.prosody_net import ProsodyPredictor, word_index
 from drifting_tts.prosody import voiced_tokens
 from drifting_tts.sentence_features import SENTENCE_FEATURES, sentence_features, sentence_type
-from drifting_tts.text import SYMBOLS, ids_to_text, normalize, split_sentences, text_to_ids
+from drifting_tts.text import SYMBOLS, normalize, split_sentences, text_to_ids
 from drifting_tts.train_prosody import ProsodyData, load_frozen_tts, sample_split
 
 COL = {k: i for i, k in enumerate(SENTENCE_FEATURES)}
