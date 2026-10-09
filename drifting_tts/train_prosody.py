@@ -247,6 +247,8 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
     ``pcont`` (the continuous contour) and ``voiced``, for ``K`` seeds. ``pred=None``: the TTS model's own
     regressors (ceil of ``exp(logw)`` times its per-voice ``duration_scales``, as at inference)."""
     out = [None] * len(data)
+    if spread != 1.0:  # every utterance is sampled 16 times in one batch
+        batch_size = max(1, batch_size // 16)
     for s in range(0, len(data), batch_size):
         idx = list(range(s, min(s + batch_size, len(data))))
         b = data.batch(idx, device)
@@ -274,6 +276,12 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
     return out
 
 
+def _pair_mean(x: np.ndarray) -> np.ndarray:
+    """Unbiased ``E|X - X'|`` per column over the ``K`` rows (distinct pairs only; 0 for one sample)."""
+    K = x.shape[0]
+    return np.abs(x[:, None] - x[None]).sum((0, 1)) / (K * (K - 1)) if K > 1 else np.zeros(x.shape[1:])
+
+
 def _w1(a: np.ndarray, b: np.ndarray) -> float:
     q = np.linspace(0.005, 0.995, 199)
     return float(np.abs(np.quantile(a, q) - np.quantile(b, q)).mean())
@@ -299,8 +307,9 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
     """Token / letter / word / utterance prosody statistics of sampled sequences against the recordings' targets.
 
     ``*_std_ratio``: within-utterance spread, predicted / ground truth (1 = as varied as the recordings);
-    ``*_corr``: Pearson with the ground truth; ``*_crps``: continuous ranked probability score over the seeds (the
-    MAE for one deterministic sample; lower is better, comparable between deterministic and stochastic models);
+    ``*_corr``: Pearson with the ground truth; ``*_crps``: continuous ranked probability score over the seeds
+    (unbiased pair term; the MAE for one deterministic sample; lower is better, comparable between deterministic and
+    stochastic models);
     ``w1_*``: 1-Wasserstein distance between pooled distributions; ``jitter_ratio``: mean |Δ pitch| between
     neighbouring voiced tokens, predicted / ground truth; ``reversal_rate``: local pitch reversals per voiced letter
     (:func:`reversal_rate`; threshold 0.077 normalised log-F0 = 0.5 semitone with v3.1's statistics; the recordings'
@@ -371,13 +380,13 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
             ustd_gt.append(p_gt[v].std())
             # CRPS over the seeds: E|X - y| - 0.5 E|X - X'|
             x = pc[:, v]
-            acc["p_crps"].append((np.abs(x - p_gt[v]).mean(0) - 0.5 * np.abs(x[:, None] - x[None]).mean((0, 1))).mean())
+            acc["p_crps"].append((np.abs(x - p_gt[v]).mean(0) - 0.5 * _pair_mean(x)).mean())
         acc["ld_std_gt"].append(ld_gt.std())
         acc["let_std_gt"].append(let_gt.std())
         acc["wd_std_gt"].append(wd_gt.std())
         if wsel.sum() > 1:
             acc["wp_std_gt"].append(wp_gt[wsel].std())
-        acc["ld_crps"].append((np.abs(ld - ld_gt).mean(0) - 0.5 * np.abs(ld[:, None] - ld[None]).mean((0, 1))).mean())
+        acc["ld_crps"].append((np.abs(ld - ld_gt).mean(0) - 0.5 * _pair_mean(ld)).mean())
         ld_gt_all.append(ld_gt)
         if K > 1:
             acc["div_p"].append(pc[:, v].std(0).mean() if v.any() else 0.0)

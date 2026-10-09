@@ -51,6 +51,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prosody-temperature", type=float, default=1.0, help="noise temperature of --prosody")
     p.add_argument("--prosody-spread", type=float, default=1.0,
                    help="output-space temperature of --prosody (< 1: closer to its mean, flatter, less varied)")
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled",
+                   help="regressor: --prosody samples only the token pitch; durations stay the model's")
     add_vocoder_args(p)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -84,7 +86,8 @@ def preferred_temperature(model) -> float:
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False,
-                 prosody: str | Path | None = None, prosody_temperature: float = 1.0, prosody_spread: float = 1.0):
+                 prosody: str | Path | None = None, prosody_temperature: float = 1.0, prosody_spread: float = 1.0,
+                 prosody_durations: str = "sampled"):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
         checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
         latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
@@ -96,7 +99,8 @@ class Synthesizer:
         ``prosody``: a stochastic prosody predictor (``train-prosody``) that samples the durations and token pitch
         instead of the model's deterministic regressors, with noise temperature ``prosody_temperature`` and
         output-space temperature ``prosody_spread`` (:meth:`ProsodyPredictor.sample`; the seed of each call drives
-        it too). Its per-voice duration factors replace the model's. It runs eagerly: with
+        it too). ``prosody_durations="regressor"`` keeps the model's durations (and per-voice factors) and samples
+        only the token pitch. Its per-voice duration factors replace the model's. It runs eagerly: with
         ``fast`` only the vocoder windows use CUDA graphs."""
         from .train import load_tts
         from .vocoder import load_vocoder
@@ -122,6 +126,9 @@ class Synthesizer:
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
         self.acoustic, self.vocoder_graphs, self.prosody = None, None, None
         self.prosody_temperature, self.prosody_spread = prosody_temperature, prosody_spread
+        if prosody_durations not in ("sampled", "regressor"):
+            raise ValueError(f"prosody_durations must be 'sampled' or 'regressor', got {prosody_durations!r}")
+        self.prosody_durations = prosody_durations
         if prosody is not None:
             from .models.prosody_net import ProsodyPredictor
 
@@ -164,7 +171,7 @@ class Synthesizer:
         spk_id = self.speaker_id(speaker)
         if spk_id >= self.model.encoder.spk.num_embeddings:
             raise ValueError(f"speaker {speaker!r} ({spk_id}) is not in this checkpoint")
-        if self.prosody is not None:  # factors measured for the sampler (1: none stored)
+        if self.prosody is not None and self.prosody_durations == "sampled":  # the sampler's own factors (1: none)
             tempo = self.prosody.duration_scales.get(spk_id, 1.0)
         else:
             tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
@@ -182,6 +189,8 @@ class Synthesizer:
         if self.prosody is not None:  # sampled first, from the same generator as the DiT's noise
             durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, self.prosody_temperature,
                                                     length_scale, generator=g, spread=self.prosody_spread)
+            if self.prosody_durations == "regressor":
+                durations = None
         mel, _ = self.model.synthesize(ids, ids_len, spk, cfg_scale=cfg_scale, temperature=temperature,
                                        length_scale=length_scale, generator=g, attn_window=attn_window,
                                        pitch_shift=pitch_shift, steps=steps, durations=durations, pitch=pitch)
@@ -254,7 +263,7 @@ class Synthesizer:
 def run(args) -> None:
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel,
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
-                        prosody_spread=args.prosody_spread)
+                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations)
     if args.list_speakers:
         for name, v in VOICES.items():
             default = " (default)" if name == DEFAULT_VOICE else ""

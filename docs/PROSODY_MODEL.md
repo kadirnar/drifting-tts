@@ -71,7 +71,141 @@ spread (see below). `spread` (output-space temperature) draws 16 samples in one 
 
 ## Results
 
-*(filled in below)*
+All rows use the frozen v3.1 model. Training: 12k steps for the drift samplers (dev metrics were flat from 6k; the
+run was stopped there to free the shared GPU), 20k for MSE and flow matching. Checkpoints were selected on `dev`, the
+temperatures on `dev`; the tables report `val` + `dev` (300 + 300 held-out utterances, 254 speakers, of which 200
+are studio-voice utterances). Sampled rows use 8 seeds.
+
+### Token level (no audio)
+
+Each predictor is compared with the targets the DiT was trained on (MAS durations, token pitch) on the held-out
+utterances (`scripts/eval_prosody_tokens.py`). The spreads are within-utterance standard deviations relative to the
+recordings, so 1 means as varied as the recordings. A "letter" is a character and the blank after it. Jitter is
+the mean |Δ pitch| between neighbouring voiced tokens, relative to the recordings. Reversals are local pitch-direction
+changes of more than 0.5 semitone per voiced letter. CRPS is the continuous ranked probability score over the seeds
+(lower is better). It is a proper score, so deterministic and stochastic predictors are comparable (for one sample
+it is the MAE). W1 is the Wasserstein distance between the pooled pitch deviations. Length ratio uses each
+predictor's per-voice factors.
+
+**val+dev studio (722)**
+
+| predictor | T | pitch spread | word pitch spread | letter dur spread | word dur spread | pitch jitter | reversals / letter | pitch r | letter dur r | pitch CRPS | log-dur CRPS | W1 pitch | length ratio | seed div. pitch |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| recordings | – | 1 | 1 | 1 | 1 | 1 | 0.371 | 1 | 1 | 0 | 0 | 0 | 1 | – |
+| v3.1 regressors | – | 0.732 | 0.738 | 0.578 | 0.948 | 0.797 | 0.364 | 0.704 | 0.691 | 0.301 | 0.408 | 0.113 | 1.013 | 0 |
+| MSE (same backbone) | – | 0.788 | 0.832 | 0.803 | 0.997 | 0.779 | 0.359 | 0.784 | 0.727 | 0.267 | 0.352 | 0.086 | 1.008 | 0 |
+| flow matching | 0.5 | 0.776 | 0.795 | 0.912 | 1.014 | 0.816 | 0.362 | 0.756 | 0.695 | 0.220 | 0.256 | 0.092 | 0.925 | 0.098 |
+| flow matching | 1 | 0.897 | 0.923 | 0.967 | 1.006 | 0.895 | 0.359 | 0.676 | 0.611 | 0.191 | 0.226 | 0.042 | 0.986 | 0.227 |
+| **drift** | 0.5 | 0.912 | 0.890 | 0.944 | 1.010 | 1.041 | 0.400 | 0.670 | 0.640 | 0.220 | 0.258 | 0.030 | 0.969 | 0.181 |
+| **drift** | 1 | 0.978 | 1.008 | 1.005 | 1.010 | 1.008 | 0.374 | 0.594 | 0.545 | 0.200 | 0.240 | 0.011 | 1.005 | 0.302 |
+| drift, spread 0.8 | 1 | 0.896 | 0.922 | 0.960 | 1.015 | 0.957 | 0.380 | 0.645 | 0.583 | 0.203 | 0.242 | 0.041 | 0.959 | 0.235 |
+| drift + BERTurk | 1 | 0.970 | 0.964 | 1.011 | 1.014 | 1.002 | 0.376 | 0.639 | 0.556 | 0.190 | 0.240 | 0.015 | 1.003 | 0.296 |
+| drift + BERTurk, spread 0.8 | 1 | 0.909 | 0.912 | 0.947 | 1.001 | 0.937 | 0.370 | 0.672 | 0.601 | 0.192 | 0.242 | 0.036 | 0.958 | 0.239 |
+
+**val+dev (all speakers)**
+
+| predictor | T | pitch spread | word pitch spread | letter dur spread | word dur spread | pitch jitter | reversals / letter | pitch r | letter dur r | pitch CRPS | log-dur CRPS | W1 pitch | length ratio | seed div. pitch |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| recordings | – | 1 | 1 | 1 | 1 | 1 | 0.310 | 1 | 1 | 0 | 0 | 0 | 1 | – |
+| v3.1 regressors | – | 0.593 | 0.594 | 0.436 | 0.823 | 0.705 | 0.295 | 0.522 | 0.512 | 0.425 | 0.564 | 0.162 | 0.955 | 0 |
+| MSE (same backbone) | – | 0.667 | 0.733 | 0.626 | 0.872 | 0.626 | 0.261 | 0.579 | 0.530 | 0.402 | 0.490 | 0.130 | 0.818 | 0 |
+| flow matching | 0.5 | 0.662 | 0.714 | 0.785 | 0.929 | 0.627 | 0.247 | 0.546 | 0.485 | 0.330 | 0.362 | 0.133 | 0.819 | 0.139 |
+| flow matching | 1 | 0.862 | 0.900 | 0.908 | 0.950 | 0.805 | 0.269 | 0.450 | 0.396 | 0.289 | 0.318 | 0.054 | 0.953 | 0.321 |
+| **drift** | 0.5 | 0.913 | 0.957 | 0.937 | 0.960 | 0.981 | 0.320 | 0.436 | 0.426 | 0.319 | 0.351 | 0.032 | 0.952 | 0.291 |
+| **drift** | 1 | 0.989 | 1.048 | 0.980 | 0.967 | 1.010 | 0.307 | 0.379 | 0.348 | 0.297 | 0.326 | 0.009 | 0.993 | 0.418 |
+| drift, spread 0.8 | 1 | 0.869 | 0.926 | 0.898 | 0.943 | 0.912 | 0.305 | 0.420 | 0.379 | 0.301 | 0.328 | 0.048 | 0.913 | 0.329 |
+| drift + BERTurk | 1 | 0.971 | 0.976 | 0.978 | 0.972 | 1.036 | 0.323 | 0.435 | 0.360 | 0.283 | 0.325 | 0.013 | 1.002 | 0.413 |
+| drift + BERTurk, spread 0.8 | 1 | 0.873 | 0.881 | 0.879 | 0.930 | 0.937 | 0.314 | 0.468 | 0.394 | 0.285 | 0.328 | 0.050 | 0.923 | 0.332 |
+
+- **The regressors are flat.** v3.1's token pitch has 59% of the recordings' within-utterance spread (73% for
+  the studio voice), and its letter durations 44% (58%). A bigger regressor trained the same way (MSE) barely helps.
+- **Both samplers restore the spread.** The drift sampler matches the recordings' distributions almost exactly at
+  T = 1: spreads 0.97–1.05, jitter 1.01, reversals 0.307 per letter (recordings 0.310), W1 0.009, length 0.99 without
+  calibration. Flow matching stays 10–14% narrow and smoother than the recordings (jitter 0.81–0.90).
+- **Per-token accuracy.** Flow matching beats plain drift on CRPS (pitch 0.289 vs 0.297, log-duration 0.318 vs
+  0.326; studio 0.191 vs 0.200) and correlation. The drift samples vary more independently of the text: with one
+  positive per text, τ sets the spread (Notes). BERTurk word features (#40) give drift the best pitch CRPS (0.283 all
+  speakers, 0.190 studio) at the same distributional match.
+- **Temperature.** For flow matching, T scales the spread (T 0.5: pitch spread 0.66, jitter 0.63; that is MSE-flat).
+  For drift, T mostly scales the seed diversity (pitch 0.29 → 0.42 between T 0.5 and 1). The spread changes much
+  less (0.91 → 0.99), because the zero-noise output already has realistic spread. `spread 0.8` is the knob that
+  narrows drift (pitch spread 0.87, CRPS within 0.004).
+
+### Audio: studio voice, 100 held-out `val` utterances
+
+`scripts/eval_prosody_audio.py` adds the samplers as systems to `drifting-tts prosody` (prosody-eval's runner, same
+metrics and recordings). It uses one pass over the whole text, T = 0.3, α = 2, vocos-ft, seed = utterance index,
+harvest F0 in semitones. `onepass` is v3.1 as released (regressors); `oracle-both` gets the recording's MAS
+durations and token pitch. `-pitch` samples only the token pitch and keeps the regressors' durations.
+
+| system | F0 std | F0 range | move | micro | reversals/s | pauses/utt | syl/s | DTW F0 r | render flat | seed F0 spread |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| recordings | 3.68 | 11.9 | 0.63 | 0.42 | 10.9 | 1.39 | 6.22 | – | 1.00 | – |
+| v3.1 (regressors) | 3.20 | 10.2 | 0.67 | 0.47 | 11.3 | 0.45 | 6.10 | 0.609 | 1.19 | 1.39 |
+| oracle prosody | 3.81 | 12.2 | 0.71 | 0.50 | 11.6 | 1.39 | 6.22 | 0.804 | 1.05 | – |
+| MSE | 3.38 | 10.8 | 0.67 | 0.47 | 11.1 | 0.45 | 6.16 | 0.656 | 1.13 | – |
+| flow matching, T 1 | 3.59 | 11.5 | 0.70 | 0.50 | 11.4 | 0.98 | 6.30 | 0.585 | 1.05 | 2.32 |
+| **drift, T 1** | 3.77 | 12.1 | 0.70 | 0.50 | 11.4 | 1.65 | 6.14 | 0.518 | 1.05 | 2.59 |
+| drift, T 1, spread 0.8 | 3.62 | 11.5 | 0.71 | 0.50 | 11.6 | 1.27 | 6.42 | 0.542 | 1.07 | – |
+| drift, T 0.5 | 3.63 | 11.4 | 0.72 | 0.52 | 11.6 | 1.44 | 6.40 | 0.562 | 1.06 | – |
+| drift + BERTurk, T 1 | 3.78 | 12.2 | 0.71 | 0.51 | 11.4 | 1.70 | 6.21 | 0.551 | 1.05 | 2.60 |
+| drift, T 1, pitch only | 3.78 | 12.0 | 0.71 | 0.50 | 11.4 | 0.53 | 6.10 | 0.518 | 1.07 | 2.28 |
+| drift + BERTurk, T 1, pitch only | 3.75 | 12.0 | 0.71 | 0.49 | 11.1 | 0.48 | 6.11 | 0.561 | 1.06 | – |
+
+- **Intonation range is fixed.** The F0 std goes from 3.20 (v3.1) to 3.77 (drift), against 3.68 for the recordings
+  and 3.81 with oracle prosody. The 5–95% range goes from 10.2 to 12.1 (recordings 11.9). The DiT no longer
+  has to stretch a flat input: "render flat" (std of the realised token F0 over std of the conditioning token pitch)
+  drops from 1.19 to 1.05, as with oracle prosody. Flow matching gets about two thirds of the way (3.59 / 11.5).
+- **Pauses.** Sampled durations put pauses inside the utterance (1.65 per utterance, recordings 1.39, v3.1 0.45). The
+  pitch-only mode keeps v3.1's pause pattern.
+- **Different, not worse, tunes.** DTW log-F0 correlation with the specific recording drops (0.61 → 0.52; oracle
+  0.80), because each sample is one plausible tune among many. Seed diversity of F0 rises from 1.39 to 2.59 st.
+- **Micro-variation** (0.50) and reversals/s (11.4) are slightly above the recordings (0.42 / 10.9) for every one-pass
+  system, oracle included (0.50 / 11.6). They come from the DiT + Vocos rendering, not from the predictors.
+
+### Guard rails: Freya-100
+
+`drifting-tts benchmark --num 100 --speaker 722 --vocoder vocos-ft` (T 0.3, α 2, sentence by sentence, Whisper
+large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduces the published one exactly.
+
+FREYA_TABLE
+
+FREYA_NOTES
+
+### Turkish polar questions (#40 diagnostic)
+
+17 held-out utterances with a "?" and a mI question word (`scripts/eval_question_pitch.py`, token pitch, semitones;
+8 seeds). `pre-mI` is the mean pitch of the word before mI relative to the utterance mean. `fall` is the pitch of the
+last word minus that of the pre-mI word. Turkish polar questions mostly peak before mI and end low (§4.2 of the
+research memo).
+
+| predictor | pre-mI (st) | fall (st) | ends low |
+|---|---:|---:|---:|
+| recordings | +0.05 | −4.24 | 71% |
+| v3.1 regressors | −1.17 | −0.95 | 65% |
+| MSE | −0.49 | −1.93 | 71% |
+| flow matching, T 1 | −0.98 | −1.82 | 71% |
+| drift, T 1 | −1.57 | −0.52 | 62% |
+| drift + BERTurk, T 1 | −0.13 | −2.37 | 68% |
+
+This is indicative only (17 questions), but it is the one place where word context visibly helps. Character-level
+predictors miss the pre-mI peak, and the BERTurk variant gets closest on both measures.
+
+### Training dynamics
+
+| run | step | pitch spread | word pitch spread | log-dur spread | jitter | pitch r | W1 pitch | length |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| drift | 2k | 0.81 | 0.79 | 0.88 | 1.04 | 0.46 | 0.077 | 0.92 |
+| drift | 4k | 0.96 | 0.98 | 0.95 | 1.03 | 0.40 | 0.016 | 0.98 |
+| drift | 12k | 1.00 | 1.05 | 0.99 | 1.03 | 0.38 | 0.009 | 0.98 |
+| drift + BERTurk | 12k | 0.97 | 0.98 | 0.99 | 1.04 | 0.44 | 0.013 | 1.00 |
+| flow matching | 20k | 0.87 | 0.91 | 0.92 | 0.82 | 0.45 | 0.053 | 0.94 |
+| MSE | 20k | 0.67 | 0.73 | 0.66 | 0.63 | 0.58 | 0.131 | 0.81 |
+
+(`dev`, T = 1, 4 seeds, uncalibrated lengths.) τ falls from 1.0 to 0.11 within 3k steps and stays at 0.10–0.11
+(Kyutai: ≈ 0.056). The kernel mass on the data (`p_data`) rises from 0.05 to ≈ 0.45, and the sample spread stays
+at ≈ 0.62 standardised units throughout. There is no collapse and no divergence. Seed diversity is stable from 4k
+steps.
 
 ## Usage
 
@@ -107,4 +241,23 @@ wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
 
 ## Notes and pitfalls
 
-*(filled in below)*
+- **One positive per text sets the drift sampler's spread through τ, not through the data.** Per row, distances are
+  normalised by the samples' own mean distance, so the balance between the attraction to the single positive and
+  the repulsion between siblings is scale-free. The learned τ (1.0 → 0.10 within 3k steps, then flat; Kyutai: ≈ 0.056)
+  ends up giving realistic *marginal* spread, but the samples depend less on the text than flow matching's
+  (lower per-token correlation, higher CRPS). `spread < 1` at inference is the cheap correction.
+- **The noise temperature of the drift sampler is a diversity knob, not an expressiveness knob.** Its zero-noise
+  output already has the recordings' within-utterance spread (pitch std ratio 0.83 at 2k steps against 0.62 for
+  MSE); lowering T shrinks the differences between seeds. Flow matching behaves like a diffusion model: lower T
+  is flatter.
+- **Host syncs dominate small-model training on a shared GPU.** Boolean row selection (`x[mask]`) per feature map
+  and `int(tensor.max())` cost ~0.35 s per step under time-slicing (0.57 → 0.21 s per step after removing them).
+- **MAS durations are noisy per token.** The split of a character's time between it and its neighbouring blanks is
+  arbitrary (47% of all tokens get exactly one frame), so token-level duration statistics look much flatter for
+  any predictor than letter- or word-level ones. The tables report letter (character + following blank) and word
+  levels as well.
+- **Rounding.** The regressors' `ceil(exp(logw))` adds about half a frame per token (a predicted blank of 1.05 frames
+  becomes 2), which the v3.1 per-voice factors partly compensate. The samplers round to the nearest frame instead,
+  with their own factors.
+- **Turkish BERT.** The normalised text is lower-case, but `dbmdz/bert-base-turkish-uncased` strips diacritics
+  (`gelmiş` → `gelmis`, `değişik` → `degis ##ik`). The cased model keeps them on lower-case input.

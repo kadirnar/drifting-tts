@@ -49,6 +49,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prosody", default=None, help="stochastic prosody predictor checkpoint (train-prosody)")
     p.add_argument("--prosody-temperature", type=float, default=1.0)
     p.add_argument("--prosody-spread", type=float, default=1.0)
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled")
     p.add_argument("--out", default="outputs/benchmark")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -88,7 +89,7 @@ def run(args) -> None:
     items = items[: args.num] if args.num else items
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel, fast=args.fast,
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
-                        prosody_spread=args.prosody_spread)
+                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations)
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
 
@@ -125,7 +126,7 @@ def run(args) -> None:
                "stream": args.stream or args.fast, "fast": args.fast,
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
                "prosody": args.prosody, "prosody_temperature": args.prosody_temperature,
-               "prosody_spread": args.prosody_spread}
+               "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")
     print(format_table([res]))

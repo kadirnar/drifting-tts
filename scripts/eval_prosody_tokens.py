@@ -46,11 +46,20 @@ def main() -> None:
     cache = torch.load(args.cache, map_location="cpu", weights_only=False)
     sets = {"val+dev (all speakers)": ProsodyData(cache, ("val", "dev")),
             "val+dev studio (722)": ProsodyData(cache, ("val", "dev"), [722])}
-    rows = []
+    out_json = Path(args.out).with_suffix(".json")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    rows = json.loads(out_json.read_text()) if out_json.exists() else []  # resume
+    done = {(r["set"], r["system"], r["T"]) for r in rows}
+
+    def add(row: dict) -> None:
+        rows.append(row)
+        out_json.write_text(json.dumps(rows, indent=1))
+
     for set_name, data in sets.items():
-        res = token_metrics(sample_split(None, tts, data, [0], 1.0, args.device), data)
-        rows.append({"set": set_name, "system": "v3.1 regressors", "T": None, **res, "voicing_acc": None,
-                     "div_p": 0.0, "div_ld": 0.0, "div_total": 0.0})
+        if (set_name, "v3.1 regressors", None) not in done:
+            res = token_metrics(sample_split(None, tts, data, [0], 1.0, args.device), data)
+            add({"set": set_name, "system": "v3.1 regressors", "T": None, **res, "voicing_acc": None,
+                 "div_p": 0.0, "div_ld": 0.0, "div_total": 0.0})
         for spec in args.prosody:
             name, path = spec.split("=", 1)
             pred = ProsodyPredictor.load(path, args.device, tts=tts)
@@ -59,15 +68,15 @@ def main() -> None:
             spreads = [1.0] if pred.kind == "mse" else args.spreads
             for T in temps:
                 for lam in spreads:
+                    label = name if lam == 1.0 else f"{name} (spread {lam:g})"
+                    if (set_name, label, None if pred.kind == "mse" else T) in done:
+                        continue
                     s = sample_split(pred, tts, data, seeds, T, args.device, apply_scales=args.scales, spread=lam)
                     res = token_metrics(s, data)
                     if pred.kind == "mse":
                         res.update(div_p=0.0, div_ld=0.0, div_total=0.0)
-                    label = name if lam == 1.0 else f"{name} (spread {lam:g})"
-                    rows.append({"set": set_name, "system": label, "T": None if pred.kind == "mse" else T, **res})
+                    add({"set": set_name, "system": label, "T": None if pred.kind == "mse" else T, **res})
                     print(set_name, label, T, {k: round(v, 3) for k, v in res.items() if v == v}, flush=True)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).with_suffix(".json").write_text(json.dumps(rows, indent=1))
     lines = []
     for set_name in sets:
         lines += [f"### {set_name}", "", "| system | T | " + " | ".join(c[1] for c in COLS) + " |",
