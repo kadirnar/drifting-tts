@@ -134,6 +134,9 @@ def test_seed_diversity():
     moved = seed_diversity([f, f * 2 ** (1 / 12)], durations=[torch.tensor([2, 4]), torch.tensor([2, 8])])
     assert moved["f0_spread"] == pytest.approx(0.5, abs=1e-6)  # one semitone apart: std 0.5
     assert moved["token_dur_std"] == pytest.approx(math.log(2) / 4, abs=1e-6)
+    slow = np.repeat(f, 2)  # the same contour, twice as slow: aligned by DTW on a feature that follows it
+    feats = [np.log(f)[None] * np.ones((3, 1)), np.log(slow)[None] * np.ones((3, 1))]
+    assert seed_diversity([f, slow], features=feats)["f0_spread"] == pytest.approx(0.0, abs=0.05)
 
 
 def test_pause_policy():
