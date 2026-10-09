@@ -170,7 +170,7 @@ jobs, so no step rate is quoted):
 |---|---|---|---|
 | 1 × 16 | 3.05 GB | 3.56 GB | – |
 | 2 × 16 | 4.56 GB | 5.13 GB | 4.98 GB |
-| 4 × 16 | 7.51 GB | | – |
+| 4 × 16 | 7.51 GB | – | – |
 | 16 × 16 (linear extrapolation) | ~25.3 GB | ~26.7 GB | ~25.7 GB |
 
 The SLM adds its frozen models (0.41 GB), the extra generator samples (~0.03 GB each) and a transient of ~0.12 GB
