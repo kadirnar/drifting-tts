@@ -145,19 +145,22 @@ durations and token pitch. `-pitch` samples only the token pitch and keeps the r
 | oracle prosody | 3.81 | 12.2 | 0.71 | 0.50 | 11.6 | 1.39 | 6.22 | 0.804 | 1.05 | – |
 | MSE | 3.38 | 10.8 | 0.67 | 0.47 | 11.1 | 0.45 | 6.16 | 0.656 | 1.13 | – |
 | flow matching, T 1 | 3.59 | 11.5 | 0.70 | 0.50 | 11.4 | 0.98 | 6.30 | 0.585 | 1.05 | 2.32 |
-| **drift, T 1** | 3.77 | 12.1 | 0.70 | 0.50 | 11.4 | 1.65 | 6.14 | 0.518 | 1.05 | 2.59 |
+| drift, T 1 | 3.77 | 12.1 | 0.70 | 0.50 | 11.4 | 1.65 | 6.14 | 0.518 | 1.05 | 2.59 |
 | drift, T 1, spread 0.8 | 3.62 | 11.5 | 0.71 | 0.50 | 11.6 | 1.27 | 6.42 | 0.542 | 1.07 | – |
-| drift, T 0.5 | 3.63 | 11.4 | 0.72 | 0.52 | 11.6 | 1.44 | 6.40 | 0.562 | 1.06 | – |
-| drift + BERTurk, T 1 | 3.78 | 12.2 | 0.71 | 0.51 | 11.4 | 1.70 | 6.21 | 0.551 | 1.05 | 2.60 |
+| drift, T 0.5 (factors of T 1) | 3.63 | 11.4 | 0.72 | 0.52 | 11.6 | 1.44 | 6.40 | 0.562 | 1.06 | – |
+| **drift, T 0.5 (final checkpoint)** | 3.63 | 11.4 | 0.71 | 0.51 | 11.5 | 1.48 | 6.21 | 0.565 | 1.06 | 2.19 |
 | drift, T 1, pitch only | 3.78 | 12.0 | 0.71 | 0.50 | 11.4 | 0.53 | 6.10 | 0.518 | 1.07 | 2.28 |
+| drift + BERTurk, T 1 | 3.78 | 12.2 | 0.71 | 0.51 | 11.4 | 1.70 | 6.21 | 0.551 | 1.05 | 2.60 |
 | drift + BERTurk, T 1, pitch only | 3.75 | 12.0 | 0.71 | 0.49 | 11.1 | 0.48 | 6.11 | 0.561 | 1.06 | – |
 
-- **Intonation range is fixed.** The F0 std goes from 3.20 (v3.1) to 3.77 (drift), against 3.68 for the recordings
-  and 3.81 with oracle prosody. The 5–95% range goes from 10.2 to 12.1 (recordings 11.9). The DiT no longer
+- **Intonation range is fixed.** The F0 std goes from 3.20 (v3.1) to 3.77 (drift, T 1) or 3.63 (T 0.5), against
+  3.68 for the recordings and 3.81 with oracle prosody. The 5–95% range goes from 10.2 to 12.1 / 11.4 (recordings
+  11.9). With factors calibrated at T 0.5, the final checkpoint also matches the recordings' speaking rate (6.21 vs
+  6.22 syllables/s). The DiT no longer
   has to stretch a flat input: "render flat" (std of the realised token F0 over std of the conditioning token pitch)
   drops from 1.19 to 1.05, as with oracle prosody. Flow matching gets about two thirds of the way (3.59 / 11.5).
-- **Pauses.** Sampled durations put pauses inside the utterance (1.65 per utterance, recordings 1.39, v3.1 0.45). The
-  pitch-only mode keeps v3.1's pause pattern.
+- **Pauses.** Sampled durations put pauses inside the utterance (1.48–1.65 per utterance, recordings 1.39, v3.1
+  0.45). The pitch-only mode keeps v3.1's pause pattern.
 - **Different, not worse, tunes.** DTW log-F0 correlation with the specific recording drops (0.61 → 0.52; oracle
   0.80), because each sample is one plausible tune among many. Seed diversity of F0 rises from 1.39 to 2.59 st.
 - **Micro-variation** (0.50) and reversals/s (11.4) are slightly above the recordings (0.42 / 10.9) for every one-pass
@@ -209,6 +212,13 @@ steps.
 
 ## Usage
 
+**Recommended setting** (from the tables above): the drift sampler at prosody temperature 0.5 with its own voice
+factors (`train-prosody --calibrate-only calibrate.temperature=0.5` stores both, so `--prosody` alone selects it).
+It keeps Freya-100 intelligibility (WER / CER within the v3.1 intervals), raises UTMOSv2 beyond the v3.1 interval and
+gives the held-out studio sentences the recordings' intonation range. `--prosody-durations regressor` (pitch only)
+is the conservative option: v3.1's rhythm and UTMOSv2, the new intonation. The default stays the regressors until
+a listening test.
+
 ```bash
 # 1. targets of a trained pitch-conditioned model (~2 min)
 drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data/tr12_eleven \
@@ -216,13 +226,19 @@ drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data
 # 2. train (configs/prosody_drift.yaml; net.kind=mse / flow for the baselines)
 drifting-tts train-prosody --workdir runs/pm_drift tts=runs/release/drifting_tts_v3.1.pt \
     cache=runs/pm_cache/targets_v31.pt train.batch_size=12
-# 3. synthesise with it (opt-in; the default stays the deterministic regressors)
+# 3. per-voice duration factors and the preferred prosody temperature (training utterances only)
+drifting-tts train-prosody --workdir runs/pm_drift --calibrate-only tts=... cache=... calibrate.temperature=0.5
+# 4. synthesise with it (opt-in; the default stays the deterministic regressors)
 drifting-tts synthesize --model runs/release/drifting_tts_v3.1.pt --prosody runs/pm_drift/prosody_ema.pt \
-    --prosody-temperature 1.0 --temperature 0.3 --cfg 2 --vocoder vocos-ft --text "..."
+    --temperature 0.3 --cfg 2 --vocoder vocos-ft --text "..."
+#    --prosody-temperature T (default: the stored one), --prosody-spread S, --prosody-durations regressor
+# 5. guard rails with it
+drifting-tts benchmark --model runs/release/drifting_tts_v3.1.pt --num 100 --speaker 722 --vocoder vocos-ft \
+    --prosody runs/pm_drift/prosody_ema.pt
 ```
 
 ```python
-synth = Synthesizer("drifting_tts_v3.1.pt", vocoder="vocos-ft", prosody="prosody_ema.pt", prosody_temperature=1.0)
+synth = Synthesizer("drifting_tts_v3.1.pt", vocoder="vocos-ft", prosody="prosody_ema.pt")  # T from the checkpoint
 wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
 ```
 
@@ -233,11 +249,38 @@ wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
   which compensate the regressors' log-domain bias and `ceil`. `length_scale` still applies on top.
 - **`fast=True`.** The CUDA-graph acoustic path (`drifting_tts/fast.py`) covers only the regressors. With `prosody`
   set, the acoustic model runs eagerly, and only the streaming vocoder windows use CUDA graphs.
+- **Cost.** One 165-token sentence on the shared (busy) RTX 5090: text encoder 6.6 ms, + drift sampler 9.9 ms in
+  total (one pass), flow matching with 8 Euler steps 35.7 ms, drift + BERTurk 48 ms (BERT dominates). Busy-GPU
+  numbers, 2–4× above an idle GPU; the drift sampler adds a few milliseconds to time-to-first-audio.
 - **Not ported:** ONNX / WebGPU and MLX still use the regressors.
 
 ## Word-level context (#40)
 
-*(filled in below)*
+**Features** (`drifting_tts/word_features.py`, `prosody-cache --word-model`). `dbmdz/bert-base-turkish-cased`
+(BERTurk, 111 M, MIT) runs over the normalised text. Words are its space-separated pieces, which are exactly the
+segments of `word_index`. A word's vector is the mean over its sub-word pieces of the mean of the last four hidden
+layers. It is standardised per dimension and broadcast to the word's character and blank tokens as 768 extra input
+channels. The uncased BERTurk is unusable here: it strips the diacritics of our lower-case text. The cache adds
+783k word vectors (fp16, ~10 min on the shared GPU). The model is frozen (no fine-tuning), and everything else
+equals the drift run (12k steps).
+
+**A/B against the character-only drift sampler:**
+
+| | pitch CRPS (all / studio) | pitch r (all / studio) | pitch spread | jitter | pre-mI / fall (st) | Freya-100 WER, T 1 / T 0.5 / pitch only |
+|---|---|---|---|---|---|---|
+| drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / PITCH_ONLY_DRIFT |
+| drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / BERT_T05 / 0.66% |
+| recordings | 0 | 1 | 1 | 1 | +0.05 / −4.24 | – |
+
+- **Word context makes the sampled tune more text-specific.** Pitch CRPS improves by 5%, correlation rises by
+  0.05–0.06, and the polar-question shape (the pitch before mI, the final fall) moves towards the recordings, at the
+  same distributional match.
+- **It does not help the durations on out-of-domain text.** At T 1 the BERTurk sampler's sampled durations are
+  worse for intelligibility on Freya-100 (WER 4.50%). With the regressors' durations (pitch only) it is as clean
+  as v3.1.
+- **Cost:** BERTurk adds ~40 ms per sentence on the busy GPU and a `transformers` dependency at inference. A smaller
+  cased encoder (ELECTRA-small-tr, 13.7 M, MIT) and fine-tuning (Kenter et al. 2020) are the obvious next steps;
+  neither was tried here.
 
 ## Notes and pitfalls
 

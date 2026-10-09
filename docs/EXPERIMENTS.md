@@ -52,6 +52,7 @@ is the index and the place to start before planning new work.
 | latents | longer latent training (10k → 50k) | worse (WER 4.94% → 7.57%) | ❌ | [LATENTS.md](LATENTS.md#longer-training-and-the-released-model) |
 | latents | fine-tuning the VAE decoder on generated latents | **the fix for the noise**: DAC-VAE WER 9.55% → 1.32%, UTMOSv2 1.84 → 2.71 | ✅ on the Hub | [LATENTS.md](LATENTS.md#fine-tuning-the-dac-vae-decoder-on-generated-latents-32) |
 | prosody | temperature / CFG as prosody knobs | no effect on intonation or rhythm | – | [§5](#5-robotic-prosody-diagnosis-and-research) |
+| prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.66%, UTMOSv2 2.627 → 2.722 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
 **Best systems on one protocol** (Freya-100):
 
@@ -291,6 +292,15 @@ Listening feedback: the voices sound robotic. Measured on Prosody-40 (harvest F0
   4. a metric that cannot see the problem.
 
 The plan is in issues #37–#42 (below). The owner decided that the vocoder stays as it is for this work.
+
+**Stochastic prosody predictor (#39, [PROSODY_MODEL.md](PROSODY_MODEL.md)).** An 8 M sampler, trained with the
+drifting objective on multi-scale feature maps of the per-token (log-duration, pitch) sequence, replaces the
+regressors at inference; the DiT is unchanged. On 100 held-out studio sentences the F0 std goes from 3.20 to 3.63 st
+(recordings 3.68, oracle prosody 3.81) and the internal pauses from 0.45 to 1.48 per utterance (1.39). At prosody
+temperature 0.5, Freya-100 stays as intelligible (WER 0.66%, CER 0.14%) and UTMOSv2 rises to 2.722. At T 1 the
+sampled durations cost intelligibility (WER 2.63%). Flow matching with the same backbone is the better per-token
+model (CRPS), but it is 10–14% flatter and needs 8 network evaluations. BERTurk word features help the pitch
+(polar questions) but not the durations.
 
 ## 6. Pitfalls and engineering notes
 
