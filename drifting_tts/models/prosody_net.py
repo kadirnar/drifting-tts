@@ -207,6 +207,7 @@ class ProsodyPredictor(nn.Module):
         self.net = ProsodyNet(cond_dim, **self.net_cfg)
         self.stats = ProsodyStats(self.net.word_dim)
         self.duration_scales: dict[int, float] = {}
+        self.temperature: float | None = None  # preferred prosody temperature (train-prosody --calibrate-only)
         self.flow_steps = 8
         self._word_encoder = None
 
@@ -316,5 +317,6 @@ class ProsodyPredictor(nn.Module):
         p.net.load_state_dict(ck["ema"])
         p.stats.load_state_dict(ck["stats"])
         p.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}
+        p.temperature = ck.get("temperature")
         p.flow_steps = int(ck.get("flow_steps", 8))
         return p.to(device).eval()

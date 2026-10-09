@@ -48,7 +48,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prosody", default=None,
                    help="stochastic prosody predictor checkpoint (train-prosody, prosody_ema.pt); default: the "
                         "model's deterministic duration / pitch regressors")
-    p.add_argument("--prosody-temperature", type=float, default=1.0, help="noise temperature of --prosody")
+    p.add_argument("--prosody-temperature", type=float, default=None,
+                   help="noise temperature of --prosody (default: its preferred one, else 1)")
     p.add_argument("--prosody-spread", type=float, default=1.0,
                    help="output-space temperature of --prosody (< 1: closer to its mean, flatter, less varied)")
     p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled",
@@ -86,8 +87,8 @@ def preferred_temperature(model) -> float:
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False,
-                 prosody: str | Path | None = None, prosody_temperature: float = 1.0, prosody_spread: float = 1.0,
-                 prosody_durations: str = "sampled"):
+                 prosody: str | Path | None = None, prosody_temperature: float | None = None,
+                 prosody_spread: float = 1.0, prosody_durations: str = "sampled"):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
         checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
         latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
@@ -97,7 +98,8 @@ class Synthesizer:
         fuses the DiT with ``torch.compile`` (about 20 s the first time) and ``tf32`` uses TF32 matmuls: both are
         faster but change the output slightly (0.4-0.7 dB log-spectral distance with TF32).
         ``prosody``: a stochastic prosody predictor (``train-prosody``) that samples the durations and token pitch
-        instead of the model's deterministic regressors, with noise temperature ``prosody_temperature`` and
+        instead of the model's deterministic regressors, with noise temperature ``prosody_temperature`` (``None``:
+        the checkpoint's preferred one, else 1) and
         output-space temperature ``prosody_spread`` (:meth:`ProsodyPredictor.sample`; the seed of each call drives
         it too). ``prosody_durations="regressor"`` keeps the model's durations (and per-voice factors) and samples
         only the token pitch. Its per-voice duration factors replace the model's. It runs eagerly: with
@@ -133,6 +135,8 @@ class Synthesizer:
             from .models.prosody_net import ProsodyPredictor
 
             self.prosody = ProsodyPredictor.load(prosody, device, tts=self.model)
+            if prosody_temperature is None:
+                self.prosody_temperature = 1.0 if self.prosody.temperature is None else self.prosody.temperature
         if fast and self.prosody is None:
             from .fast import GraphedAcoustic
 

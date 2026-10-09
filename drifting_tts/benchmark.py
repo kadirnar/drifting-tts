@@ -47,7 +47,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stream", action="store_true", help="synthesise with Synthesizer.stream (streaming vocoder)")
     p.add_argument("--fast", action="store_true", help="CUDA graphs, Synthesizer(fast=True); implies --stream")
     p.add_argument("--prosody", default=None, help="stochastic prosody predictor checkpoint (train-prosody)")
-    p.add_argument("--prosody-temperature", type=float, default=1.0)
+    p.add_argument("--prosody-temperature", type=float, default=None, help="default: the checkpoint's preferred one")
     p.add_argument("--prosody-spread", type=float, default=1.0)
     p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled")
     p.add_argument("--out", default="outputs/benchmark")
@@ -125,7 +125,7 @@ def run(args) -> None:
     results = {"texts": args.texts, "sentences": len(rows), "band_hz": args.band, "voices": args.speaker,
                "stream": args.stream or args.fast, "fast": args.fast,
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
-               "prosody": args.prosody, "prosody_temperature": args.prosody_temperature,
+               "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
                "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")

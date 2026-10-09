@@ -30,8 +30,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--config", default="configs/prosody_drift.yaml")
     p.add_argument("--workdir", default="runs/prosody")
     p.add_argument("--calibrate-only", action="store_true",
-                   help="only (re-)measure the per-voice duration factors of <workdir>/prosody_ema.pt "
-                        "(calibrate.temperature)")
+                   help="only (re-)measure the per-voice duration factors of <workdir>/prosody_ema.pt at "
+                        "calibrate.temperature / calibrate.spread, and store that temperature as the preferred one")
     p.add_argument("overrides", nargs="*", help="config overrides, e.g. train.steps=1000")
 
 
@@ -460,6 +460,7 @@ def run(args) -> None:
         ck["duration_scales"] = calibrate(pred, tts, cache, device, cal.get("temperature", 1.0),
                                           spread=cal.get("spread", 1.0))
         ck["calibrate_temperature"], ck["calibrate_spread"] = cal.get("temperature", 1.0), cal.get("spread", 1.0)
+        ck["temperature"] = cal.get("temperature", 1.0)  # the default of Synthesizer(prosody_temperature=None)
         save_checkpoint(path, **ck)
         print(f"stored duration_scales {ck['duration_scales']} in {path}")
         return
