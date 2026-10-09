@@ -201,6 +201,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
 | [docs/PROSODY.md](docs/PROSODY.md) | prosody metrics against recordings (`drifting-tts prosody`), oracle prosody, pitch gain, pause policy |
 | [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM): the backends, their resynthesis ceiling, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
+| [docs/POCKET_TTS_GATE.md](docs/POCKET_TTS_GATE.md) | a Turkish Pocket TTS (autoregressive, Mimi latents) on Freya-100 with our judges and prosody metrics, and the Mimi codec gate (#42) |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
 | [drifting_tts/mlx/](drifting_tts/mlx/) | MLX inference for Apple silicon (`python -m drifting_tts.mlx`) |
 | [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |

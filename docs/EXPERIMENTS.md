@@ -58,6 +58,7 @@ is the index and the place to start before planning new work.
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
 | prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
 | prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
+| #42 | a community Turkish Pocket TTS (autoregressive 24-layer teacher over Mimi latents, 336 M) on Freya-100, and the Mimi codec gate | WER on par (1.54% vs 1.10%); UTMOSv2 2.96 vs 2.63, explained by its decoder (Mimi resynthesis 3.26 vs `vocos-ft` copy 2.74); pitch spread equal to v3.1's with our voice as prompt; phrase breaks; 8 kHz output; 14× slower on CPU. Mimi: transparent on the studio voice, +2 pp WER and SIM 0.84 on the base corpus | – (no training) | [POCKET_TTS_GATE.md](POCKET_TTS_GATE.md) |
 
 **Best systems on one protocol** (Freya-100):
 
@@ -69,8 +70,10 @@ is the index and the place to start before planning new work.
 | v3.1 (mels) | Revox (4.5 M, non-commercial) | 0.77% | 0.16% | 2.244 | 3.10 |
 | DAC-VAE latents | DAC-VAE decoder, fine-tuned | 1.32% | 0.30% | 2.710 | 3.26 |
 | VoxCPM2 latents | VoxCPM2 decoder, fine-tuned | 1.87% | 0.43% | 2.530 | 3.25 |
+| *pocket-tts-tr (external, autoregressive, studio-voice prompt)* | *Mimi* | *1.54%* | *0.32%* | *2.964* | *3.38* |
 
-v3.1 with BigVGAN-v2-ft remains the reference. The comparison Space plays all six systems from one click.
+v3.1 with BigVGAN-v2-ft remains the reference. The comparison Space plays all six systems from one click. The
+external pocket-tts-tr row is a community model with a 5 s voice prompt and 8 kHz output ([POCKET_TTS_GATE.md](POCKET_TTS_GATE.md)).
 
 ## 1. Acoustic model recipe (before v3.1)
 
