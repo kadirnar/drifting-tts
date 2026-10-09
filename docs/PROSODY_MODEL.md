@@ -243,11 +243,12 @@ factors (`train-prosody --calibrate-only calibrate.temperature=0.5` stores both,
 It keeps Freya-100 intelligibility (WER 0.99%, CER 0.22%, v3.1 1.10% / 0.22%), raises UTMOSv2 (2.712 vs 2.627) and
 gives the held-out studio sentences the recordings' intonation range. `--prosody-durations regressor` (pitch only)
 is the conservative option: v3.1's rhythm and pauses with the new intonation (Freya-100 WER 0.77%, UTMOSv2 2.693).
-The default stays the regressors until a listening test.
+The explicit API keeps the regressors by default; release v3.2 uses the drift sampler at T 0.5
+(`Synthesizer.from_pretrained("v3.2")`, `prosody="drift"`: the published `prosody_drift_v3.2.pt`).
 
 ```bash
 # 1. targets of a trained pitch-conditioned model (~2 min)
-drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data/tr12_eleven \
+drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data/train \
     --out runs/pm_cache/targets_v31.pt
 # 2. train (configs/prosody_drift.yaml; net.kind=mse / flow for the baselines)
 drifting-tts train-prosody --workdir runs/pm_drift tts=runs/release/drifting_tts_v3.1.pt \
@@ -266,6 +267,8 @@ drifting-tts benchmark --model runs/release/drifting_tts_v3.1.pt --num 100 --spe
 ```python
 synth = Synthesizer("drifting_tts_v3.1.pt", vocoder="vocos-ft", prosody="prosody_ema.pt")  # T from the checkpoint
 wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
+synth = Synthesizer.from_pretrained("v3.2")   # the published one: prosody="drift", vocos-v2, pause="punct"
+wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0, prosody_temperature=0.7)  # per call
 ```
 
 - **Seeds.** The prosody noise is drawn from the same seeded generator as the DiT noise, before it, so a seed
@@ -273,8 +276,13 @@ wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
 - **Speaking rate.** The sampler has its own per-voice duration factors (`train-prosody --calibrate-only`: the median
   recorded / sampled length on training utterances, never on the evaluation splits). It replaces the v3.1 factors,
   which compensate the regressors' log-domain bias and `ceil`. `length_scale` still applies on top.
-- **`fast=True`.** The CUDA-graph acoustic path (`drifting_tts/fast.py`) covers only the regressors. With `prosody`
-  set, the acoustic model runs eagerly, and only the streaming vocoder windows use CUDA graphs.
+- **`fast=True`.** A one-pass sampler (`drift`, `mse`; no word features, spread 1) runs inside the text encoder's
+  CUDA graph (`drifting_tts/fast.py`), its noise drawn outside the graph in the eager order: the same frame counts
+  and mels within float noise of the eager path. Flow matching, BERTurk features and `spread` != 1 run eagerly, with
+  only the streaming vocoder windows in CUDA graphs.
+- **Publishing.** `scripts/prepare_release.py` keeps what `ProsodyPredictor.load` reads (no training config, cache
+  or TTS paths) and records a fingerprint of the text encoder: loading the predictor with another acoustic model
+  warns.
 - **Cost.** One 165-token sentence on the shared (busy) RTX 5090: text encoder 6.6 ms, + drift sampler 9.9 ms in
   total (one pass), flow matching with 8 Euler steps 35.7 ms, drift + BERTurk 48 ms (BERT dominates). Busy-GPU
   numbers, 2–4× above an idle GPU; the drift sampler adds a few milliseconds to time-to-first-audio.

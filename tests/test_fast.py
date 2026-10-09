@@ -59,3 +59,36 @@ def test_graphed_acoustic_matches_eager(text):
             mel = fast(ids, spk, 1.5, 0.5, 1.3, generator=g)
             assert mel.shape == ref.shape
             torch.testing.assert_close(mel, ref, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+@pytest.mark.parametrize("durations", ["sampled", "regressor"])
+def test_graphed_acoustic_with_a_prosody_predictor_matches_eager(durations):
+    """The drift prosody predictor inside the encoder's graph: the same draws and the same mel as
+    ``ProsodyPredictor.predict`` followed by ``synthesize``."""
+    from drifting_tts.models.prosody_net import ProsodyPredictor
+
+    cfg = {"text": {"d": 16, "heads": 2, "layers": 2, "ffn": 32, "dropout": 0.0, "spk_dim": 8},
+           "gen": {"hidden": 32, "depth": 2, "heads": 2, "patch": 2, "mlp_ratio": 4.0, "n_registers": 4,
+                   "noise_classes": 8, "noise_coords": 3, "residual_prior": True, "num_steps": 1},
+           "pitch": {"enabled": True}}
+    torch.manual_seed(0)
+    model = DriftingTTS(Config(cfg), num_speakers=3).cuda().eval()
+    pred = ProsodyPredictor({"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4,
+                             "noise_glob": 4, "out_init": 1.0}, cond_dim=16 + 8 + 2).cuda().eval()
+    with torch.no_grad():
+        for p in [*model.parameters(), *pred.parameters()]:
+            p.add_(torch.randn_like(p) * 0.1)
+    ids = torch.tensor([text_to_ids("bu bir deneme cümlesidir, tek adımda ve hızlı üretilir.")], device="cuda")
+    n, spk = torch.tensor([ids.shape[1]], device="cuda"), torch.tensor([2], device="cuda")
+    fast = GraphedAcoustic(model, token_bucket=16, frame_bucket=32, prosody=pred, prosody_durations=durations)
+    with torch.no_grad():
+        for seed in range(2):
+            g = torch.Generator(device="cuda").manual_seed(seed)
+            frames, pitch = pred.predict(model, ids, n, spk, 0.7, 1.3, generator=g)
+            ref, _ = model.synthesize(ids, n, spk, cfg_scale=1.5, temperature=0.5, length_scale=1.3, generator=g,
+                                      durations=frames if durations == "sampled" else None, pitch=pitch)
+            g = torch.Generator(device="cuda").manual_seed(seed)
+            mel = fast(ids, spk, 1.5, 0.5, 1.3, generator=g, prosody_temperature=0.7)
+            assert mel.shape == ref.shape
+            torch.testing.assert_close(mel, ref, rtol=0, atol=1e-4)

@@ -14,6 +14,7 @@ is the index and the place to start before planning new work.
 - [6. Pitfalls and engineering notes](#6-pitfalls-and-engineering-notes)
 - [7. Open work](#7-open-work)
 - [8. Published artefacts](#8-published-artefacts)
+- [9. Release v3.2](#9-release-v32)
 
 ## Protocols and judges
 
@@ -49,7 +50,7 @@ is the index and the place to start before planning new work.
 | vocoders | GTA fine-tunes of BigVGAN-base and Vocos | BigVGAN-base-ft (14 M) ≈ BigVGAN-v2-ft (112 M); Vocos-ft fastest but less natural | ✅ on the Hub | [VOCODERS.md](VOCODERS.md) |
 | vocoders | Revox Vocoder 1.0 (third-party, non-commercial) | intelligible, least natural neural vocoder | opt-in only | [VOCODERS.md](VOCODERS.md#revox-vocoder-10-non-commercial) |
 | vocoders | GAN-free vocoder with the drifting objective | content learned, realism not (UTMOSv2 1.40–1.84) | ❌ (code kept, experimental) | [DESIGN.md §8](DESIGN.md#8-a-gan-free-vocoder-experimental) |
-| vocoders | Vocos-ft trained further: rebalanced losses, multi-scale mel, instantaneous-frequency loss, cosine LR (10k-step pilots) | Freya-100 UTMOSv2 2.63 → 2.92, WER 1.10% → 0.77%, F0 micro-variation 0.45 → 0.40 st (BigVGAN 0.395); same network and streaming | ✅ `configs/vocoder_vocos_v2.yaml`, `vocos-ft2` (local); 160k-step run in progress | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
+| vocoders | Vocos-ft trained further: rebalanced losses, multi-scale mel, instantaneous-frequency loss, cosine LR (10k-step pilots) | Freya-100 UTMOSv2 2.63 → 2.92, WER 1.10% → 0.77%, F0 micro-variation 0.45 → 0.40 st (BigVGAN 0.395); same network and streaming | ✅ `configs/vocoder_vocos_v2.yaml`, `vocos-v2`: the vocoder of v3.2 (160k-step run) | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
 | vocoders | Vocos with NVIDIA's released MPD + CQT-D instead of its own | UTMOSv2 2.84, no better pitch; 3× slower, 12 GB at batch 8 | ❌ | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
 | latents | VoxCPM2 / DAC-VAE latent TTS (10k pilots) | speaks earlier than mels, but noisy with the released decoders | partly | [LATENTS.md](LATENTS.md#tts-pilots-17) |
 | latents | longer latent training (10k → 50k) | worse (WER 4.94% → 7.57%) | ❌ | [LATENTS.md](LATENTS.md#longer-training-and-the-released-model) |
@@ -58,6 +59,8 @@ is the index and the place to start before planning new work.
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
 | prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
 | prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
+| release | **v3.2** = v3.1's acoustic model + the drift prosody predictor (T 0.5) + Vocos v2 + punctuation pauses | Freya-495 studio WER {{V32_WER}}, UTMOSv2 {{V32_UTMOS}}; F0 std {{V32_F0_STD}} st (recordings 3.68); 89 M parameters instead of 180 M | ✅ `Synthesizer.from_pretrained("v3.2")` | [§9](#9-release-v32), [RESULTS.md](RESULTS.md#v32-sampled-prosody-vocos-v2-punctuation-pauses) |
+| latency | the prosody predictor inside the acoustic model's CUDA graphs; graphs captured under `no_grad` | `fast=True` works with the predictor (TTFA {{V32_TTFA}}); `fast=True` memory ~6 GB → 0.65 GB | ✅ | [§9](#9-release-v32) |
 | prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
 **Best systems on one protocol** (Freya-100):
@@ -114,6 +117,9 @@ From [TRAINING.md](TRAINING.md) and [DESIGN.md](DESIGN.md), kept here for comple
   - fp16 BigVGAN: overflows, NaN.
   - `torch.compile` of BigVGAN: +17% speed, but the output changes.
 - **Small vocoders:** first audio 7.8 ms with BigVGAN-base-ft and 4.9 ms with Vocos-ft (idle GPU).
+- **Graph memory.** Until v3.2, `GraphedAcoustic.warmup` captured the graphs with autograd on: every frame bucket's
+  outputs kept their activations alive, ~0.25 GB per bucket and ~6 GB for the full set. Captured under `no_grad`
+  they take 0.65 GB.
 
 **WebGPU** ([RESULTS.md](RESULTS.md#in-the-browser-webgpu)). Three ONNX graphs; JavaScript repeats each token's
 features for its duration.
@@ -343,7 +349,17 @@ model (CRPS), but it is 10–14% flatter and needs 8 network evaluations. BERTur
 **Publishing:**
 - **Sanitise every checkpoint before upload.** Training checkpoints store the config with absolute data paths. Rewrite
   `data.root` / `mae.path` to generic paths, drop training-only state (`taus`), and scan for paths and names.
-  Decoder exports (`decoder_ft.pt`) hold tensors only.
+  Decoder exports (`decoder_ft.pt`) hold tensors only. `scripts/prepare_release.py` (`drifting_tts/publish.py`) does
+  it for the acoustic model, Vocos and the prosody predictor: it keeps only what the loaders read, reloads each file
+  against its source, and scans the pickle's strings and the file's printable runs for absolute paths and for every
+  speaker, show and data-root name of the training data (counts only). The scan also flags the published
+  `drifting_tts_v3.1.pt`: its config names the local data folder (`data.root`).
+- **A prosody predictor belongs to one text encoder.** It is conditioned on the encoder states and the regressors'
+  predictions of the model it was trained on. Its published checkpoint records a fingerprint of those weights, and
+  loading it with another acoustic model warns (a fine-tune that moves the encoder needs a token-level check,
+  `scripts/eval_prosody_tokens.py`, or a retrained predictor).
+- **Stage before uploading.** `DRIFTING_TTS_HUB_DIR=<staging dir>` makes every Hub download (`from_pretrained`, the
+  vocoder and prosody registries) read that directory first, so a release runs locally exactly as users will get it.
 - **Privacy.** Never publish dataset names, sources, hours, speaker names or recording-derived audio. Only aggregate
   metrics and integer speaker IDs.
 - **Third-party licences.**
@@ -380,7 +396,7 @@ test should gate every naturalness claim.
 
 | where | what |
 |---|---|
-| [`Vyvo/drifting-tts-tr`](https://huggingface.co/Vyvo/drifting-tts-tr) | v3.1 (`drifting_tts_v3.1.pt`); vocoders `bigvgan_v2_ft.pt`, `bigvgan_base_ft.pt`, `vocos_ft.pt`; `onnx/`; `mlx/` (incl. `bigvgan_base_ft.safetensors`, `vocos_ft.safetensors`) |
+| [`Vyvo/drifting-tts-tr`](https://huggingface.co/Vyvo/drifting-tts-tr) | v3.1 (`drifting_tts_v3.1.pt`); vocoders `bigvgan_v2_ft.pt`, `bigvgan_base_ft.pt`, `vocos_ft.pt`; `onnx/`; `mlx/` (incl. `bigvgan_base_ft.safetensors`, `vocos_ft.safetensors`); v3.2 (planned): `vocos_v2.pt`, `prosody_drift_v3.2.pt` |
 | [`Vyvo/drifting-tts-tr-dacvae`](https://huggingface.co/Vyvo/drifting-tts-tr-dacvae) | DAC-VAE latent model (10k) and the fine-tuned decoder (40k, watermark kept) |
 | [`Vyvo/drifting-tts-tr-voxcpm2`](https://huggingface.co/Vyvo/drifting-tts-tr-voxcpm2) | VoxCPM2 latent models (10k, 50k) and the fine-tuned decoder (35k) |
 | [`Vyvo/drifting-tts-tr-demo`](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-demo) | Gradio demo of v3.1 |
@@ -398,3 +414,36 @@ Scripts used for the tables:
 | `scripts/check_mlx_parity.py` | MLX parity |
 | `drifting-tts benchmark` | Freya |
 | `drifting-tts finetune-vocoder` | GTA fine-tunes: `vocoder.arch: bigvgan` / `vocos` / `vae_decoder`, `vocoder.objective: drift` |
+
+## 9. Release v3.2
+
+**What it is.** v3.1's acoustic model (unchanged{{V32_ACOUSTIC_NOTE}}) with three opt-in results of #37 made the
+default of a new release: the stochastic prosody predictor trained with drifting (#39, prosody temperature 0.5, its own
+per-voice duration factors), Vocos v2 as the vocoder (#47, the long run's snapshot {{VOCOS_V2_STEP}}) and
+punctuation-aware pauses (#38). `Synthesizer.from_pretrained("v3.2")`, `drifting-tts synthesize --release v3.2`; v3.1
+stays available (`from_pretrained("v3.1")`), and every default of the explicit API is unchanged.
+
+**Evaluation** (`scripts/eval_release.sh`, [RESULTS.md](RESULTS.md#v32-sampled-prosody-vocos-v2-punctuation-pauses)):
+Freya-495 for the three voices, Freya-100 and the prosody protocol, each against v3.1 + BigVGAN-v2-ft (as released)
+and v3.1 + vocos-ft.
+
+| | v3.1 + BigVGAN-v2-ft | v3.1 + vocos-ft | v3.2 |
+|---|---|---|---|
+| Freya-495 studio WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
+| Freya-495 male WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
+| Freya-495 female WER / UTMOSv2 | {{…}} | {{…}} | {{…}} |
+| studio val: F0 std (recordings 3.68) / pauses per utterance (1.39) | {{…}} | {{…}} | {{…}} |
+| TTFA `fast` (short / paragraph) | 12.3 / 13.6 ms | {{…}} | {{…}} |
+
+**Dry run** (Freya-100, studio voice, the 10k-step Vocos v2 pilot standing in for the long run's snapshot, busy shared
+GPU): {{DRYRUN}}.
+
+**Engineering:**
+- **Names instead of files.** `vocoder="vocos-v2"` and `prosody="drift"` resolve to `vocos_v2.pt` and
+  `prosody_drift_v3.2.pt` in `Vyvo/drifting-tts-tr`; `pause="punct"` builds the voice's `PausePolicy`. A release is a
+  row of `drifting_tts/hub.py: RELEASES`: a new acoustic model is a one-line change there.
+- **`fast=True` with the prosody predictor.** The drift sampler (one pass) runs inside the text encoder's CUDA graph,
+  its noise drawn outside in the eager order: same frame counts, mels within float noise of the eager path.
+- **`Synthesizer.variant`** gives v3.1 next to v3.2 on one acoustic model (the demo's toggle) and replaces the
+  attribute swapping of the comparison Space; `prosody_temperature` can be set per call.
+

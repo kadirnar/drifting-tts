@@ -38,7 +38,7 @@ def main() -> None:
     p.add_argument("--settings", nargs="+", required=True,
                    help="name:temperature[:spread][:pitch] (each rendered with every --seeds; pitch: only the token "
                         "pitch is sampled, the durations stay the regressors')")
-    p.add_argument("--data", default="/workspace/data/tr12_eleven")
+    p.add_argument("--data", required=True, help="prepared data root (val / dev texts)")
     p.add_argument("--vocoder", default="vocos-ft")
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2])
     p.add_argument("--num-studio", type=int, default=6)

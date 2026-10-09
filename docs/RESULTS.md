@@ -1,7 +1,88 @@
 # Results
 
-Detailed results of the current model, v3.1: the v3 model plus the fine-tuned `studio` voice. The
-[README](../README.md) has the summary.
+Detailed results of the current release, **v3.2** (next section), and of v3.1, whose acoustic model it keeps: the v3
+model plus the fine-tuned `studio` voice. The [README](../README.md) has the summary.
+
+## v3.2: sampled prosody, Vocos v2, punctuation pauses
+
+v3.2 keeps v3.1's acoustic model and changes what surrounds it. `{{...}}` marks numbers of the final evaluation
+(`scripts/eval_release.sh`, below) that are not filled in yet.
+
+| | v3.1 | v3.2 |
+|---|---|---|
+| durations and token pitch | deterministic regressors (MSE) | sampled by an 8.1 M prosody predictor trained with drifting, prosody temperature 0.5 ([PROSODY_MODEL.md](PROSODY_MODEL.md)) |
+| vocoder | BigVGAN-v2-ft (112.4 M) | Vocos v2 (13.5 M): `vocos-ft` trained further with the second recipe ([VOCODERS.md](VOCODERS.md#training-vocos-further)) |
+| pause between sentences | 0.15 s | by the sentence's final punctuation, measured per voice ([PROSODY.md](PROSODY.md#pauses)) |
+| acoustic model | `drifting_tts_v3.1.pt` | the same file{{V32_ACOUSTIC_NOTE}} |
+| parameters at inference | 180.1 M | 89.3 M (67.7 M acoustic + 8.1 M prosody + 13.5 M vocoder) |
+| per-voice duration factors | the regressors' (`calibrate-durations`) | the prosody predictor's own (`train-prosody --calibrate-only`, at prosody temperature 0.5) |
+
+```python
+tts = Synthesizer.from_pretrained("v3.2", "cuda")        # = model v3.1, vocoder="vocos-v2", prosody="drift", pause="punct"
+v31 = tts.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)   # v3.1, sharing the acoustic model
+```
+
+**Freya-TR-Eval** (Freya-495: all 495 sentences, T = 0.3, α = 2, seed = sentence index, Whisper large-v3 on 8 kHz
+audio, UTMOSv2 and DNSMOS P.835 on the full band):
+
+| voice | system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL |
+|---|---|---|---|---|---|
+| studio | v3.1 + BigVGAN-v2-ft (v3.1 as released) | {{F495_STUDIO_V31B_WER}} | {{…}} | {{…}} | {{…}} |
+| studio | v3.1 + vocos-ft | {{F495_STUDIO_V31V_WER}} | {{…}} | {{…}} | {{…}} |
+| studio | **v3.2** | {{F495_STUDIO_V32_WER}} | {{…}} | {{…}} | {{…}} |
+| male | v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} |
+| male | v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} |
+| male | **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} |
+| female | v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} |
+| female | v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} |
+| female | **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} |
+
+The published v3.1 rows were 1.23% / 2.94 (studio), 1.74% / 2.81 (male) and 3.02% / 2.75 (female) in WER / UTMOSv2;
+the re-run reproduces them within {{…}}.
+
+**Freya-100** (the first 100 sentences, studio voice; the protocol of [EXPERIMENTS.md](EXPERIMENTS.md#protocols-and-judges)):
+
+| system | WER [95% CI] | CER | UTMOSv2 [95% CI] | DNSMOS OVRL | RTF (shared GPU) |
+|---|---|---|---|---|---|
+| v3.1 + BigVGAN-v2-ft | {{…}} (known: 0.66%) | {{…}} (0.14%) | {{…}} (2.934) | {{…}} (3.33) | {{…}} |
+| v3.1 + vocos-ft | {{…}} (known: 1.10%) | {{…}} (0.22%) | {{…}} (2.627) | {{…}} (3.31) | {{…}} |
+| **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+
+**Prosody** (`drifting-tts prosody`, the 100 studio `val` recordings against each system's rendition of their texts,
+sentence by sentence; harvest F0 in semitones; [PROSODY.md](PROSODY.md#how-it-is-measured) defines the columns):
+
+| system | F0 std | F0 range | micro | pauses/utt | pause s | syl/s | DTW F0 r | CER | WER | UTMOSv2 | SIM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| recording | 3.68 | 11.9 | 0.42 | 1.39 | 0.139 | 6.22 | – | 0.88% | 2.06% | 3.093 | – |
+| v3.1 + BigVGAN-v2-ft | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+| v3.1 + vocos-ft | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+| **v3.2** | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} | {{…}} |
+
+**Latency** (`scripts/bench_ttfa.py`, RTX 5090, studio voice, T = 0.3, α = 2, median of 100 runs after warm-up;
+`fast`: `Synthesizer(fast=True).stream`, with the prosody predictor inside the acoustic model's CUDA graphs):
+
+| system | mode | TTFA short | TTFA long sentence | TTFA paragraph | RTF paragraph |
+|---|---|---|---|---|---|
+| v3.1 + BigVGAN-v2-ft (`--cuda-kernel`) | `fast` | 12.3 ms | 13.9 ms | 13.6 ms | – |
+| v3.1 + vocos-ft | `fast` | {{…}} | {{…}} | {{…}} | {{…}} |
+| v3.2 | `stream` (eager acoustic model) | {{…}} | {{…}} | {{…}} | {{…}} |
+| **v3.2** | **`fast`** | {{…}} | {{…}} | {{…}} | {{…}} |
+
+- **The prosody predictor in CUDA graphs.** One pass of the drift sampler (`drift` / `mse` kinds, no word features,
+  spread 1) runs inside the text encoder's graph; its noise is drawn outside the graph in the eager order, so a seed
+  gives the same frame counts as the eager path, and mels equal to 77–207 dB SNR (bit-identical on most sentences;
+  the remaining float differences come from attention kernels on padded buckets, as for v3.1's `fast` path on short
+  sentences). Before, `fast=True` with a prosody model ran the acoustic model eagerly.
+- **Memory of `fast=True`.** The graphs were captured with autograd on, so each frame bucket kept its activations
+  alive: about 6 GB of GPU memory for the full set. They are now captured under `no_grad`: 0.65 GB allocated with or
+  without the prosody predictor.
+
+**Reproduce:** stage the files with `scripts/prepare_release.py`, then
+
+```bash
+scripts/eval_release.sh runs/release/drifting_tts_v3.1.pt runs/rel_publish/prosody_drift_v3.2.pt \
+    runs/rel_publish/vocos_v2.pt runs/rel_eval_v3.2      # Freya-100, Freya-495 x 3 voices, prosody; summary.md
+```
 
 ## Freya-TR-Eval
 
