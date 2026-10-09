@@ -48,6 +48,8 @@ is the index and the place to start before planning new work.
 | vocoders | GTA fine-tunes of BigVGAN-base and Vocos | BigVGAN-base-ft (14 M) ≈ BigVGAN-v2-ft (112 M); Vocos-ft fastest but less natural | ✅ on the Hub | [VOCODERS.md](VOCODERS.md) |
 | vocoders | Revox Vocoder 1.0 (third-party, non-commercial) | intelligible, least natural neural vocoder | opt-in only | [VOCODERS.md](VOCODERS.md#revox-vocoder-10-non-commercial) |
 | vocoders | GAN-free vocoder with the drifting objective | content learned, realism not (UTMOSv2 1.40–1.84) | ❌ (code kept, experimental) | [DESIGN.md §8](DESIGN.md#8-a-gan-free-vocoder-experimental) |
+| vocoders | Vocos-ft trained further: rebalanced losses, multi-scale mel, instantaneous-frequency loss, cosine LR (10k-step pilots) | Freya-100 UTMOSv2 2.63 → 2.92, WER 1.10% → 0.77%, F0 micro-variation 0.45 → 0.40 st (BigVGAN 0.395); same network and streaming | ✅ `configs/vocoder_vocos_v2.yaml`, `vocos-ft2` (local); 160k-step run in progress | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
+| vocoders | Vocos with NVIDIA's released MPD + CQT-D instead of its own | UTMOSv2 2.84, no better pitch; 3× slower, 12 GB at batch 8 | ❌ | [VOCODERS.md](VOCODERS.md#training-vocos-further) |
 | latents | VoxCPM2 / DAC-VAE latent TTS (10k pilots) | speaks earlier than mels, but noisy with the released decoders | partly | [LATENTS.md](LATENTS.md#tts-pilots-17) |
 | latents | longer latent training (10k → 50k) | worse (WER 4.94% → 7.57%) | ❌ | [LATENTS.md](LATENTS.md#longer-training-and-the-released-model) |
 | latents | fine-tuning the VAE decoder on generated latents | **the fix for the noise**: DAC-VAE WER 9.55% → 1.32%, UTMOSv2 1.84 → 2.71 | ✅ on the Hub | [LATENTS.md](LATENTS.md#fine-tuning-the-dac-vae-decoder-on-generated-latents-32) |
@@ -168,6 +170,14 @@ Details: [VOCODERS.md](VOCODERS.md).
   - The mel conversion is accurate: 0.91 dB against Revox's own mel.
   - The frame-level F0 step costs more than the network.
   - It cannot stream (its source phase resets every call).
+- **Vocos's gap was in its training, not its size** ([VOCODERS.md](VOCODERS.md#training-vocos-further)).
+  - Copy-synthesis showed it in pitch and periodicity: F0 error 88 vs 52 cents (BigVGAN-v2-ft), periodicity error
+    2.5×, rough voiced frames.
+  - Continuing the first recipe changed nothing. Rebalancing the losses lifted Freya-100 UTMOSv2 to 2.92 within 5k
+    steps: MRD × 1, feature matching × 2, BigVGAN-v2's multi-scale mel × 15 instead of 45 × single-scale, cosine LR.
+  - An instantaneous-frequency (phase-advance) loss against the recording then brought the F0 jitter to BigVGAN's
+    level.
+  - Per-step evaluation needs pitch measures: UTMOSv2 moved most where the pitch measures moved least.
 - **GAN-free drift vocoder: negative.** Three 20k-step pilots learned content (WER as low as 1.13%) but not realism.
   - The pairing (conditional and pooled vs pooled only) and fixed noise barely matter.
   - Tripling the drift weight helps (1.40 → 1.84) but stays far below the GAN fine-tune (2.63).
@@ -304,6 +314,10 @@ The plan is in issues #37–#42 (below). The owner decided that the vocoder stay
 - **Speed tables.** Measure on an idle GPU: a busy GPU inflates RTF and TTFA 2–4×.
 - **Machine limits.** CPU quota ~7.7 cores: cap `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `NUMBA_NUM_THREADS` at 2–3
   and `num_workers` ≤ 3. Run pytest files one at a time under load; a combined run can exceed long timeouts.
+- **Losses on recordings meet digital silence.** A phase loss normalised by the STFT magnitude gave NaN on all-zero
+  training segments. Floor every normaliser (`phase_derivative_loss`).
+- **Measured GPU memory, not estimates.** NVIDIA's CQT-D at batch 16 × 16,384 samples needs 17 GB next to a Vocos
+  generator. Register the peak that `nvidia-smi` shows.
 - **Process management.** `pkill -f` / `pgrep -f` patterns can match the shell running them. Kill by PID, or use
   bracket patterns (`[p]attern`). Wait loops that `pgrep` their own pattern never end.
 
