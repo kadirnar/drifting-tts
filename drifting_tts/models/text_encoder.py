@@ -145,7 +145,13 @@ def duration_loss(logw: Tensor, logw_target: Tensor, x_mask: Tensor) -> Tensor:
 def durations_to_alignment(logw: Tensor, x_mask: Tensor, length_scale: float = 1.0) -> tuple[Tensor, Tensor]:
     """Predicted log-durations -> hard alignment ``[B, N, T]`` and mel lengths ``[B]``."""
     w = torch.exp(logw) * x_mask * length_scale
-    w_ceil = torch.ceil(w).clamp_min(0)[:, 0] * x_mask[:, 0]
+    return frames_to_alignment(torch.ceil(w).clamp_min(0)[:, 0], x_mask)
+
+
+def frames_to_alignment(w_ceil: Tensor, x_mask: Tensor) -> tuple[Tensor, Tensor]:
+    """Integer frames per token ``[B, N]`` (e.g. ground-truth MAS durations) -> hard alignment ``[B, N, T]`` and mel
+    lengths ``[B]``."""
+    w_ceil = w_ceil.to(x_mask.dtype) * x_mask[:, 0]
     y_len = w_ceil.sum(1).clamp_min(1).long()
     y_mask = sequence_mask(y_len)[:, None].to(x_mask.dtype)
     attn_mask = x_mask.transpose(1, 2) * y_mask
