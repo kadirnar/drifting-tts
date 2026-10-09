@@ -175,6 +175,7 @@ large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduce
 |---|---:|---:|---:|---:|
 | v3.1 (regressors) | 1.10% [0.44, 1.89] | 0.22% | 2.627 [2.585, 2.669] | 0.0153 |
 | flow matching, T 1 | 1.10% [0.44, 1.86] | 0.24% | 2.742 [2.695, 2.788] | 0.0272 |
+| flow matching, T 0.7 | 0.77% [0.22, 1.51] | 0.19% | 2.695 [2.641, 2.744] | 0.0220 |
 | flow matching, T 1, pitch only | 0.77% [0.22, 1.52] | 0.19% | 2.723 [2.683, 2.761] | 0.0210 |
 | drift, T 1 | 2.63% [1.61, 3.88] | 0.58% | 2.688 [2.642, 2.733] | 0.0182 |
 | drift, T 1, spread 0.8 | 1.87% [0.89, 2.98] | 0.48% | 2.702 [2.652, 2.754] | 0.0148 |
@@ -183,6 +184,7 @@ large-v3 on 8 kHz band-matched audio, UTMOSv2 full band). The v3.1 row reproduce
 | **drift, T 0.5, factors calibrated at T 0.5 (final)** | 0.99% [0.33, 1.73] | 0.22% | 2.712 [2.668, 2.757] | 0.0147 |
 | drift, T 1, pitch only | 0.77% [0.11, 1.55] | 0.13% | 2.693 [2.647, 2.738] | 0.0144 |
 | drift + BERTurk, T 1 | 4.50% [2.53, 6.69] | 1.09% | 2.647 [2.594, 2.699] | 0.0294 |
+| drift + BERTurk, T 0.5 | 1.65% [0.76, 2.67] | 0.34% | 2.669 [2.621, 2.717] | 0.0242 |
 | drift + BERTurk, T 1, pitch only | 0.66% [0.22, 1.21] | 0.16% | 2.643 [2.594, 2.688] | 0.0231 |
 
 - **The prosody temperature decides intelligibility.** With durations sampled at T 1, the drift sampler loses
@@ -293,14 +295,14 @@ equals the drift run (12k steps).
 | | pitch CRPS (all / studio) | pitch r (all / studio) | pitch spread | jitter | pre-mI / fall (st) | Freya-100 WER, T 1 / T 0.5 / pitch only |
 |---|---|---|---|---|---|---|
 | drift | 0.297 / 0.200 | 0.379 / 0.594 | 0.99 | 1.01 | −1.57 / −0.52 | 2.63% / 0.66% / 0.77% |
-| drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / (pending) / 0.66% |
+| drift + BERTurk | **0.283 / 0.190** | **0.435 / 0.639** | 0.97 | 1.04 | **−0.13 / −2.37** | 4.50% / 1.65% / 0.66% |
 | recordings | 0 | 1 | 1 | 1 | +0.05 / −4.24 | – |
 
 - **Word context makes the sampled tune more text-specific.** Pitch CRPS improves by 5%, correlation rises by
   0.05–0.06, and the polar-question shape (the pitch before mI, the final fall) moves towards the recordings, at the
   same distributional match.
-- **It does not help the durations on out-of-domain text.** At T 1 the BERTurk sampler's sampled durations are
-  worse for intelligibility on Freya-100 (WER 4.50%). With the regressors' durations (pitch only) it is as clean
+- **It does not help the durations on out-of-domain text.** The BERTurk sampler's sampled durations are worse for
+  intelligibility on Freya-100 (WER 4.50% at T 1, 1.65% at T 0.5, against 2.63% / 0.66–0.99% without it). With the regressors' durations (pitch only) it is as clean
   as v3.1.
 - **Cost:** BERTurk adds ~40 ms per sentence on the busy GPU and a `transformers` dependency at inference. A smaller
   cased encoder (ELECTRA-small-tr, 13.7 M, MIT) and fine-tuning (Kenter et al. 2020) are the obvious next steps;
