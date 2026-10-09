@@ -54,8 +54,8 @@ is the index and the place to start before planning new work.
 | latents | fine-tuning the VAE decoder on generated latents | **the fix for the noise**: DAC-VAE WER 9.55% → 1.32%, UTMOSv2 1.84 → 2.71 | ✅ on the Hub | [LATENTS.md](LATENTS.md#fine-tuning-the-dac-vae-decoder-on-generated-latents-32) |
 | prosody | temperature / CFG as prosody knobs | no effect on intonation or rhythm | – | [§5](#5-robotic-prosody-diagnosis-and-research) |
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
-| prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63) | opt-in probe | [PROSODY.md](PROSODY.md#inference-time-fixes) |
-| prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s) | opt-in | [PROSODY.md](PROSODY.md#pauses) |
+| prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
+| prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
 
 **Best systems on one protocol** (Freya-100):
 

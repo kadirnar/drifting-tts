@@ -32,7 +32,7 @@ import math
 import os
 import re
 from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -466,9 +466,12 @@ def run(args) -> None:
 
                         spk_ref.update({u.index: retry_oom(judges.sv, band_match(u.audio, 0)) for u in utts})
                 if missing_judges(rows[0], judges, s.name):  # e.g. a first pass with --asr / --mos / --sv none
-                    for r, u in zip(rows, utts):
+                    for r, u in zip(rows, utts):  # only the scores a row lacks
+                        need = replace(judges, asr=None if "hyp" in r else judges.asr,
+                                       mos=None if "mos" in r else judges.mos,
+                                       sv=None if s.name == "recording" or "speaker_sim" in r else judges.sv)
                         wav = torch.from_numpy(sf.read(wav_path(s, u), dtype="float32")[0])
-                        r.update(retry_oom(judge, judges, u.audio if s.name == "recording" else wav, u.text, band,
+                        r.update(retry_oom(judge, need, u.audio if s.name == "recording" else wav, u.text, band,
                                            spk_ref.get(u.index))[0])
                     cached.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
                     print(f"{s.name}: judges added", flush=True)
