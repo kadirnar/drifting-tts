@@ -58,6 +58,7 @@ is the index and the place to start before planning new work.
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
 | prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
 | prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
+| prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
 **Best systems on one protocol** (Freya-100):
 
@@ -310,6 +311,15 @@ The plan is in issues #37–#42 (below). The owner decided that the vocoder stay
 pitch through the frozen DiT lifts the DTW F0 correlation with the recording from 0.61 to 0.79 (copy synthesis 0.83)
 and the F0 std from 3.19 to 3.81 st (recordings 3.68). The DiT renders the token pitch it is given as faithfully as
 copy synthesis, so the deterministic pitch predictor, not the acoustic model, flattens the intonation.
+
+**Stochastic prosody predictor (#39, [PROSODY_MODEL.md](PROSODY_MODEL.md)).** An 8 M sampler, trained with the
+drifting objective on multi-scale feature maps of the per-token (log-duration, pitch) sequence, replaces the
+regressors at inference; the DiT is unchanged. On 100 held-out studio sentences the F0 std goes from 3.20 to 3.63 st
+(recordings 3.68, oracle prosody 3.81) and the internal pauses from 0.45 to 1.48 per utterance (1.39). At prosody
+temperature 0.5, Freya-100 stays as intelligible (WER 0.99%, CER 0.22%) and UTMOSv2 rises to 2.712. At T 1 the
+sampled durations cost intelligibility (WER 2.63%). Flow matching with the same backbone is the better per-token
+model (CRPS), but it is 10–14% flatter and needs 8 network evaluations. BERTurk word features help the pitch
+(polar questions) but not the durations.
 
 ## 6. Pitfalls and engineering notes
 
