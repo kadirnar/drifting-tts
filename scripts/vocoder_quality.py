@@ -9,9 +9,9 @@ held-out recordings (docs/VOCODERS.md, "Training Vocos further").
 * ``copy``: recorded mel -> vocoder against the recording, on the first ``--copy-num`` utterances of the ``val``
   split (``val``: all speakers, the set of ``resynthesis_benchmark.py``) or of speaker 722 in it (``studio``):
   log-mel L1 (the BigVGAN front end) and its mean bias per band in dB, multi-resolution log-STFT L1, UTMOSv2,
-  DNSMOS OVRL, and against the
-  recording's WORLD harvest F0: voicing decision error (VDE), gross pitch error (GPE, > 20% off), the RMS of the
-  other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output and recording. ``*_gta``
+  DNSMOS OVRL, and against the recording's WORLD harvest F0: voicing decision error (VDE), gross pitch error (GPE,
+  > 20% off), the RMS of the other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output
+  and recording. ``*_gta``
   sets vocode the acoustic model's mels of the same utterances under their ground-truth alignment and pitch (what
   the vocoder is fine-tuned on) instead; ``mel L1 to input`` compares the output's log-mel with the input mel.
 
