@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import soundfile as sf
@@ -36,6 +37,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help=">1 slower, <1 faster speech (on top of the calibrated duration_scale)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pause", type=float, default=0.15, help="seconds of silence between sentences")
+    p.add_argument("--pause-policy", choices=["fixed", "punct"], default="fixed",
+                   help="punct: silence by the sentence's final punctuation, measured on the training data "
+                        "(drifting_tts.prosody.PausePolicy; --pause-jitter > 0 varies it)")
+    p.add_argument("--pause-jitter", type=float, default=0.0, help="punct policy: fraction of the measured std")
     p.add_argument("--pitch-shift", type=float, default=0.0, help="semitones (models trained with pitch only)")
     p.add_argument("--steps", type=int, default=None, help="generator evaluations (default: as trained, 1-NFE)")
     p.add_argument("--attn-window", type=int, default=None,
@@ -62,6 +67,12 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
                         f"only; default: {default or stock}")
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
+
+
+def silence(pause: float | Callable[[str, random.Random], float], sentence: str, rng: random.Random) -> torch.Tensor:
+    """The silence after ``sentence``: ``pause`` seconds, or what a pause policy picks for it (e.g.
+    :class:`drifting_tts.prosody.PausePolicy`, by its final punctuation)."""
+    return torch.zeros(int((pause(sentence, rng) if callable(pause) else pause) * SAMPLE_RATE))
 
 
 def preferred_temperature(model) -> float:
@@ -188,13 +199,14 @@ class Synthesizer:
 
     @torch.no_grad()
     def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0,
-                 temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0, pause: float = 0.15,
-                 attn_window: int | None = None, pitch_shift: float = 0.0,
+                 temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0,
+                 pause: float | Callable[[str, random.Random], float] = 0.15, attn_window: int | None = None,
+                 pitch_shift: float = 0.0,
                  steps: int | None = None) -> tuple[torch.Tensor, dict]:
         spk, tempo = self._speaker(speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
         wavs, t_acoustic, t_vocoder = [], 0.0, 0.0
-        silence = torch.zeros(int(pause * SAMPLE_RATE))
+        rng = random.Random(seed)  # pause jitter only: the acoustic draws stay those of ``g``
         for sentence in split_sentences(normalize(text)):
             self._sync()
             t0 = time.perf_counter()
@@ -206,15 +218,15 @@ class Synthesizer:
             self._sync()
             t_acoustic += t1 - t0
             t_vocoder += time.perf_counter() - t1
-            wavs += [wav, silence]
+            wavs += [wav, silence(pause, sentence, rng)]
         wav = torch.cat(wavs[:-1]) if wavs else torch.zeros(0)
         dur = max(wav.numel() / SAMPLE_RATE, 1e-6)
         return wav, {"seconds": dur, "rtf_acoustic": t_acoustic / dur, "rtf_total": (t_acoustic + t_vocoder) / dur}
 
     @torch.no_grad()
     def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
-               length_scale: float = 1.0, seed: int = 0, pause: float = 0.15, first: int = 32,
-               chunk: int = 256) -> Iterator[torch.Tensor]:
+               length_scale: float = 1.0, seed: int = 0, pause: float | Callable[[str, random.Random], float] = 0.15,
+               first: int = 32, chunk: int = 256) -> Iterator[torch.Tensor]:
         """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
 
         Each sentence is generated in one pass. The vocoder then streams: the first ``first`` mel frames (0.34 s), then
@@ -224,11 +236,12 @@ class Synthesizer:
 
         spk, tempo = self._speaker(speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
-        silence = torch.zeros(int(pause * SAMPLE_RATE))
-        for k, sentence in enumerate(split_sentences(normalize(text))):
+        rng, previous = random.Random(seed), None
+        for sentence in split_sentences(normalize(text)):
             mel = self.stats.denormalize(self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo))
-            if k:
-                yield silence
+            if previous is not None:
+                yield silence(pause, previous, rng)
+            previous = sentence
             for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, context=self.vocoder.context,
                                         graphs=self.vocoder_graphs):
                 yield piece.cpu()
@@ -248,8 +261,13 @@ def run(args) -> None:
             print(f"{name:7s} speaker {v['id']}, median pitch {v['pitch_hz']} Hz{default}")
         return
     temperature = synth.default_temperature if args.temperature is None else args.temperature
+    pause = args.pause
+    if args.pause_policy == "punct":
+        from .prosody import PausePolicy
+
+        pause = PausePolicy.for_voice(synth.speaker_id(args.speaker), jitter=args.pause_jitter)
     kw = dict(speaker=args.speaker, cfg_scale=args.cfg, temperature=temperature,
-              length_scale=args.length_scale, seed=args.seed, pause=args.pause, attn_window=args.attn_window,
+              length_scale=args.length_scale, seed=args.seed, pause=pause, attn_window=args.attn_window,
               pitch_shift=args.pitch_shift, steps=args.steps)
     if args.text_file:
         out_dir = Path(args.out_dir)
