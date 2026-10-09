@@ -176,6 +176,39 @@ jobs, so no step rate is quoted):
 The SLM adds its frozen models (0.41 GB), the extra generator samples (~0.03 GB each) and a transient of ~0.12 GB
 per crop in a chunk while only the generator graph is alive.
 
+**Pilot (negative so far).** Setup:
+- Fine-tuned from v3.1 for 12k steps with `configs/tts_v3_slm.yaml`, at 10 conditions × 16 samples.
+- The vocoder in the loop was a frozen snapshot of the improved Vocos (20k steps of the Vocos v2 long run).
+- Snapshots were evaluated with the same vocoder on Freya-100 (studio voice, T 0.3, α 2, the scripts of
+  `vocoder_quality.py`).
+- The control is the identical fine-tune without the adversary.
+
+Measured cost and runs:
+- **Cost:** 19.1 GB vs 17.9 GB (nvidia-smi); 1.7 vs 2.3 it/s on a shared GPU, so −30% throughput.
+- **`real: audio`** was stopped at 2k steps, by the rule "stop if the discriminator gap stays > 0.6":
+  - D(real) 0.96 / D(fake) 0.03 after the 1k-step warm-up, then 0.98 / 0.02 by 2k;
+  - the acoustic model cannot remove what the discriminator keys on.
+- **`real: vocoded`:**
+  - the gap grew slowly, 0.27 → 0.48 over 12k steps, and the crop-gradient cap bound in > 99% of the steps;
+  - drift, prior, `across_sample_std` (0.209) and τ tracked the control to the third digit.
+
+| model | WER | CER | UTMOSv2 | DNSMOS OVRL | F0 micro-variation | periodicity |
+|---|---|---|---|---|---|---|
+| v3.1 | 0.66% | 0.14% | 2.918 | 3.344 | 0.398 | 0.708 |
+| SLM, `real: audio`, 2k | 0.77% | 0.18% | 2.929 | 3.350 | 0.392 | 0.707 |
+| SLM, `real: vocoded`, 2k / 6k / 12k | 0.55 / 0.66 / 0.77% | 0.14 / 0.16 / 0.16% | 2.928 / 2.951 / 2.942 | 3.354 / 3.353 / 3.347 | 0.391 / 0.400 / 0.387 | 0.708 / 0.709 / 0.709 |
+| control, 2k / 6k / 12k | 0.55 / 0.55 / 0.99% | 0.13 / 0.14 / 0.19% | 2.935 / 2.887 / 2.942 | 3.355 / 3.342 / 3.350 | 0.388 / 0.394 / 0.395 | 0.710 / 0.708 / 0.709 |
+
+**SLM minus control on the same sentences and seeds** (UTMOSv2, 95% bootstrap CI):
+- 2k: −0.007 [−0.052, +0.042]
+- 6k: +0.065 [+0.015, +0.114]; the control's 6k snapshot is its lowest.
+- 12k: −0.000 [−0.043, +0.043]
+
+The control's own snapshots vary by ±0.03 UTMOSv2. Word errors are 5–9 of 911 throughout.
+
+At this strength the adversary changes nothing that Freya-100's judges can see. The push it applies is about a
+quarter of the drift's.
+
 ## What to look at while training
 
 - **`train/centroid_mse`** should keep decreasing.

@@ -23,7 +23,8 @@ slm:
   crops_per_cond: 2          # 32 vocoded crops per step
   alpha: 1.0                 # extra samples at CFG scale 1, noise temperature 1: the data distribution, which the
   temperature: 1.0           # discriminator compares against (CFG > 1 samples are off it by design)
-  real: audio                # vocoded: compare through vocos-ft on both sides (no vocoder artefacts to detect)
+  real: vocoded              # real mel crops through the same vocoder. With the recordings (audio) the
+                             # discriminator wins on Vocos's own artefacts (D gap 0.96 at 2k steps; docs/TRAINING.md)
   disc_warmup: 1000
 
 train:
