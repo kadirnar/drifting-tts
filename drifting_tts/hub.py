@@ -24,7 +24,7 @@ PROSODY_MODELS: dict[str, tuple[str, str | None]] = {
 # v3.2 keeps v3.1's acoustic model: a new one is a change of ``model`` (e.g. "drifting_tts_v3.2.pt").
 RELEASES: dict[str, dict] = {
     "v3.1": {"model": "drifting_tts_v3.1.pt", "vocoder": "bigvgan-v2-ft", "prosody": None, "pause": 0.15},
-    "v3.2": {"model": "drifting_tts_v3.1.pt", "vocoder": "vocos-v2", "prosody": "drift", "pause": "punct"},
+    "v3.2": {"model": "drifting_tts_v3.2.pt", "vocoder": "vocos-v2", "prosody": "drift", "pause": "punct"},
 }
 LATEST = "v3.2"
 

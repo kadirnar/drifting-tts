@@ -121,6 +121,7 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     hub = tmp_path / "hub"
     hub.mkdir()
     _tts_file(hub / "drifting_tts_v3.1.pt")
+    _tts_file(hub / "drifting_tts_v3.2.pt")  # v3.1's acoustic weights, published with a sanitised config
     torch.save(_prosody_ck(), hub / "prosody_drift_v3.2.pt")
     monkeypatch.setenv(HUB_DIR_ENV, str(hub))
     synth = Synthesizer.from_pretrained("v3.2", "cpu", vocoder="griffin-lim")  # vocos-v2 needs the Hub
@@ -135,7 +136,7 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     p = argparse.ArgumentParser()
     add_args(p)
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--vocoder", "griffin-lim"]))
-    assert a == {"model_path": str(hub / "drifting_tts_v3.1.pt"), "vocoder": "griffin-lim", "prosody": "drift",
+    assert a == {"model_path": str(hub / "drifting_tts_v3.2.pt"), "vocoder": "griffin-lim", "prosody": "drift",
                  "pause": "punct"}
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody", "none", "--pause", "0.2"]))
     assert a["prosody"] is None and a["pause"] == 0.2 and a["vocoder"] == "vocos-v2"
