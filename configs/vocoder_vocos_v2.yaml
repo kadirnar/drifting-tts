@@ -1,7 +1,8 @@
 # Vocos on the BigVGAN mels of a trained TTS model, second recipe (docs/VOCODERS.md, "Training Vocos further"):
 # continues a finished `vocoder_vocos_bigvgan.yaml` run with the discriminators rebalanced (MRD weight 1, feature
-# matching x 2), BigVGAN-v2's multi-scale mel loss (x 15) instead of the single-scale one (x 45), and a cosine-decayed
-# learning rate. Same generator, ISTFT head and streaming context as `vocos-ft`.
+# matching x 2), BigVGAN-v2's multi-scale mel loss (x 15) instead of the single-scale one (x 45), an
+# instantaneous-frequency loss against the recording, and a cosine-decayed learning rate. Same generator, ISTFT head
+# and streaming context as `vocos-ft`. ~6.5 GB and ~4.5 it/s on an RTX 5090.
 base: vocoder_vocos_bigvgan.yaml
 
 vocoder:
@@ -19,6 +20,8 @@ train:
   mel_loss_coeff: 15.0     # first recipe: 45 (single scale)
   mrd_loss_coeff: 1.0      # first recipe: 0.1 (the Vocos authors advise 1.0 against buzz)
   fm_loss_coeff: 2.0
+  iaf_loss_coeff: 20.0     # frame-to-frame phase advance vs the recording (phase_derivative_loss): F0 jitter
+  iaf_on_gta: true         # on generated-mel batches too (their alignment and pitch are the recording's)
   disc_warmup_steps: 0     # the discriminators are already trained
   num_workers: 2
   save_every: 5000
