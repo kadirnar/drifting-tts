@@ -332,14 +332,17 @@ def phase_derivative_loss(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 102
     s_hat, s = (torch.stft(x.float(), n_fft, hop, n_fft, window, return_complex=True) for x in (y_hat, y))
 
     def advance(spec: torch.Tensor) -> torch.Tensor:
-        mag = spec.abs()
-        unit = spec / (mag + 1e-4 * mag.amax(dim=(1, 2), keepdim=True))
+        mag = (spec.real.square() + spec.imag.square() + 1e-12).sqrt()  # differentiable at 0, unlike abs()
+        unit = spec / (mag + 1e-4 * mag.amax(dim=(1, 2), keepdim=True) + 1e-7)
         return unit[..., 1:] * unit[..., :-1].conj()
+
+    def norm(z: torch.Tensor) -> torch.Tensor:
+        return (z.real.square() + z.imag.square() + 1e-12).sqrt()
 
     mag, a, b = s.abs(), advance(s_hat), advance(s)
     w = (mag[..., 1:] * mag[..., :-1]).sqrt()
     w = w / w.mean().clamp_min(1e-8)
-    return (w * (a.abs() * b.abs() - (a * b.conj()).real)).mean()  # |a| |b| (1 - cos), 0 for y_hat = y
+    return (w * (norm(a) * norm(b) - (a * b.conj()).real)).mean()  # |a| |b| (1 - cos), ~0 for y_hat = y
 
 
 def tc_scheduled(tc) -> bool:

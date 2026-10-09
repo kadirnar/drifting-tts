@@ -108,7 +108,7 @@ def test_phase_derivative_loss_ignores_shifts_and_sees_jitter():
     t = torch.arange(4 * 4096) / 24000
     tone = lambda f: sum(torch.sin(2 * torch.pi * k * f * t) / k for k in (1, 2, 3))[None]  # noqa: E731
     y = tone(120.0)
-    assert phase_derivative_loss(y, y) < 1e-6
+    assert phase_derivative_loss(y, y) < 1e-4
     shifted = torch.roll(y, 37, -1)  # a constant delay: the phase advance per frame does not change
     jitter = tone(120.0 * (1 + 0.03 * torch.sin(2 * torch.pi * 9 * t)))  # +-3% vibrato at 9 Hz
     assert phase_derivative_loss(shifted, y) < 0.1 * phase_derivative_loss(jitter, y)
@@ -124,3 +124,14 @@ def test_iaf_term_on_recorded_batches_only(tmp_path):
     assert "iaf" not in gan.step(mel, audio, 1)
     gan.batch_is_gta = False
     assert "iaf" in gan.step(mel, audio, 1)
+
+
+def test_phase_derivative_loss_is_finite_on_silence():
+    from drifting_tts.finetune_vocoder import phase_derivative_loss
+
+    y_hat = torch.zeros(2, 8192, requires_grad=True)
+    y = torch.zeros(2, 8192)
+    y[1] = 0.1 * torch.randn(8192)
+    loss = phase_derivative_loss(y_hat, y)
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(y_hat.grad).all()
