@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from .config import load_config, save_config
 from .drift import key_weight, kyutai_drift_loss
-from .models.prosody_net import ProsodyPredictor, prosody_features, summary_features, word_index
+from .models.prosody_net import ProsodyPredictor, boundary_tokens, prosody_features, summary_features, word_index
 from .text import PAD_ID
 from .utils import EMA, count_params, lr_lambda, save_checkpoint, seed_everything
 
@@ -242,10 +242,13 @@ def training_loss(pred: ProsodyPredictor, tts, b: dict, cfg, tau: torch.Tensor |
 # ---------------------------------------------------------------------------------------------------- metrics
 @torch.no_grad()
 def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: list[int], temperature: float,
-                 device, batch_size: int = 50, apply_scales: bool = False, spread: float = 1.0) -> list[dict]:
+                 device, batch_size: int = 50, apply_scales: bool = False, spread: float = 1.0,
+                 duration_temperature: float | None = None, rhythm: dict[int, int] | None = None) -> list[dict]:
     """Per utterance: ``frames`` ``[K, n]`` (integer), ``pitch`` (token pitch as fed to the generator, 0 unvoiced),
     ``pcont`` (the continuous contour) and ``voiced``, for ``K`` seeds. ``pred=None``: the TTS model's own
-    regressors (ceil of ``exp(logw)`` times its per-voice ``duration_scales``, as at inference)."""
+    regressors (ceil of ``exp(logw)`` times its per-voice ``duration_scales``, as at inference).
+    ``duration_temperature`` / ``rhythm`` (speaker -> the speaker whose durations it samples): as at inference
+    (``ProsodyPredictor.sample``)."""
     out = [None] * len(data)
     if spread != 1.0:  # every utterance is sampled 16 times in one batch
         batch_size = max(1, batch_size // 16)
@@ -259,10 +262,18 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
             res = [(fr, b["pitch_det"], b["pitch_det"], torch.ones_like(mask))] * len(seeds)
         else:
             cond, base, x_mask = encode(tts, pred, b)
+            dcond = None
+            dmask = ~boundary_tokens(b["ids"])  # as predict: the pauses keep the first row's durations ...
+            if rhythm and any(int(k) in rhythm for k in b["spk"]):
+                rs = torch.tensor([rhythm.get(int(k), int(k)) for k in b["spk"]], device=device)
+                dcond = encode(tts, pred, {**b, "spk": rs})[:2]
+                dmask = dmask | (rs != b["spk"])[:, None]  # ... unless the rhythm is borrowed
             res = []
             for seed in seeds:
                 g = torch.Generator(device=device).manual_seed(seed)
-                y, vlogit = pred.sample(cond, base, x_mask, temperature, generator=g, spread=spread)
+                y, vlogit = pred.sample(cond, base, x_mask, temperature, generator=g, spread=spread,
+                                        duration_temperature=duration_temperature, duration_cond=dcond,
+                                        duration_mask=dmask)
                 sc = 1.0
                 if apply_scales:
                     sc = torch.tensor([pred.duration_scales.get(int(k), 1.0) for k in b["spk"]], device=device)[:, None]
@@ -411,9 +422,14 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
 
 @torch.no_grad()
 def calibrate(pred: ProsodyPredictor, tts, cache: dict, device, temperature: float, speakers=(722, 389, 323),
-              num: int = 300, seed: int = 0, spread: float = 1.0) -> dict[int, float]:
+              num: int = 300, seed: int = 0, spread: float = 1.0, duration_temperature: float | None = None,
+              rhythm: dict[int, int] | None = None) -> dict[int, float]:
     """Per-voice duration factors of the sampler: the median recorded / sampled length over ``num`` *training*
-    utterances of each voice (never the evaluation splits), as ``calibrate-durations`` does for the regressors."""
+    utterances of each voice (never the evaluation splits), as ``calibrate-durations`` does for the regressors.
+    ``duration_temperature`` / ``rhythm``: the operating point of the sampled durations. A voice in ``rhythm``
+    samples another speaker's rhythm, and its factor brings that rhythm to the length of the voice's own regressor
+    durations (the release's speaking rate; its recordings' length would slow the articulation of a voice whose
+    recordings have long pauses)."""
     rng = np.random.default_rng(seed)
     scales = {}
     for spk in speakers:
@@ -421,11 +437,19 @@ def calibrate(pred: ProsodyPredictor, tts, cache: dict, device, temperature: flo
         if len(data) < 20:
             continue
         sub = data.subset(rng.choice(len(data), min(num, len(data)), replace=False))
-        samples = sample_split(pred, tts, sub, [seed], temperature, device, spread=spread)
-        r = [it["dur"].sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
+        samples = sample_split(pred, tts, sub, [seed], temperature, device, spread=spread,
+                               duration_temperature=duration_temperature, rhythm=rhythm)
+        if rhythm and spk in rhythm:  # the voice's regressor durations (ceil, its factor), as at inference
+            f = tts.duration_scales.get(int(spk), tts.duration_scale)
+            r = [np.ceil(np.exp(it["logw_det"]) * f).sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
+        else:
+            r = [it["dur"].sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
         scales[int(spk)] = float(np.median(r))
+        src = f", rhythm of {rhythm[spk]} against its regressors' length" if rhythm and spk in rhythm else ""
+        td = "" if duration_temperature is None else f", durations T={duration_temperature:g}"
         print(f"speaker {spk}: recorded / sampled length median {scales[spk]:.3f} (p10 {np.percentile(r, 10):.3f}, "
-              f"p90 {np.percentile(r, 90):.3f}) over {len(sub)} training utterances, T={temperature:g}", flush=True)
+              f"p90 {np.percentile(r, 90):.3f}) over {len(sub)} training utterances, T={temperature:g}{td}{src}",
+              flush=True)
     return scales
 
 
@@ -457,10 +481,12 @@ def run(args) -> None:
         path = work / "prosody_ema.pt"
         pred = ProsodyPredictor.load(path, device, tts=tts)
         ck = torch.load(path, map_location="cpu", weights_only=False)
+        dt, rhythm = cal.get("duration_temperature"), {int(k): int(v) for k, v in (cal.get("rhythm") or {}).items()}
         ck["duration_scales"] = calibrate(pred, tts, cache, device, cal.get("temperature", 1.0),
-                                          spread=cal.get("spread", 1.0))
+                                          spread=cal.get("spread", 1.0), duration_temperature=dt, rhythm=rhythm)
         ck["calibrate_temperature"], ck["calibrate_spread"] = cal.get("temperature", 1.0), cal.get("spread", 1.0)
         ck["temperature"] = cal.get("temperature", 1.0)  # the default of Synthesizer(prosody_temperature=None)
+        ck["duration_temperature"], ck["rhythm"] = dt, rhythm  # and of prosody_duration_temperature, the voices
         save_checkpoint(path, **ck)
         print(f"stored duration_scales {ck['duration_scales']} in {path}")
         return

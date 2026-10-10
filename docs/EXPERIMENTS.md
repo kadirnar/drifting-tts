@@ -61,6 +61,7 @@ is the index and the place to start before planning new work.
 | prosody | punctuation-aware pauses | the 0.15 s joins make the studio voice's sentence pauses 2.3× too long; the measured policy: 0.32 → 0.17 s (recordings 0.14 s), UTMOSv2 2.614 → 2.628 | opt-in | [PROSODY.md](PROSODY.md#pauses) |
 | release | **v3.2** = v3.1's acoustic weights + token pitch sampled by the drift predictor (T 0.5; durations stay v3.1's) + Vocos v2 (160k) + punctuation pauses | Freya-495 WER / UTMOSv2: studio 1.33% / 3.021 (v3.1 1.23% / 2.935), male 2.28% / 2.896 (1.74% / 2.814), female 3.99% / 2.722 (3.02% / 2.752); F0 std 3.53 st (recordings 3.68, v3.1 3.21); 89 M parameters instead of 180 M | ✅ `Synthesizer.from_pretrained("v3.2")` | [§9](#9-release-v32), [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses) |
 | release | the same with **sampled durations** too | Freya-495 WER male 5.78%, female 11.28% (studio 1.89%): word slips on new text for the voices with little data | ❌ as the default; opt-in for the studio voice, T ≤ 0.5 | [§9](#9-release-v32) |
+| prosody | sampled durations made safe: the letters' durations at prosody T 0.3, pauses and pitch at T 0.5 (inference only; a second row of the sampler's batch, also in the CUDA graphs) | studio Freya-495, 3 seed sets: WER 1.40% vs 1.36% for v3.2 (+0.04 pp; sampled at T 0.5: +0.32 pp), pauses / rate / F0 of the T 0.5 setting, UTMOSv2 +0.015; male / female: their own sampled rhythm reproduces irregular recordings, the studio voice's rhythm borrowed at T 0.3 with their own sentence edges still costs +0.61 / +0.40 pp | ✅ opt-in (`prosody_duration_temperature=0.3`), the demo's sampled rhythm (studio only) | [PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips) |
 | latency | the prosody predictor inside the acoustic model's CUDA graphs; graphs captured under `no_grad` | `fast=True` works with the predictor (v3.2 TTFA 5.8–7.4 ms on an idle RTX 5090, v3.1 + BigVGAN-v2-ft 12.3–13.8 ms); `fast=True` memory ~6 GB → 0.65 GB | ✅ | [§9](#9-release-v32) |
 | prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
 
@@ -444,6 +445,13 @@ and v3.1 + vocos-ft.
 - **What is left for the male and female voices.** Their WER stays above v3.1 + BigVGAN-v2-ft (2.28% vs 1.74%, 3.99%
   vs 3.02%). Part of it is the vocoder (female, regressors: BigVGAN-v2-ft 3.02%, Vocos v2 3.27%), part the sampled
   pitch.
+- **Sampled rhythm after the release** ([PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips)).
+  Listening, the owner preferred the sampled durations on the studio voice, so the slips were traced: they come
+  from the letters' durations at T 0.5, not from the pauses or the speaking rate. Letters at T 0.3 with pauses and
+  pitch at T 0.5 keep the liveliness (pauses, rate, F0 of the T 0.5 setting) at v3.2's intelligibility (Freya-495,
+  3 seed sets: 1.40% vs 1.36%). The male and female recordings are irregular (female: abrupt starts, 16.5% of the
+  letters at ≤ 2 frames) and the sampler reproduces them, so no temperature fixes those voices; borrowing the studio
+  voice's rhythm (with their own sentence edges) leaves +0.61 pp (male) and +0.40 pp (female) over three seed sets.
 
 **Dry run** (Freya-100, studio voice, sampled durations, the 10k-step Vocos v2 pilot standing in for the long run's
 snapshot, busy shared GPU, `scripts/eval_release.sh` with `STAGES=freya100` on the staged files). Both reference rows

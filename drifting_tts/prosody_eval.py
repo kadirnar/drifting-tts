@@ -93,6 +93,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--release-prosody-temperature", type=float, default=None, help="default: the checkpoint's")
     p.add_argument("--release-prosody-durations", choices=["sampled", "regressor"], default="sampled",
                    help="system 'release': regressor = only the token pitch is sampled (v3.2)")
+    p.add_argument("--release-prosody-duration-temperature", type=float, default=None,
+                   help="system 'release': noise temperature of the sampled durations (default: the checkpoint's, "
+                        "else --release-prosody-temperature)")
     p.add_argument("--release-vocoder", default=None, help="system 'release': its vocoder (default: --vocoder)")
     p.add_argument("--release-model", default=None, help="system 'release': its acoustic model (default: --model)")
     add_vocoder_args(p, default="vocos-ft")
@@ -215,7 +218,8 @@ class Runner:
             kw = {} if voc is None else {"vocoder": voc}
             if s.sampled:
                 kw.update(prosody=self.release["prosody"], prosody_temperature=self.release.get("prosody_temperature"),
-                          prosody_durations=self.release.get("prosody_durations", "sampled"))
+                          prosody_durations=self.release.get("prosody_durations", "sampled"),
+                          prosody_duration_temperature=self.release.get("prosody_duration_temperature"))
             self._synths[key] = base.variant(**kw)
         return self._synths[key]
 
@@ -474,6 +478,7 @@ def run(args) -> None:
     release = {"vocoder": args.release_vocoder, "prosody": args.release_prosody,
                "prosody_temperature": args.release_prosody_temperature,
                "prosody_durations": args.release_prosody_durations,
+               "prosody_duration_temperature": args.release_prosody_duration_temperature,
                "model": args.release_model if args.release_model not in (None, args.model) else None}
     runner = Runner(synth, speaker, args.temperature, args.cfg, release)
     utts = load_utterances(args, synth, speaker)
