@@ -51,6 +51,13 @@ audio, UTMOSv2 and DNSMOS P.835 on the full band). "Sampled durations" is the pr
   durations cause it, not Vocos v2. The errors are single-phone slips where the sampler places very short sounds
   ([PROSODY_MODEL.md](PROSODY_MODEL.md#guard-rails-freya-100)). `prosody_durations="sampled"` stays an opt-in for
   the studio voice at prosody temperature ≤ 0.5 (studio at 0.3: 1.46% / 3.035).
+- **Sampled rhythm, made safe (opt-in, studio voice).** The words are lost on the letters' durations, not on the
+  pauses: sampling the letters at prosody temperature 0.3 and the pauses and the pitch at 0.5
+  (`prosody_duration_temperature=0.3`) gives WER 1.40% against 1.36% for v3.2 over three seed sets (+0.04 pp
+  [−0.15, +0.24]; sampled durations at T 0.5: +0.32 pp) with the pauses, speaking rate and intonation of the T 0.5
+  setting (held-out studio texts: 2.37 pauses per utterance, F0 std 3.56) and UTMOSv2 3.032 (3.016). The male and
+  female voices stay +0.5 to +0.7 pp above v3.2 even with the studio voice's rhythm, so the demo keeps v3.2 for them
+  ([PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips)).
 
 **Freya-100** (the first 100 sentences, studio voice; the protocol of [EXPERIMENTS.md](EXPERIMENTS.md#protocols-and-judges)):
 

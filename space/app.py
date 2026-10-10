@@ -27,9 +27,10 @@ except ImportError:  # running locally
 DEVICE = os.environ.get("DEMO_DEVICE", "cuda")
 v32 = Synthesizer.from_pretrained("v3.2", DEVICE)  # vocos-v2, prosody="drift" (pitch only), pause="punct"
 v31 = v32.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)  # same acoustic model, loaded once
-# opt-in: the prosody model samples the durations (rhythm, pauses inside sentences) too; studio voice only, since the
-# voices with little data then slip on words (Freya-495 WER male 5.78%, female 11.28%)
-v32_rhythm = v32.variant(prosody=v32.prosody, prosody_durations="sampled")
+# opt-in: the prosody model samples the durations (rhythm, pauses inside sentences) too, the letters' durations at
+# prosody temperature 0.3 (at 0.5 they cost words: Freya-495 WER 1.89% against 1.33%), the pauses and the pitch at the
+# slider's; studio voice only, since the voices with little data still slip on words (docs/PROSODY_MODEL.md)
+v32_rhythm = v32.variant(prosody=v32.prosody, prosody_durations="sampled", prosody_duration_temperature=0.3)
 RHYTHM = "v3.2 + sampled rhythm (experimental, studio voice only)"
 RELEASES = {
     "v3.2 (new): sampled intonation, Vocos v2, punctuation pauses": v32,
@@ -64,8 +65,9 @@ the intonation is less flat; each seed gives another plausible tune. The male an
 intelligible than in v3.1.
 
 **v3.2 + sampled rhythm** (experimental) lets the prosody model sample the durations as well: a livelier rhythm with
-more pauses inside sentences (held-out studio texts: 2.35 pauses per utterance, against 1.39 in the recordings and
-1.54 for v3.2). Studio voice, Freya-495: WER 1.89% / UTMOSv2 3.03 at prosody temperature 0.5, 1.46% / 3.04 at 0.3.
+more pauses inside sentences (held-out studio texts: 2.37 pauses per utterance, against 1.39 in the recordings and
+1.54 for v3.2). The letters' durations are sampled at prosody temperature 0.3, the pauses and the pitch at the
+slider's. Studio voice, Freya-495 over three seed sets: WER 1.40% / UTMOSv2 3.03, against 1.36% / 3.02 for v3.2.
 The other voices have too little data for it, so with them this option falls back to v3.2.
 """
 
@@ -117,8 +119,8 @@ with gr.Blocks(title="Drifting TTS: one-step Turkish TTS") as demo:
                                      info="Classifier-free guidance learned at training time (free at inference)")
                 prosody_temperature = gr.Slider(
                     0.0, 1.0, value=v32.prosody_temperature, step=0.05, label="Prosody temperature (v3.2)",
-                    info="How freely the pitch (and, with sampled rhythm, the durations) is sampled: 0.5 is the "
-                         "tested setting; higher is more varied, 0 is the predictor's most typical reading")
+                    info="How freely the pitch (and, with sampled rhythm, the pauses) is sampled: 0.5 is the tested "
+                         "setting; higher is more varied, 0 is the predictor's most typical reading")
                 rate = gr.Slider(0.7, 1.4, value=1.0, step=0.05, label="Speaking rate")
                 seed = gr.Number(value=0, precision=0, label="Seed")
             button = gr.Button("Synthesise", variant="primary")
