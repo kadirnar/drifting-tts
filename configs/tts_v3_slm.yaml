@@ -1,0 +1,39 @@
+# Fine-tune v3.1 with an SSL adversarial term (issue #41; drifting_tts/slm.py): StyleTTS 2's WavLM discriminator on
+# vocoded crops of the generated mels, next to the drift, prior, duration and pitch losses. Vocos-ft and WavLM stay
+# frozen; the discriminator has its own AdamW and trains alone for the first `slm.disc_warmup` steps.
+# Needs the training data with audio (`prepare --save-audio`). Run from the directory that holds data/ and runs/:
+#   drifting-tts train --config configs/tts_v3_slm.yaml --workdir runs/slm_pilot
+base: tts_v3.yaml
+
+data:
+  root: data/tr12_eleven     # v3.1's corpus (studio voice 722 repeated twice)
+
+drift:
+  kyutai:
+    tau_init: 0.0636         # v3.1's learned kernel temperature (the release checkpoint does not store it)
+
+slm:
+  enabled: true
+  # Gradient norms at v3.1 (scripts/slm_probe.py): after 50 discriminator-only steps the unweighted LSGAN gradient on
+  # the generator is 28-40x the drift gradient (4-8 judged crops; ~0.5x with a fresh discriminator), orthogonal to
+  # it (|cos| < 0.07). weight 0.01 and the cap below keep the adversarial push at ~0.1-0.3x the drift's.
+  weight: 0.01
+  grad_clip: 0.01            # max norm of the weighted gradient w.r.t. the 32 judged crops (drift's: ~0.03 at 16 x 16)
+  fm_weight: 0.0             # L1 to the aligned real segment is a regression (pulls samples to the target): off
+  crops_per_cond: 2          # 32 vocoded crops per step
+  alpha: 1.0                 # extra samples at CFG scale 1, noise temperature 1: the data distribution, which the
+  temperature: 1.0           # discriminator compares against (CFG > 1 samples are off it by design)
+  real: vocoded              # real mel crops through the same vocoder. With the recordings (audio) the
+                             # discriminator wins on Vocos's own artefacts (D gap 0.96 at 2k steps; docs/TRAINING.md)
+  disc_warmup: 1000
+
+train:
+  init_from: runs/release/drifting_tts_v3.1.pt
+  init_calibration: true     # keep v3.1's per-voice duration factors and T = 0.3 in the exports
+  steps: 25000
+  lr: 0.0001
+  warmup: 1000
+  num_workers: 2
+  sample_every: 5000
+  save_every: 2500
+  keep_snapshots: true       # model_ema_<step>.pt: pick the snapshot on Freya-100

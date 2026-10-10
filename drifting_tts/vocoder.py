@@ -456,6 +456,13 @@ class Vocoder:
             wav = self.model(x)
         return wav.clamp(-1, 1)
 
+    def differentiable(self, log_mel: Tensor) -> Tensor:
+        """Unclamped ``[B, T * 256]`` waveform with gradients to ``log_mel``, for losses through a frozen vocoder
+        (training the acoustic model, ``drifting_tts.slm``). Vocos on BigVGAN mels only: its ISTFT head is cheap."""
+        if self.kind != "vocos" or self.mel != "bigvgan" or self.noise:
+            raise ValueError(f"{self.name or self.kind}: only a Vocos vocoder on BigVGAN mels is supported here")
+        return self._vocos_bigvgan(log_mel.to(self.device))
+
     def _vocos_bigvgan(self, x: Tensor) -> Tensor:
         """Vocos backbone + ISTFT head on BigVGAN-style mels, ``T * hop`` samples (a ``center`` head gives
         ``(T - 1) * hop``, so it gets one more, repeated frame)."""
