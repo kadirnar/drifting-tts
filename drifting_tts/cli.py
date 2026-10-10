@@ -14,11 +14,14 @@ COMMANDS: dict[str, str] = {
     "train": "drifting_tts.train",
     "synthesize": "drifting_tts.synthesize",
     "evaluate": "drifting_tts.evaluate",
+    "prosody": "drifting_tts.prosody_eval",
     "benchmark": "drifting_tts.benchmark",
     "merge-data": "drifting_tts.merge_data",
     "calibrate-durations": "drifting_tts.calibrate",
     "finetune-vocoder": "drifting_tts.finetune_vocoder",
     "extract-latents": "drifting_tts.extract_latents",
+    "prosody-cache": "drifting_tts.prosody_cache",
+    "train-prosody": "drifting_tts.train_prosody",
 }
 
 

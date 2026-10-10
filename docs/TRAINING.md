@@ -78,6 +78,23 @@ BigVGAN mel frames are uncentred: `F` frames correspond to `F·256` samples star
 builds BigVGAN's fused activation for the local GPU. It is 2.4–2.9× faster at inference, with SNR ≥ 51.6 dB against
 the PyTorch path.
 
+## Vocos fine-tuning
+
+`configs/vocoder_vocos_bigvgan.yaml` fine-tunes the pretrained `charactr/vocos-mel-24khz` on the model's mels: fresh MPD + MRD, 40k
+steps.
+`configs/vocoder_vocos_v2.yaml` continues that run (`train.init_from`) with a rebalanced loss: MRD × 1, feature
+matching × 2, BigVGAN-v2's multi-scale mel × 15, an instantaneous-frequency loss and a cosine learning rate. The
+pilots and measures are in [VOCODERS.md](VOCODERS.md#training-vocos-further).
+
+```bash
+drifting-tts finetune-vocoder --config configs/vocoder_vocos_v2.yaml --workdir runs/vocos_v2 \
+    tts.path=runs/tts_v3/model_ema.pt train.init_from=runs/vocos_bigvgan/last.pt
+```
+
+`train.speaker_balance` (any vocoder fine-tune, opt-in) gives chosen speakers fixed shares of the batches.
+`configs/vocoder_vocos_v2_balance.yaml` continues the Vocos v2 run with more of the `male` and `female` voices
+([VOCODERS.md](VOCODERS.md#speaker-balance)).
+
 ## GAN-free vocoder fine-tuning (drifting, experimental)
 
 `vocoder.objective: drift` fine-tunes a Vocos or a BigVGAN-base **without a discriminator**. The drifting field in a

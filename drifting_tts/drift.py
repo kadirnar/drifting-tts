@@ -162,6 +162,7 @@ def kyutai_drift_loss(
     affinity_floor: float = 1e-6,
     min_tau: float = 1e-3,
     min_scale: float = 1e-3,
+    row_weight: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
     """Kyutai's released drifting objective (pocket-tts ``training/modules/samplers.py``, class ``Drifting``).
 
@@ -177,6 +178,10 @@ def kyutai_drift_loss(
     * ``tau`` is trained only by ``-mean_rows max_i log sum_{j in pos} softmax_j(-d_ij / tau + log w_j)``: per
       row, the generated sample that puts the most kernel mass on the positives sets the temperature. The
       candidates are the positives, the siblings (self masked) and the extra negatives with multiplicity ``w``.
+
+    ``row_weight`` ``[B]`` (optional) weights the rows in the force normalisation, the temperature loss and the
+    info; weight-0 rows (e.g. padding, so that batches of variable length need no host sync to select rows) then
+    have no effect on the others.
 
     Shapes as in :func:`drift_force`; ``tau`` is a scalar tensor. Returns the per-row drift loss ``[B]``
     (gradient only w.r.t. ``gen``), the temperature loss (gradient only w.r.t. ``tau``) and an info dict
@@ -202,18 +207,24 @@ def kyutai_drift_loss(
         scale_inputs = scale / D**0.5  # per-row coordinates (:262-263)
         x_s, t_s = x / scale_inputs, targets / scale_inputs
 
+    if row_weight is None:
+        row_mean = lambda v: v.mean()  # noqa: E731
+    else:
+        rw = row_weight.float()
+        row_mean = lambda v: (v * rw).sum() / rw.sum().clamp_min(1e-8)  # noqa: E731
     logits = -dist_n / tau.float().clamp_min(min_tau)  # differentiable w.r.t. tau only
     with torch.no_grad():
         f = _product_field(logits.detach(), targets_w, G + N, t_s, x_s, affinity_floor)
         rms = (f**2).mean((1, 2)).clamp_min(1e-8).sqrt()
-        goal = x_s + f / rms.mean()  # normalize_force="batch": mean over rows of the per-row RMS (:239-241)
+        goal = x_s + f / row_mean(rms)  # normalize_force="batch": mean over rows of the per-row RMS (:239-241)
     loss = ((gen.float() / scale_inputs - goal) ** 2).mean(dim=(-1, -2))  # (:266)
 
     # tau as the calibration of a classifier that picks the data out of the candidates (:232, :268)
     log_p = torch.log_softmax(logits + targets_w.clamp_min(1e-12).log()[:, None, :], dim=-1)
     best = torch.logsumexp(log_p[..., G + N:], dim=-1).amax(dim=-1)  # [B]: max over the generated samples
-    tau_loss = -best.mean()
-    info = {"scale": scale.mean(), "force": (f**2).mean(), "p_data": best.detach().exp().mean()}
+    tau_loss = -row_mean(best)
+    info = {"scale": row_mean(scale[:, 0, 0]), "force": row_mean((f**2).mean((1, 2))),
+            "p_data": row_mean(best.detach().exp())}
     return loss, tau_loss, info
 
 

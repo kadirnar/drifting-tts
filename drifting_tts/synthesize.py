@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import soundfile as sf
@@ -22,7 +23,13 @@ DEFAULT_TEMPERATURE = 0.5  # CLI default noise temperature (lowest CER in the RE
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--model", default="runs/tts/model_ema.pt")
+    from .hub import RELEASES
+
+    p.add_argument("--release", choices=list(RELEASES), default=None,
+                   help="a published release of Vyvo/drifting-tts-tr (downloaded): its model, vocoder, prosody and "
+                        "pauses (v3.2: vocos-v2, the drift prosody predictor, --pause punct); --model / --vocoder / "
+                        "--prosody / --pause override them")
+    p.add_argument("--model", default=None, help="TTS checkpoint (default: the release's, else runs/tts/model_ema.pt)")
     p.add_argument("--text", help="text to synthesise (or use --text-file)")
     p.add_argument("--text-file", help="one utterance per line; writes <out-dir>/<n>.wav")
     p.add_argument("--speaker", default=DEFAULT_VOICE, help=f"voice: {' or '.join(VOICES)} (default: {DEFAULT_VOICE})")
@@ -35,11 +42,30 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--length-scale", type=float, default=1.0,
                    help=">1 slower, <1 faster speech (on top of the calibrated duration_scale)")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--pause", type=float, default=0.15, help="seconds of silence between sentences")
+    p.add_argument("--pause", type=pause_arg, default=None,
+                   help="silence between sentences: seconds, or 'punct' (by the sentence's final punctuation, "
+                        "measured per voice: drifting_tts.prosody.PausePolicy; --pause-jitter > 0 varies it); "
+                        "default: the release's, else 0.15")
+    p.add_argument("--pause-policy", choices=["fixed", "punct"], default="fixed", help="punct: as --pause punct")
+    p.add_argument("--pause-jitter", type=float, default=0.0, help="punct policy: fraction of the measured std")
     p.add_argument("--pitch-shift", type=float, default=0.0, help="semitones (models trained with pitch only)")
     p.add_argument("--steps", type=int, default=None, help="generator evaluations (default: as trained, 1-NFE)")
     p.add_argument("--attn-window", type=int, default=None,
                    help="sliding-window attention radius in tokens (2 frames each); default: full attention")
+    p.add_argument("--prosody", default=None,
+                   help="stochastic prosody predictor: 'drift' (the published one) or a checkpoint (train-prosody, "
+                        "prosody_ema.pt); 'none': the model's deterministic duration / pitch regressors (the default "
+                        "without --release)")
+    p.add_argument("--prosody-temperature", type=float, default=None,
+                   help="noise temperature of --prosody (default: its preferred one, else 1)")
+    p.add_argument("--prosody-spread", type=float, default=1.0,
+                   help="output-space temperature of --prosody (< 1: closer to its mean, flatter, less varied)")
+    p.add_argument("--prosody-duration-temperature", type=float, default=None,
+                   help="noise temperature of the sampled durations apart from the pitch's (default: the "
+                        "checkpoint's preferred one, else --prosody-temperature)")
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default=None,
+                   help="regressor: --prosody samples only the token pitch; durations stay the model's (default: the "
+                        "release's, else sampled)")
     add_vocoder_args(p)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,6 +84,41 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
 
 
+Pause = float | str | Callable[[str, random.Random], float]
+_KEEP = object()  # Synthesizer.variant: argument not given
+
+
+def pause_arg(value: str) -> float | str:
+    """``--pause``: seconds or ``punct[:<jitter>]``."""
+    try:
+        return float(value)
+    except ValueError:
+        if value.partition(":")[0] != "punct":
+            raise argparse.ArgumentTypeError(f"expected seconds or 'punct', got {value!r}") from None
+        return value
+
+
+def resolve_pause(pause: Pause, speaker_id: int, edge: float | None = None) -> float | Callable[[str, random.Random],
+                                                                                              float]:
+    """``pause``: seconds, a callable (e.g. a :class:`drifting_tts.prosody.PausePolicy`), or ``"punct"`` /
+    ``"punct:<jitter>"``: the voice's measured policy (``PausePolicy.for_voice``, with the generated sentences' edge
+    silence ``edge`` if known)."""
+    if not isinstance(pause, str):
+        return pause
+    name, _, jitter = pause.partition(":")
+    if name != "punct":
+        raise ValueError(f"pause must be seconds, a callable or 'punct[:<jitter>]', got {pause!r}")
+    from .prosody import PausePolicy
+
+    return PausePolicy.for_voice(speaker_id, jitter=float(jitter or 0.0), edge=edge)
+
+
+def silence(pause: float | Callable[[str, random.Random], float], sentence: str, rng: random.Random) -> torch.Tensor:
+    """The silence after ``sentence``: ``pause`` seconds, or what a pause policy picks for it (e.g.
+    :class:`drifting_tts.prosody.PausePolicy`, by its final punctuation)."""
+    return torch.zeros(int((pause(sentence, rng) if callable(pause) else pause) * SAMPLE_RATE))
+
+
 def preferred_temperature(model) -> float:
     """The checkpoint's preferred noise temperature (``calibrate-durations --temperature``), else 0.5."""
     t = getattr(model, "temperature", None)
@@ -66,7 +127,10 @@ def preferred_temperature(model) -> float:
 
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
-                 cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False):
+                 cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False,
+                 prosody: str | Path | None = None, prosody_temperature: float | None = None,
+                 prosody_spread: float = 1.0, prosody_durations: str = "sampled", pause: Pause = 0.15,
+                 prosody_duration_temperature: float | None = None):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
         checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
         latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
@@ -74,7 +138,14 @@ class Synthesizer:
         ``fast`` (CUDA): the acoustic model and the streaming vocoder's windows run as CUDA graphs
         (:mod:`drifting_tts.fast`), captured here (about 2 s); the output is the same as without it. ``compile`` also
         fuses the DiT with ``torch.compile`` (about 20 s the first time) and ``tf32`` uses TF32 matmuls: both are
-        faster but change the output slightly (0.4-0.7 dB log-spectral distance with TF32)."""
+        faster but change the output slightly (0.4-0.7 dB log-spectral distance with TF32).
+        ``prosody``: a stochastic prosody predictor that samples the durations and token pitch instead of the
+        model's deterministic regressors: a name of :data:`drifting_tts.hub.PROSODY_MODELS` (``"drift"``,
+        downloaded) or a ``train-prosody`` checkpoint (see :meth:`set_prosody`).
+        ``pause``: the default silence between sentences of :meth:`__call__` / :meth:`stream` (seconds, a
+        :class:`~drifting_tts.prosody.PausePolicy`, or ``"punct"``: by punctuation, measured per voice).
+        :meth:`from_pretrained` builds a published release (v3.2: ``vocos-v2``, ``prosody="drift"``,
+        ``pause="punct"``)."""
         from .train import load_tts
         from .vocoder import load_vocoder
 
@@ -97,13 +168,103 @@ class Synthesizer:
         self.default_temperature = preferred_temperature(self.model)
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
-        self.acoustic, self.vocoder_graphs = None, None
+        self.acoustic, self.vocoder_graphs, self.prosody = None, None, None
+        self.fast, self._graph_opts = fast, {"compile": compile, "tf32": tf32}
+        resolve_pause(pause, 0)  # validate
+        self.pause = pause
+        self.set_prosody(prosody, prosody_temperature, prosody_spread, prosody_durations, prosody_duration_temperature)
         if fast:
-            from .fast import GraphedAcoustic
-
-            self.acoustic = GraphedAcoustic(self.model, compile=compile, tf32=tf32)
-            self.acoustic.warmup()
             self.vocoder_graphs = self._capture_vocoder()
+
+    @classmethod
+    def from_pretrained(cls, release: str | None = None, device: str = "cuda", **kw) -> Synthesizer:
+        """A published release of ``Vyvo/drifting-tts-tr`` (:data:`drifting_tts.hub.RELEASES`; default: the latest):
+        its acoustic model, vocoder, prosody source and pause rule, downloaded once. Keyword arguments override
+        them (``vocoder="bigvgan-v2-ft"``, ``prosody=None``, ``model=<path or Hub file>``) or pass other options
+        (``fast=True``, ``cuda_kernel=True``, ...).
+
+        ``v3.1``: BigVGAN-v2-ft, the deterministic regressors, 0.15 s pauses. ``v3.2``: the same acoustic model with
+        ``vocos-v2``, the ``drift`` prosody predictor (prosody temperature 0.5) and ``pause="punct"``."""
+        from .hub import LATEST, RELEASES, hub_file
+
+        release = release or LATEST
+        if release not in RELEASES:
+            raise ValueError(f"unknown release {release!r}; choose one of {', '.join(RELEASES)}")
+        opts = {**RELEASES[release], **kw}
+        model = str(opts.pop("model"))
+        return cls(model if Path(model).is_file() else hub_file(model, f"release {release}"), device, **opts)
+
+    def variant(self, vocoder=_KEEP, prosody=_KEEP, pause: Pause = _KEEP, prosody_temperature: float | None = None,
+                prosody_spread: float = 1.0, prosody_durations: str = "sampled",
+                prosody_duration_temperature: float | None = None) -> Synthesizer:
+        """A Synthesizer that shares this one's acoustic model (no second copy in memory) with another vocoder (a
+        registry name, a checkpoint or a loaded :class:`~drifting_tts.vocoder.Vocoder`), prosody source
+        (:meth:`set_prosody`) or default pause; arguments left out are kept. E.g. v3.1 next to v3.2:
+        ``Synthesizer.from_pretrained("v3.2").variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)``."""
+        import copy
+
+        from .vocoder import Vocoder, load_vocoder
+
+        other = copy.copy(self)
+        if vocoder is not _KEEP:
+            if self.backend in VAE_BACKENDS:
+                raise ValueError("a model trained on VAE latents keeps its decoder")
+            other.vocoder = vocoder if isinstance(vocoder, Vocoder) else load_vocoder(vocoder, self.device,
+                                                                                     backend=self.backend)
+            if other.vocoder.mel != self.backend:
+                raise ValueError(f"vocoder {other.vocoder.name!r} expects {other.vocoder.mel} mels")
+            other.vocoder_graphs = other._capture_vocoder() if self.fast else None
+        if prosody is not _KEEP:
+            other.set_prosody(prosody, prosody_temperature, prosody_spread, prosody_durations,
+                              prosody_duration_temperature)
+        if pause is not _KEEP:
+            resolve_pause(pause, 0)
+            other.pause = pause
+        return other
+
+    def set_prosody(self, prosody=None, temperature: float | None = None, spread: float = 1.0,
+                    durations: str = "sampled", duration_temperature: float | None = None) -> None:
+        """Where the durations and token pitch come from. ``prosody``: ``None`` (the model's deterministic
+        regressors), a :class:`~drifting_tts.models.prosody_net.ProsodyPredictor`, a name of
+        :data:`drifting_tts.hub.PROSODY_MODELS` (``"drift"``) or a ``train-prosody`` checkpoint.
+
+        The predictor samples with noise temperature ``temperature`` (``None``: the checkpoint's preferred one, else
+        1) and output-space temperature ``spread`` (:meth:`ProsodyPredictor.sample`); the seed of each call drives
+        it, before the DiT's noise. ``durations="regressor"`` keeps the model's durations (and per-voice factors) and
+        samples only the token pitch; otherwise its own per-voice duration factors replace the model's.
+        ``duration_temperature``: the noise temperature of the sampled durations apart from the pitch's
+        (``ProsodyPredictor.sample``; ``None``: the checkpoint's preferred one, else the prosody temperature of each
+        call). A voice listed in the predictor's ``rhythm`` table samples its durations as that speaker (its
+        rhythm, scaled to the voice's rate by ``duration_scales``) and its pitch as itself. With
+        ``fast``, a one-pass predictor (``drift`` / ``mse``, spread 1, no word features) runs in the acoustic model's
+        CUDA graphs (recaptured here); others run eagerly."""
+        if durations not in ("sampled", "regressor"):
+            raise ValueError(f"prosody_durations must be 'sampled' or 'regressor', got {durations!r}")
+        self.prosody, self.prosody_temperature = None, temperature
+        self.prosody_spread, self.prosody_durations = spread, durations
+        self.prosody_duration_temperature = duration_temperature
+        if prosody is not None:
+            from .models.prosody_net import ProsodyPredictor
+
+            self.prosody = (prosody if isinstance(prosody, ProsodyPredictor)
+                            else ProsodyPredictor.load(prosody, self.device, tts=self.model))
+            if temperature is None:
+                self.prosody_temperature = 1.0 if self.prosody.temperature is None else self.prosody.temperature
+            if duration_temperature is None:
+                self.prosody_duration_temperature = self.prosody.duration_temperature
+        if self.fast:
+            self._capture_acoustic()
+
+    def _capture_acoustic(self) -> None:
+        from .fast import GraphedAcoustic, graphable
+
+        self.acoustic = None
+        if not graphable(self.prosody, self.prosody_spread):
+            warnings.warn("this prosody predictor runs eagerly: only the vocoder windows use CUDA graphs", stacklevel=3)
+            return
+        self.acoustic = GraphedAcoustic(self.model, prosody=self.prosody, prosody_durations=self.prosody_durations,
+                                        duration_row=self._duration_row(), **self._graph_opts)
+        self.acoustic.warmup()
 
     def _capture_vocoder(self, first: int = 32, chunk: int = 256) -> dict | None:
         """CUDA graphs of the streaming vocoder's two window sizes, or ``None`` (eager windows) for a vocoder that
@@ -124,6 +285,25 @@ class Synthesizer:
             return None
         return graphs
 
+    def _duration_row(self) -> bool:
+        """Whether the sampled durations need their own row in the prosody predictor's batch: a duration
+        temperature of their own or a voice that borrows another speaker's rhythm."""
+        return (self.prosody is not None and self.prosody_durations == "sampled"
+                and (self.prosody_duration_temperature is not None or bool(self.prosody.rhythm)))
+
+    def _rhythm(self, speaker: str | int) -> tuple[torch.Tensor, float] | None:
+        """The speaker whose rhythm this voice's sampled durations borrow (``ProsodyPredictor.rhythm``) and the ratio of
+        the voice's regressor factor to its sampler factor (the sentence's edges keep its regressor durations), or
+        ``None``."""
+        if self.prosody is None or self.prosody_durations != "sampled":
+            return None
+        spk_id = self.speaker_id(speaker)
+        src = self.prosody.rhythm.get(spk_id)
+        if src is None or src == spk_id:
+            return None
+        own = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
+        return torch.tensor([src], device=self.device), own / self.prosody.duration_scales.get(spk_id, 1.0)
+
     def speaker_id(self, speaker: str | int) -> int:
         """A voice name (``male`` / ``female``), a training speaker ID, or a dataset speaker name."""
         if speaker in self.speakers and speaker not in VOICES:
@@ -135,60 +315,88 @@ class Synthesizer:
         spk_id = self.speaker_id(speaker)
         if spk_id >= self.model.encoder.spk.num_embeddings:
             raise ValueError(f"speaker {speaker!r} ({spk_id}) is not in this checkpoint")
-        tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
+        if self.prosody is not None and self.prosody_durations == "sampled":  # the sampler's own factors (1: none)
+            tempo = self.prosody.duration_scales.get(spk_id, 1.0)
+        else:
+            tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
         return torch.tensor([spk_id], device=self.device), tempo
 
     def _mel(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
              length_scale: float, attn_window: int | None = None, pitch_shift: float = 0.0,
-             steps: int | None = None) -> torch.Tensor:
-        """One normalised sentence -> normalised mel ``[1, n_mels, T]`` (CUDA graphs when ``fast`` allows it)."""
+             steps: int | None = None, prosody_temperature: float | None = None,
+             rhythm: tuple[torch.Tensor, float] | None = None) -> torch.Tensor:
+        """One normalised sentence -> normalised mel ``[1, n_mels, T]`` (CUDA graphs when ``fast`` allows it).
+        ``rhythm``: the speaker whose durations are sampled and the edge factor (:meth:`_rhythm`)."""
         ids = torch.tensor([text_to_ids(sentence, normalized=True)], device=self.device)
+        pt = self.prosody_temperature if prosody_temperature is None else prosody_temperature
+        dt = self.prosody_duration_temperature if self.prosody_durations == "sampled" else None
+        if dt is None and self._duration_row():  # the same row layout as the CUDA graphs
+            dt = pt
+        rs, edge_scale = (None, None) if rhythm is None else (rhythm[0], length_scale * rhythm[1])
         if self.acoustic is not None and attn_window is None and not pitch_shift and steps in (None, 1):
-            return self.acoustic(ids, spk, cfg_scale, temperature, length_scale, generator=g)
-        mel, _ = self.model.synthesize(ids, torch.tensor([ids.shape[1]], device=self.device), spk,
-                                       cfg_scale=cfg_scale, temperature=temperature, length_scale=length_scale,
-                                       generator=g, attn_window=attn_window, pitch_shift=pitch_shift, steps=steps)
+            return self.acoustic(ids, spk, cfg_scale, temperature, length_scale, generator=g,
+                                 prosody_temperature=1.0 if pt is None else pt, duration_temperature=dt,
+                                 rhythm=rs, edge_scale=edge_scale)
+        ids_len = torch.tensor([ids.shape[1]], device=self.device)
+        durations = pitch = None
+        if self.prosody is not None:  # sampled first, from the same generator as the DiT's noise
+            durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
+                                                    spread=self.prosody_spread, duration_temperature=dt,
+                                                    duration_speaker=rs, edge_scale=edge_scale)
+            if self.prosody_durations == "regressor":
+                durations = None
+        mel, _ = self.model.synthesize(ids, ids_len, spk, cfg_scale=cfg_scale, temperature=temperature,
+                                       length_scale=length_scale, generator=g, attn_window=attn_window,
+                                       pitch_shift=pitch_shift, steps=steps, durations=durations, pitch=pitch)
         return mel
 
     @torch.no_grad()
     def mels(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
-             length_scale: float = 1.0, seed: int = 0) -> list[torch.Tensor]:
+             length_scale: float = 1.0, seed: int = 0, prosody_temperature: float | None = None) -> list[torch.Tensor]:
         """The unnormalised log-mel ``[1, n_mels, T]`` of each sentence, with the same draws as :meth:`__call__`
         (whose waveform joins their vocoded sentences with ``pause`` seconds of silence)."""
         spk, tempo = self._speaker(speaker)
+        rhythm = self._rhythm(speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
-        return [self.stats.denormalize(self._mel(s, spk, g, cfg_scale, temperature, length_scale * tempo))
+        return [self.stats.denormalize(self._mel(s, spk, g, cfg_scale, temperature, length_scale * tempo,
+                                                 prosody_temperature=prosody_temperature, rhythm=rhythm))
                 for s in split_sentences(normalize(text))]
 
     @torch.no_grad()
     def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0,
-                 temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0, pause: float = 0.15,
-                 attn_window: int | None = None, pitch_shift: float = 0.0,
-                 steps: int | None = None) -> tuple[torch.Tensor, dict]:
+                 temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0, pause: Pause | None = None,
+                 attn_window: int | None = None, pitch_shift: float = 0.0, steps: int | None = None,
+                 prosody_temperature: float | None = None) -> tuple[torch.Tensor, dict]:
+        """``text`` -> waveform (CPU float tensor at 24 kHz) and timings. Sentence by sentence, each in one pass and
+        vocoded whole, joined by ``pause`` (default: the Synthesizer's; seconds, a callable or ``"punct"``).
+        ``prosody_temperature``: this call's noise temperature of the prosody predictor (default: the
+        Synthesizer's)."""
         spk, tempo = self._speaker(speaker)
+        rhythm = self._rhythm(speaker)
+        pause = self._pause(pause, speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
         wavs, t_acoustic, t_vocoder = [], 0.0, 0.0
-        silence = torch.zeros(int(pause * SAMPLE_RATE))
+        rng = random.Random(seed)  # pause jitter only: the acoustic draws stay those of ``g``
         for sentence in split_sentences(normalize(text)):
             self._sync()
             t0 = time.perf_counter()
             mel = self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo, attn_window,
-                            pitch_shift, steps)
+                            pitch_shift, steps, prosody_temperature, rhythm)
             self._sync()
             t1 = time.perf_counter()
             wav = self.vocoder(self.stats.denormalize(mel))[0].cpu()
             self._sync()
             t_acoustic += t1 - t0
             t_vocoder += time.perf_counter() - t1
-            wavs += [wav, silence]
+            wavs += [wav, silence(pause, sentence, rng)]
         wav = torch.cat(wavs[:-1]) if wavs else torch.zeros(0)
         dur = max(wav.numel() / SAMPLE_RATE, 1e-6)
         return wav, {"seconds": dur, "rtf_acoustic": t_acoustic / dur, "rtf_total": (t_acoustic + t_vocoder) / dur}
 
     @torch.no_grad()
     def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
-               length_scale: float = 1.0, seed: int = 0, pause: float = 0.15, first: int = 32,
-               chunk: int = 256) -> Iterator[torch.Tensor]:
+               length_scale: float = 1.0, seed: int = 0, pause: Pause | None = None,
+               first: int = 32, chunk: int = 256, prosody_temperature: float | None = None) -> Iterator[torch.Tensor]:
         """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
 
         Each sentence is generated in one pass. The vocoder then streams: the first ``first`` mel frames (0.34 s), then
@@ -197,23 +405,57 @@ class Synthesizer:
         from .fast import stream_vocoder
 
         spk, tempo = self._speaker(speaker)
+        rhythm = self._rhythm(speaker)
+        pause = self._pause(pause, speaker)
         g = torch.Generator(device=self.device).manual_seed(seed)
-        silence = torch.zeros(int(pause * SAMPLE_RATE))
-        for k, sentence in enumerate(split_sentences(normalize(text))):
-            mel = self.stats.denormalize(self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo))
-            if k:
-                yield silence
+        rng, previous = random.Random(seed), None
+        for sentence in split_sentences(normalize(text)):
+            mel = self.stats.denormalize(self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo,
+                                                   prosody_temperature=prosody_temperature, rhythm=rhythm))
+            if previous is not None:
+                yield silence(pause, previous, rng)
+            previous = sentence
             for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, context=self.vocoder.context,
                                         graphs=self.vocoder_graphs):
                 yield piece.cpu()
+
+    def _pause(self, pause: Pause | None, speaker: str | int):
+        """The pause of a call: ``"punct"`` uses the prosody predictor's measured edge silence of this voice when its
+        durations are sampled (``ProsodyPredictor.pause_edges``), else the table's (v3.1's regressors)."""
+        spk_id = self.speaker_id(speaker)
+        edge = None
+        if self.prosody is not None and self.prosody_durations == "sampled":
+            edge = self.prosody.pause_edges.get(spk_id)
+        return resolve_pause(self.pause if pause is None else pause, spk_id, edge)
 
     def _sync(self) -> None:
         if self.device.startswith("cuda"):
             torch.cuda.synchronize()
 
 
+def pipeline_args(args) -> dict:
+    """Synthesizer arguments of ``--release`` / ``--model`` / ``--vocoder`` / ``--prosody`` / ``--pause`` (the
+    explicit ones win over the release's)."""
+    from .hub import RELEASES, hub_file
+
+    rel = RELEASES[args.release] if getattr(args, "release", None) else {}
+    model = args.model or (hub_file(rel["model"], f"release {args.release}") if rel else "runs/tts/model_ema.pt")
+    prosody = args.prosody if args.prosody is not None else rel.get("prosody")
+    pause = args.pause if args.pause is not None else rel.get("pause", 0.15)
+    if getattr(args, "pause_policy", "fixed") == "punct":
+        pause = "punct"
+    if pause == "punct" and getattr(args, "pause_jitter", 0.0):
+        pause = f"punct:{args.pause_jitter}"
+    durations = getattr(args, "prosody_durations", None) or rel.get("prosody_durations", "sampled")
+    return {"model_path": model, "vocoder": args.vocoder or rel.get("vocoder"),
+            "prosody": None if str(prosody).lower() == "none" else prosody, "prosody_durations": durations,
+            "pause": pause}
+
+
 def run(args) -> None:
-    synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel)
+    synth = Synthesizer(device=args.device, cuda_kernel=args.cuda_kernel, prosody_temperature=args.prosody_temperature,
+                        prosody_spread=args.prosody_spread,
+                        prosody_duration_temperature=args.prosody_duration_temperature, **pipeline_args(args))
     if args.list_speakers:
         for name, v in VOICES.items():
             default = " (default)" if name == DEFAULT_VOICE else ""
@@ -221,7 +463,7 @@ def run(args) -> None:
         return
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     kw = dict(speaker=args.speaker, cfg_scale=args.cfg, temperature=temperature,
-              length_scale=args.length_scale, seed=args.seed, pause=args.pause, attn_window=args.attn_window,
+              length_scale=args.length_scale, seed=args.seed, attn_window=args.attn_window,
               pitch_shift=args.pitch_shift, steps=args.steps)
     if args.text_file:
         out_dir = Path(args.out_dir)

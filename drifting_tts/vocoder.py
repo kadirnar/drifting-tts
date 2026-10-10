@@ -19,10 +19,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .audio import HOP_LENGTH, N_FFT
+from .hub import HUB_REPO  # noqa: F401 (re-exported)
+from .hub import hub_file as _hub_file
 
 VOCOS_REPO = "charactr/vocos-mel-24khz"
 BIGVGAN_REPO = "nvidia/bigvgan_v2_24khz_100band_256x"
-HUB_REPO = "Vyvo/drifting-tts-tr"
 REVOX_REPO, REVOX_REVISION = "minori-live/revox-vocoder-1", "025862deee2003230d9d0fd8f3ad56a5bc09d31c"
 REVOX_CREDIT = (f"Minori Live — Revox Vocoder 1.0 (https://huggingface.co/{REVOX_REPO}), CC BY-NC-SA 4.0: "
                 "non-commercial use only")
@@ -58,6 +59,10 @@ VOCODERS: dict[str, VocoderEntry] = {
                                     "bigvgan_base_ft.pt", "runs/bigvgan_base_ft/bigvgan_ft.pt", context=16),
     "vocos-ft": VocoderEntry("vocos", "Vocos fine-tuned on this model's (BigVGAN-style) mels", VOCOS_REPO,
                              "vocos_ft.pt", "runs/vocos_bigvgan/vocos_ft.pt", context=32),
+    # vocos-ft trained further with configs/vocoder_vocos_v2.yaml (docs/VOCODERS.md): the vocoder of release v3.2
+    "vocos-v2": VocoderEntry("vocos", "Vocos-ft trained further: rebalanced GAN losses, multi-scale mel, "
+                             "instantaneous-frequency loss, cosine LR (release v3.2)", VOCOS_REPO, "vocos_v2.pt",
+                             context=32),
     "vocos": VocoderEntry("vocos", "charactr/vocos-mel-24khz, for models trained on Vocos mels", VOCOS_REPO,
                           context=32, mel="vocos"),
     "griffin-lim": VocoderEntry("griffin-lim", "mel pseudo-inverse + NNLS, then fast Griffin-Lim (no weights)",
@@ -66,6 +71,7 @@ VOCODERS: dict[str, VocoderEntry] = {
                           "('revox:<F0 source>[:dio|harvest]': griffin-lim, none or a registry vocoder)", REVOX_REPO,
                           context=None),
 }
+VOCODER_ALIASES = {"vocos-ft2": "vocos-v2"}  # the local name of vocos-v2 before it was published
 
 
 def build_vocos(init: str):
@@ -505,14 +511,7 @@ def _with_noise(v: Vocoder, noise: int, noise_seed: int | None) -> Vocoder:
 
 
 def _hub_checkpoint(name: str, filename: str) -> str:
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
-
-    try:
-        return hf_hub_download(HUB_REPO, filename)
-    except EntryNotFoundError as e:
-        raise FileNotFoundError(f"{name}: {HUB_REPO}/{filename} not found (not published yet, or offline); pass "
-                                "the checkpoint path instead") from e
+    return _hub_file(filename, name)
 
 
 def load_vocoder(spec: str | None = None, device: str = "cuda", cuda_kernel: bool = False,
@@ -528,6 +527,7 @@ def load_vocoder(spec: str | None = None, device: str = "cuda", cuda_kernel: boo
     fixed Gaussian noise from ``noise_seed``."""
     if spec is None:
         spec = "bigvgan-v2" if backend == "bigvgan" else "vocos"
+    spec = VOCODER_ALIASES.get(spec, spec)
     name, _, f0 = spec.partition(":")
     if name in VOCODERS and VOCODERS[name].kind == "revox":
         f0, _, method = f0.partition(":")
