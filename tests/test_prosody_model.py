@@ -210,3 +210,95 @@ def test_durations_at_their_own_temperature_and_with_a_borrowed_rhythm():
     torch.testing.assert_close(edged_f[edges], torch.ceil(torch.exp(logw[:, 0]) * 1.3)[edges])
     torch.testing.assert_close(edged_f[~edges], borrowed_f[~edges])
     assert edges.sum() == 5
+
+
+def _tiny_pred(**net):
+    cfg = {"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4, "noise_glob": 4,
+           "out_init": 1.0, **net}
+    return ProsodyPredictor(cfg, cond_dim=16 + 8 + 2).eval()
+
+
+def test_phase2_options_unset_keep_the_v32_sampler():
+    """Without sentence features, a context branch or a letter floor the predictor is v3.2's: a v3.2 ``net_cfg`` builds
+    the same network (context options without context are ignored) and ``predict`` is the condition, one draw (or
+    main's duration row), frames and pitch."""
+    base = _tiny_pred()
+    idle = _tiny_pred(sent_dim=0, ctx_pitch_only=True, ctx_boundaries=True, pitch_layers=3)  # no context: no branch
+    assert not idle.net.ctx_pitch_only and not idle.net.ctx_boundaries
+    def shapes(pred):
+        return {k: v.shape for k, v in pred.net.state_dict().items()}
+
+    assert shapes(idle) == shapes(base)
+    idle.net.load_state_dict(base.net.state_dict())
+    tts = _tiny_pitch_tts()
+    ids, lens, _ = _batch(["ali dün mü geldi? evet, geldi."])
+    spk = torch.tensor([1])
+    assert base.sent_tokens(ids, lens) is None and base.word_tokens(ids, lens) is None
+
+    def run(pred, **kw):
+        return pred.predict(tts, ids, lens, spk, 0.5, 1.2, generator=torch.Generator().manual_seed(5), **kw)
+
+    h, _, logw, x_mask = tts.encoder(ids, lens, spk)
+    cond, b0 = ProsodyPredictor.condition(tts, h, x_mask, spk, logw, base.stats)
+    ref = base.frames_and_pitch(*base._draw(cond, b0, x_mask, 0.5, torch.Generator().manual_seed(5), None), x_mask, 1.2)
+    for kw in ({}, {"duration_temperature": 0.3}, {"spread": 0.8}):
+        out = run(base, **kw)
+        assert all(torch.equal(a, b) for a, b in zip(run(idle, **kw), out))
+        assert all(torch.equal(a, b) for a, b in zip(run(base, min_letter_frames=0, rel_letter_floor=0, **kw), out))
+        if not kw:
+            assert all(torch.equal(a, b) for a, b in zip(out, ref))
+
+
+def test_floor_letters_raises_short_letters_only():
+    from drifting_tts.models.prosody_net import floor_letters
+
+    ids, _, mask = _batch(["ab c."])  # tokens: _ a _ b _ ' ' _ c _ . _
+    frames = torch.tensor([[1.0, 1, 1, 4, 1, 2, 1, 1, 0, 3, 1]])
+    out = floor_letters(frames, ids, min_frames=3)
+    assert out[0].tolist() == [1, 2, 1, 4, 1, 2, 1, 3, 0, 3, 1]  # a: 1+1 -> 3, c: 1+0 -> 3; blanks, space, '.' kept
+    ref = torch.full_like(frames, 4.0)
+    assert floor_letters(frames, ids, rel=0.5, ref_frames=ref)[0, 3].item() == 4  # b: 4+1 >= round(0.5 * 8)
+
+
+def test_sentence_features_mark_question_structure():
+    from drifting_tts.sentence_features import SENTENCE_FEATURES, sentence_features, sentence_type
+
+    col = {k: i for i, k in enumerate(SENTENCE_FEATURES)}
+    f = sentence_features("ali dün mü geldi? evet, geldi.")
+    assert f[:4, col["polar_q"]].all() and f[4:, col["statement"]].all()
+    assert f[1, col["mi_host"]] == 1 and f[2, col["mi"]] == 1 and f[3, col["post_mi"]] == 1
+    assert f[4, col["comma"]] == 1 and f[3, col["sentence_final"]] == 1 and f[5, col["last_sentence"]] == 1
+    assert sentence_type("toplantı saat kaçta başlıyor?".split()) == "wh_q"
+    assert sentence_type("çay mı yoksa kahve mi?".split()) == "polar_q"
+    assert sentence_type("hemen gel!".split()) == "exclamation"
+
+
+def test_context_pitch_branch_leaves_durations_alone():
+    torch.manual_seed(0)
+    net = ProsodyNet(10, d=16, layers=1, heads=2, ffn=32, noise_tok=2, noise_glob=2, word_dim=3, sent_dim=2,
+                     ctx_pitch_only=True, pitch_layers=1, out_init=1.0).eval()
+    mask, z, g = torch.ones(2, 1, 9), torch.randn(2, 2, 9), torch.randn(2, 2)
+    cond = torch.randn(2, 15, 9)
+    other = cond.clone()
+    other[:, 10:] = torch.randn(2, 5, 9)
+    a, b = net(cond, mask, z, g), net(other, mask, z, g)
+    assert a.shape == (2, 3, 9) and torch.equal(a[:, 0], b[:, 0]) and not torch.allclose(a[:, 1], b[:, 1])
+
+
+def test_boundary_tokens_and_the_boundary_branch():
+    from drifting_tts.models.prosody_net import boundary_tokens, sentence_tokens
+
+    ids, lens, _ = _batch(["ab cd, ef."])  # _ a _ b _ ' ' _ c _ d _ , _ ' ' _ e _ f _ . _
+    assert boundary_tokens(ids)[0].int().tolist() == [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1]
+    st = sentence_tokens(ids, lens, boundary=True)
+    assert st.shape[1] == 19 and torch.equal(st[0, -1].bool(), boundary_tokens(ids)[0])
+    torch.manual_seed(0)
+    net = ProsodyNet(10, d=16, layers=1, heads=2, ffn=32, noise_tok=2, noise_glob=2, sent_dim=19, ctx_pitch_only=True,
+                     ctx_boundaries=True, pitch_layers=1, out_init=1.0).eval()
+    N, z, g = ids.shape[1], torch.randn(1, 2, ids.shape[1]), torch.randn(1, 2)
+    cond = torch.cat([torch.randn(1, 10, N), st], 1)
+    other = cond.clone()
+    other[:, 10:28] = torch.randn(1, 18, N)  # other sentence features, same boundary channel
+    a, b = net(cond, torch.ones(1, 1, N), z, g), net(other, torch.ones(1, 1, N), z, g)
+    bnd = boundary_tokens(ids)[0]
+    assert torch.equal(a[0, 0, ~bnd], b[0, 0, ~bnd]) and not torch.allclose(a[0, 0, bnd], b[0, 0, bnd])
