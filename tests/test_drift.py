@@ -280,3 +280,15 @@ def test_max_locations_subsamples_large_maps_only():
     sub.backward()
     assert torch.isfinite(sub) and gen["big"].grad is not None
     assert (gen["big"].grad.abs().sum((0, 1, 3)) > 0).sum() == 10  # only the sampled locations get a gradient
+
+
+def test_kyutai_row_weight_zero_rows_have_no_effect():
+    """Weight-0 rows (padding) change neither the other rows' loss nor the temperature loss."""
+    g = torch.Generator().manual_seed(3)
+    x, y, tau = torch.randn(4, 6, 3, generator=g), torch.randn(4, 1, 3, generator=g), torch.tensor(0.5)
+    loss, tau_loss, info = kyutai_drift_loss(x, y, tau)
+    xp, yp = torch.cat([x, torch.zeros(2, 6, 3)]), torch.cat([y, torch.zeros(2, 1, 3)])
+    w = torch.tensor([1.0, 1, 1, 1, 0, 0])
+    loss_p, tau_loss_p, info_p = kyutai_drift_loss(xp, yp, tau, row_weight=w)
+    assert torch.allclose(loss, loss_p[:4], atol=1e-5) and torch.allclose(tau_loss, tau_loss_p, atol=1e-6)
+    assert torch.allclose(info["p_data"], info_p["p_data"], atol=1e-6)

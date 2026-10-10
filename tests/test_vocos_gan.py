@@ -137,3 +137,23 @@ def test_phase_derivative_loss_is_finite_on_silence():
     loss = phase_derivative_loss(y_hat, y)
     loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(y_hat.grad).all()
+
+
+def test_speaker_balance_is_opt_in():
+    from drifting_tts.data import BucketBatchSampler, WeightedBucketBatchSampler
+    from drifting_tts.finetune_vocoder import batch_sampler
+
+    class Items(list):  # what batch_sampler reads of a MelDataset
+        items = property(lambda self: self)
+
+        def frames(self, i):
+            return self[i]["frames"]
+
+    ds = items = Items({"spk_id": 7 if i < 90 else 3, "frames": 64 + i} for i in range(100))
+    tc = Config({"batch_frames": 1000, "batch_size": 4, "seed": 0})
+    assert type(batch_sampler(ds, tc)) is BucketBatchSampler  # every utterance once per epoch, as before
+    tc.speaker_balance = {"shares": {3: 0.5}, "temperature": 0.5}
+    sampler = batch_sampler(ds, tc)
+    assert isinstance(sampler, WeightedBucketBatchSampler)
+    drawn = [items[i]["spk_id"] for _ in range(20) for b in sampler for i in b]
+    assert abs(drawn.count(3) / len(drawn) - 0.5) < 0.05

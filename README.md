@@ -11,10 +11,19 @@ the learned-temperature recipe from [Kyutai's Pocket TTS](https://kyutai.org/blo
 
 | | |
 |---|---|
-| **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **1.23%** (Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 2.94 |
-| **Speed** (RTX 5090) | first audio after **12–14 ms** for any sentence length (streaming, CUDA graphs), 50–100× faster than real time |
-| **Size** | 67.7 M acoustic model + 112 M BigVGAN-v2 vocoder |
+| **Quality** | [Freya-TR-Eval](https://huggingface.co/datasets/freyavoice/freya-tr-eval) WER **1.33%** (v3.2, studio voice; v3.1 1.23%; Piper 3.76%, MMS-TTS 6.26% under the same protocol) · UTMOSv2 **3.02** (v3.1 2.94) |
+| **Intonation** (v3.2) | the pitch is **sampled** by a small model trained with drifting: pitch spread 3.53 semitones on held-out sentences (recordings 3.68, v3.1 3.21) |
+| **Speed** (RTX 5090) | first audio after **6–7 ms** for any sentence length (v3.2, streaming, CUDA graphs; v3.1: 12–14 ms), 200–600× faster than real time |
+| **Size** | 67.7 M acoustic model + 8.1 M prosody model + 13.5 M Vocos vocoder (v3.1: 67.7 M + 112 M BigVGAN-v2) |
 | **Voices** | `studio` (default), `male` and `female` |
+
+**New in v3.2:** v3.1's acoustic weights with three changes. The intonation (the pitch of every character) is
+sampled by a small prosody model trained with drifting, so each seed reads a sentence with another natural tune; the
+durations, i.e. the rhythm, stay v3.1's. A retrained Vocos vocoder (Vocos v2, 13.5 M) replaces BigVGAN-v2, and the
+pauses between sentences follow the punctuation. The studio voice is about as intelligible as in v3.1 and scores
+higher on UTMOSv2; the male and female voices lose some intelligibility (Freya WER 2.28% and 3.99%, against 1.74%
+and 3.02%) ([results](docs/RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)). v3.1 stays available
+unchanged.
 
 ## Listen
 
@@ -42,41 +51,55 @@ pip install "drifting-tts[bigvgan] @ git+https://github.com/kadirnar/drifting-tt
 
 ```python
 import soundfile as sf
-from huggingface_hub import hf_hub_download
 from drifting_tts.synthesize import Synthesizer
 
-repo = "Vyvo/drifting-tts-tr"
-tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft")
+tts = Synthesizer.from_pretrained("v3.2", "cuda")   # model, prosody predictor and Vocos v2 from Vyvo/drifting-tts-tr
 
-wav, info = tts("Merhaba, bu cümle tek adımda üretildi.", speaker="studio", cfg_scale=2.0, temperature=0.3)
+wav, info = tts("Merhaba, bu cümle tek adımda üretildi. Nasıl buldunuz?", speaker="studio", cfg_scale=2.0,
+                temperature=0.3, seed=0)
 sf.write("merhaba.wav", wav.numpy(), 24000)
 ```
 
 - `speaker`: `"studio"` (default, the clearest voice), `"male"` or `"female"`. Any of the model's 723 speaker
   IDs also works, e.g. `speaker=17`; [docs/SPEAKERS.md](docs/SPEAKERS.md) scores every one of them.
-- `temperature`: the noise level. 0.3 sounds clearest; higher values give more variety.
+- `seed`: v3.2 samples the intonation, so another seed gives another tune for the same text (with the same rhythm).
+- `temperature`: the noise level of the acoustic model. 0.3 sounds clearest; higher values give more variety.
+- `prosody_temperature` (v3.2, default 0.5, the tested setting): how freely the pitch is sampled; higher is more
+  varied.
+- `prosody_durations="sampled"` (opt-in): the prosody model also samples the durations, so the rhythm and the pauses
+  inside a sentence vary too. It costs intelligibility on new text for the voices with little data (Freya WER male
+  5.78%, female 11.28%); use it only with the studio voice (1.89%) and a prosody temperature of at most 0.5
+  ([details](docs/RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)).
 - `cfg_scale`: the guidance strength, learned during training, so it costs nothing at inference.
-- `vocoder`: `"bigvgan-v2-ft"` is the BigVGAN-v2 fine-tuned on this model's mels (downloaded from the Hub). Other
-  names: the stock NVIDIA `"bigvgan-v2"`, `"bigvgan-v1"` and `"bigvgan-base"` (14 M), or the weight-free
-  `"griffin-lim"`; a checkpoint path also works. [docs/VOCODERS.md](docs/VOCODERS.md) compares them.
+- `pause`: the silence between sentences: `"punct"` (v3.2: by the final punctuation, measured per voice) or seconds
+  (v3.1: 0.15).
+- **v3.1**, as released: `Synthesizer.from_pretrained("v3.1", "cuda")` (BigVGAN-v2-ft, deterministic pitch and
+  durations, 0.15 s pauses). Keyword arguments override a release's parts, e.g.
+  `from_pretrained("v3.2", vocoder="bigvgan-v2-ft")`; `tts.variant(...)` gives a second pipeline that shares the
+  acoustic model. The explicit form still works:
+  `Synthesizer(hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft")`.
+- `vocoder`: `"vocos-v2"` (v3.2) and `"bigvgan-v2-ft"` (v3.1) are fine-tuned on this model's mels (downloaded from
+  the Hub), as are `"vocos-ft"` and `"bigvgan-base-ft"`. Other names: the stock NVIDIA `"bigvgan-v2"`,
+  `"bigvgan-v1"` and `"bigvgan-base"` (14 M), or the weight-free `"griffin-lim"`; a checkpoint path also works.
+  [docs/VOCODERS.md](docs/VOCODERS.md) compares them.
+- `prosody`: `"drift"` (v3.2's predictor), `None` (the model's deterministic pitch regressor) or a checkpoint.
 - Numbers, dates, times, units, currencies and common abbreviations are read out in Turkish automatically.
 
-The same from the command line:
+The same from the command line (`--release` downloads the parts; `--model`, `--vocoder`, `--prosody` and `--pause`
+override them):
 
 ```bash
-hf download Vyvo/drifting-tts-tr --local-dir .
-drifting-tts synthesize --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --speaker female --cfg 2 \
+drifting-tts synthesize --release v3.2 --speaker female --cfg 2 --temperature 0.3 \
     --text "Merhaba, nasılsınız?" --out merhaba.wav
 ```
 
-**Lowest latency: streaming.** `fast=True` runs the acoustic model as CUDA graphs, with the same output. `stream()`
-yields the audio in pieces, and on an RTX 5090 the first piece (0.34 s) is ready after about 12 ms. The vocoder streams
-in overlapping windows whose pieces join into the whole-sentence audio; Freya WER and CER are unchanged
-([details](docs/RESULTS.md#latency-and-size)):
+**Lowest latency: streaming.** `fast=True` runs the acoustic model, the prosody predictor included, as CUDA graphs,
+with the same output. `stream()` yields the audio in pieces, and on an RTX 5090 the first piece (0.34 s) is ready
+after about 6–7 ms (v3.1 with BigVGAN-v2: 12–14 ms). The vocoder streams in overlapping windows whose pieces join into the whole-sentence audio;
+Freya WER and CER are unchanged ([details](docs/RESULTS.md#latency-and-size)):
 
 ```python
-tts = Synthesizer(hf_hub_download(repo, "drifting_tts_v3.1.pt"), "cuda", vocoder="bigvgan-v2-ft",
-                  cuda_kernel=True, fast=True)
+tts = Synthesizer.from_pretrained("v3.2", "cuda", fast=True)
 for piece in tts.stream("Merhaba! Bu ses parça parça, bekletmeden geliyor.", speaker="studio",
                         cfg_scale=2.0, temperature=0.3):
     play(piece)   # float32 tensor at 24 kHz
@@ -84,7 +107,8 @@ for piece in tts.stream("Merhaba! Bu ses parça parça, bekletmeden geliyor.", s
 
 ## In the browser (WebGPU)
 
-The model also runs entirely client-side with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): the
+The model (v3.1's pipeline: the v3.2 prosody predictor and Vocos v2 are not exported to ONNX yet) also runs entirely
+client-side with [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): the
 **[WebGPU demo](https://huggingface.co/spaces/Vyvo/drifting-tts-tr-webgpu)** downloads about 385 MB once, and after
 that the text never leaves the device. On an RTX 5090 in Chrome the first audio arrives after about 0.1 s, and
 speech is generated 12–22× faster than real time ([details](docs/RESULTS.md#in-the-browser-webgpu)).
@@ -121,6 +145,7 @@ host-ready audio; later chunks grow to reduce repeated vocoder work. `tts(text)`
 See [streaming, vocoders, memory settings and reproducible benchmarks](docs/MLX.md).
 
 - **Settings:** the same voices and options as the PyTorch API. The defaults are the recommended T = 0.3 and α = 2.
+  The MLX port runs v3.1's pipeline: the v3.2 prosody predictor and Vocos v2 are not ported yet.
 - **Vocoders:** BigVGAN-v2 by default; `Synthesizer.from_pretrained(vocoder="bigvgan-base-ft")` or `"vocos-ft"`
   (CLI `--vocoder`) uses a 14 M-parameter vocoder instead of 112 M ([quality](docs/VOCODERS.md),
   [MLX parity](docs/MLX.md#vocoders)). Only the chosen vocoder is downloaded.
@@ -144,7 +169,10 @@ Whisper large-v3, and both texts normalised the same way. Lower is better.
 
 | system | parameters | WER | CER |
 |---|---|---|---|
-| **drifting-tts v3.1, studio voice** | 68 M + 112 M vocoder | **1.23%** | **0.24%** |
+| **drifting-tts v3.2, studio voice** | 68 M + 8 M prosody + 14 M vocoder | **1.33%** | **0.27%** |
+| drifting-tts v3.2, male voice | 68 M + 8 M prosody + 14 M vocoder | 2.28% | 0.45% |
+| drifting-tts v3.2, female voice | 68 M + 8 M prosody + 14 M vocoder | 3.99% | 0.97% |
+| drifting-tts v3.1, studio voice | 68 M + 112 M vocoder | 1.23% | 0.24% |
 | drifting-tts v3.1, male voice | 68 M + 112 M vocoder | 1.74% | 0.38% |
 | drifting-tts v3.1, female voice | 68 M + 112 M vocoder | 3.02% | 0.70% |
 | Piper (tr, dfki) | 16 M | 3.76% (report: 4.4%) | 0.83% (1.1%) |
@@ -155,20 +183,25 @@ Whisper large-v3, and both texts normalised the same way. Lower is better.
 - Piper and MMS-TTS were re-run in this repository's harness. Their scores are close to those in the FreyaTTS
   report, so the numbers are comparable.
 - "report" values are copied from the FreyaTTS report (arXiv 2607.09530, Table 2).
-- Reproduce with `drifting-tts benchmark --model drifting_tts_v3.1.pt --vocoder bigvgan_v2_ft.pt --speaker studio`.
+- Reproduce with `drifting-tts benchmark --model drifting_tts_v3.2.pt --vocoder vocos-v2 --prosody drift
+  --prosody-durations regressor --pause punct --speaker studio` (v3.2; v3.1: `--model drifting_tts_v3.1.pt --vocoder
+  bigvgan-v2-ft`), or all rows with `scripts/eval_release.sh`.
 
 ## How it works
 
 ```
-text ─► Turkish normaliser ─► text encoder ─► durations + pitch ─► DriftDiT (1 pass) ─► mel ─► BigVGAN-v2 ─► audio
+text ─► Turkish normaliser ─► text encoder: durations ─► prosody model: pitch ─► DriftDiT (1 pass) ─► mel ─► Vocos ─► audio
 ```
 
-1. A text encoder predicts how long each character lasts and its pitch, then lays the text out over time.
+1. A text encoder reads the text and predicts how long each character lasts. A small prosody model, also trained
+   with drifting, samples the pitch of each character (v3.1: a deterministic regressor), and the text is laid out
+   over time.
 2. The **DriftDiT** generator turns random noise plus that layout into a mel spectrogram in one forward pass.
 3. Training uses a **drifting field**: generated samples are pulled toward real recordings and pushed away from each
    other, so the model's output distribution moves toward the data distribution. Similarity is measured in the
    features of a frozen mel autoencoder, with a learned kernel temperature.
-4. BigVGAN-v2, fine-tuned on the model's own spectrograms, turns the mel into a 24 kHz waveform.
+4. A vocoder fine-tuned on the model's own spectrograms (Vocos v2 in v3.2, BigVGAN-v2 in v3.1) turns the mel into a
+   24 kHz waveform.
 
 ## Train it yourself
 
@@ -200,6 +233,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/DESIGN.md](docs/DESIGN.md) | how the drifting method maps to TTS, deviations from the paper, related work |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | evaluation judges, the benchmark command, data scoring and filtering |
 | [docs/PROSODY.md](docs/PROSODY.md) | prosody metrics against recordings (`drifting-tts prosody`), oracle prosody, pitch gain, pause policy |
+| [docs/PROSODY_MODEL.md](docs/PROSODY_MODEL.md) | the stochastic prosody predictor of v3.2 (drifting), against regression and flow matching |
 | [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM): the backends, their resynthesis ceiling, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
 | [docs/POCKET_TTS_GATE.md](docs/POCKET_TTS_GATE.md) | a Turkish Pocket TTS (autoregressive, Mimi latents) on Freya-100 with our judges and prosody metrics, and the Mimi codec gate (#42) |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
@@ -207,13 +241,18 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
+| [scripts/eval_release.sh](scripts/eval_release.sh) | the evaluation of a release against v3.1 (Freya, prosody); `scripts/prepare_release.py` stages its files |
 | [scripts/compare_vocoders.py](scripts/compare_vocoders.py) | vocoder comparison ([docs/VOCODERS.md](docs/VOCODERS.md)) |
 
 ## Limitations
 
 - **Voices:** three built-in voices; no voice cloning from a reference recording.
-- **Prosody:** durations and pitch come from simple predictors. Intonation is natural but flatter than in real speech.
-- **Naturalness:** measured only with an automatic score (UTMOSv2), not by listeners.
+- **Prosody:** v3.2 samples the intonation with the recordings' spread, but the rhythm still comes from a
+  deterministic duration predictor, and each sentence is generated without the context of its neighbours. Sampling
+  the durations too (opt-in) costs intelligibility for the male and female voices.
+- **Intelligibility:** v3.2's male and female voices are less intelligible than v3.1's (Freya WER 2.28% and 3.99%
+  against 1.74% and 3.02%); `from_pretrained("v3.1")` remains available.
+- **Naturalness:** measured only with automatic scores (UTMOSv2, DNSMOS, F0 statistics), not by listeners.
 
 ## Citation and license
 
@@ -226,5 +265,5 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 }
 ```
 
-The code is MIT. The vocoder is fine-tuned from
-[NVIDIA BigVGAN-v2](https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x) (MIT).
+The code is MIT. The vocoders are fine-tuned from [charactr/vocos-mel-24khz](https://huggingface.co/charactr/vocos-mel-24khz)
+(MIT; v3.2) and [NVIDIA BigVGAN-v2](https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x) (MIT; v3.1).

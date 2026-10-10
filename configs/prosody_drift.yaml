@@ -1,0 +1,55 @@
+# Stochastic prosody predictor (#39) for a pitch-conditioned TTS model: `drifting-tts train-prosody`.
+# Needs the model's prosody targets: `drifting-tts prosody-cache --model <tts.pt> --out <cache.pt>`.
+tts: runs/release/drifting_tts_v3.1.pt   # frozen TTS model (encoder states, speaker table, regressors)
+cache: runs/pm_cache/targets_v31.pt      # its prosody targets (MAS durations, token pitch)
+
+net:
+  kind: drift            # drift | mse (regression baseline) | flow (flow-matching baseline)
+  d: 256
+  layers: 4
+  heads: 4
+  ffn: 1024
+  dropout: 0.0
+  noise_tok: 16          # per-token noise channels (drift)
+  noise_glob: 32         # utterance-level noise vector (drift)
+  out_init: 0.1          # output layer scale at init: starts close to the regressors' predictions
+  word_dim: 0            # > 0: contextual word features from the cache (prosody-cache --word-model; set from it)
+
+drift:
+  gen_per_cond: 16       # G samples per utterance; the recording's prosody is the one positive
+  tau_init: 1.0          # Kyutai's learned temperature (raw, one for all maps)
+  pools: [3, 9, 27]      # masked mean over k tokens (stride k // 2)
+  windows: [8, 32]       # whole windows of k tokens flattened (local contour / rhythm shape)
+  key_weights: {}        # per-map multipliers: tok, d1, avg<k>, win<k>, word, utt
+
+loss:
+  voiced: 0.1            # voicing BCE (unvoiced tokens get pitch 0, as in training the generator)
+
+flow:
+  steps: 8               # Euler steps at inference (kind flow)
+  t_per_cond: 4
+
+eval_split: dev           # token-level metrics during training (dev_history.json); checkpoints are picked on dev
+eval_temperatures: [1.0, 0.7]
+
+train:
+  seed: 0
+  steps: 20000
+  batch_size: 16
+  lr: 0.0003
+  weight_decay: 0.0
+  warmup: 500
+  schedule: const
+  grad_clip: 3.0
+  ema_decay: 0.999
+  log_every: 100
+  eval_every: 2000
+  save_every: 2000
+
+calibrate:                 # per-voice duration factors at the end of training (median recorded / sampled length
+  enabled: true            # on training utterances); re-run: train-prosody --calibrate-only calibrate.temperature=T
+  temperature: 1.0
+  spread: 1.0              # output-space temperature of the operating point (the length depends on it)
+  duration_temperature: null  # the letters' durations at their own noise temperature (null: temperature; the pauses
+                           # keep it); stored as the preferred one
+  rhythm: {}               # voice -> speaker whose rhythm its sampled durations borrow, e.g. {389: 722, 323: 722}

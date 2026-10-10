@@ -18,6 +18,8 @@ GAN objective:
   ``decoder_ft.pt`` for ``LatentVocoder`` / ``Synthesizer(vocoder=...)``.
 
 ``vocoder.objective: drift`` trains either architecture without a GAN (:class:`DriftVocoder`, ``drift_vocoder.py``).
+``train.speaker_balance`` (any trainer, opt-in) gives chosen speakers fixed shares of the batches and splits the rest
+over the other speakers by their amount of audio raised to a temperature (:func:`batch_sampler`).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from torch.utils.data import DataLoader
 from .alignment import sequence_mask
 from .audio import HOP_LENGTH, SAMPLE_RATE
 from .config import load_config, save_config
-from .data import BucketBatchSampler, MelDataset, MelStats, collate
+from .data import BucketBatchSampler, MelDataset, MelStats, WeightedBucketBatchSampler, collate, speaker_balance_weights
 from .models import bigvgan_disc as bd
 from .models.text_encoder import align, token_pitch
 from .utils import count_params, infinite, save_checkpoint, seed_everything
@@ -806,6 +808,26 @@ def build_trainer(cfg, device, arch: str, mel: str):
     return BigVGANGAN(cfg, device) if arch == "bigvgan" else VocosGAN(cfg, device, mel=mel)
 
 
+def batch_sampler(ds: MelDataset, tc) -> BucketBatchSampler:
+    """Every training utterance once per epoch, or with ``train.speaker_balance`` (``shares``: ``{speaker id:
+    share of the draws}``; ``temperature``: how the rest is split, :func:`~drifting_tts.data.speaker_balance_weights`)
+    ``len(ds)`` draws with replacement per epoch."""
+    lengths, kw = [ds.frames(i) for i in range(len(ds))], dict(max_frames=tc.batch_frames, max_batch=tc.batch_size,
+                                                                 seed=tc.seed)
+    sb = tc.get("speaker_balance")
+    if not sb:
+        return BucketBatchSampler(lengths, **kw)
+    speakers = [e["spk_id"] for e in ds.items]
+    shares = {int(k): v for k, v in (sb.get("shares") or {}).items()}
+    weights = speaker_balance_weights(speakers, lengths, shares, sb.get("temperature", 1.0))
+    drawn = {s: sum(w for w, t in zip(weights, speakers) if t == s) for s in shares}
+    natural = {s: speakers.count(s) / len(speakers) for s in shares}
+    print("speaker balance: " + ", ".join(f"{s} {100 * drawn[s]:.1f}% (was {100 * natural[s]:.2f}%)" for s in shares)
+          + f", {len(set(speakers)) - len(shares)} other speakers {100 * (1 - sum(drawn.values())):.1f}% "
+          f"(temperature {sb.get('temperature', 1.0)})", flush=True)
+    return WeightedBucketBatchSampler(lengths, weights, **kw)
+
+
 @torch.no_grad()
 def log_samples(gan, tts, batch: dict, stats: MelStats, tc, writer, step: int, device) -> None:
     """Full validation utterances: the vocoder on GTA mels and on recorded mels, plus the real audio."""
@@ -858,8 +880,7 @@ def run(args) -> None:
     d = cfg.data
     ds = MelDataset(d.root, "train", min_quality=d.min_quality, min_frames=min_frames, max_frames=d.max_frames,
                     with_audio=True, with_f0=tts.pitch_enabled, filters=d.get("filters"))
-    sampler = BucketBatchSampler([ds.frames(i) for i in range(len(ds))], max_frames=tc.batch_frames,
-                                 max_batch=tc.batch_size, seed=tc.seed)
+    sampler = batch_sampler(ds, tc)
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=tc.num_workers,
                         pin_memory=True, persistent_workers=tc.num_workers > 0)
     print(f"{arch} vocoder on {backend} {'latents' if vae else 'mels'} {gan.n_gen:.1f}M, "
