@@ -198,6 +198,10 @@ The existing voices kept their quality. Their Freya WER went from 1.92% to 1.74%
 
 ## Latency and size
 
+Under load, with the method in detail: [LATENCY.md](LATENCY.md). With 64 / 128 / 256 requests arriving at once, v3.2
+served one request after another gives the last one its first audio after 0.81 / 1.64 / 3.19 s; one batched pass
+gives every request its first audio after 71 / 150 / 304 ms.
+
 **Setup:** RTX 5090, PyTorch 2.11, T = 0.3, α = 2, `studio` voice, fine-tuned BigVGAN-v2 with its CUDA kernel
 (`--cuda-kernel`). Each value is the median of 100 runs after warm-up, measured with `scripts/bench_ttfa.py --mode
 <mode>`. **TTFA** (time to first audio) runs from the input text to the first audio on the host.

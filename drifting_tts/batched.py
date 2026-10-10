@@ -85,10 +85,11 @@ def acoustic_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temp
 
 def batchable(synth) -> bool:
     """Whether :func:`synth_mels` supports this Synthesizer's prosody source: none, or a one-pass predictor without
-    a duration row of its own (no separate duration temperature, no borrowed rhythm)."""
+    a duration row of its own (no separate duration temperature, no borrowed rhythm) and no second pitch predictor."""
     from .fast import graphable
 
-    return graphable(synth.prosody, synth.prosody_spread) and not synth._duration_row()
+    return (graphable(synth.prosody, synth.prosody_spread) and not synth._duration_row()
+            and getattr(synth, "prosody_pitch", None) is None)
 
 
 @torch.no_grad()
@@ -99,7 +100,7 @@ def synth_mels(synth, sentences: list[str], speaker, cfg_scale: float, temperatu
     voice's duration factor: normalised ``sentences`` -> normalised mels ``[B, n_mels, T]`` and lengths ``[B]``."""
     if not batchable(synth):
         raise NotImplementedError("batched synthesis supports no prosody predictor or a one-pass one (drift / mse) "
-                                  "without a duration temperature or rhythm of its own")
+                                  "without a duration temperature, rhythm or pitch predictor of its own")
     _, tempo = synth._speaker(speaker)
     pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
     return acoustic_batch(synth.model, [text_to_ids(s, normalized=True) for s in sentences],

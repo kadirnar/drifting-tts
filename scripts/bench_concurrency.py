@@ -101,20 +101,24 @@ def run_batched(synth, texts: list[str], kw: dict, group: int | None = None) -> 
     return events
 
 
-def stall(ev: list[tuple[float, int]]) -> float:
-    """Seconds a client that plays each request from its first piece would wait for audio (buffer underruns)."""
-    play, total = ev[0][0] + ev[0][1] / SAMPLE_RATE, 0.0
+def playback(ev: list[tuple[float, int]]) -> tuple[float, float]:
+    """A client that plays a request from its first piece on: the seconds it waits for audio (buffer underruns) and
+    the least audio it still has buffered when a later piece arrives (negative: an underrun)."""
+    play, total, least = ev[0][0] + ev[0][1] / SAMPLE_RATE, 0.0, float("inf")
     for t, n in ev[1:]:
+        if n:
+            least = min(least, play - t)
         if t > play:
             total, play = total + t - play, t
         play += n / SAMPLE_RATE
-    return total
+    return total, least
 
 
 def summarize(runs: list[list[list[tuple[float, int]]]], peaks: list[float]) -> dict:
     """Per-request TTFA percentiles pooled over the runs; per-run aggregates as the median over the runs."""
     ttfa = np.array([ev[0][0] for run in runs for ev in run]) * 1000
-    stalls = np.array([stall(ev) for run in runs for ev in run]) * 1000
+    play = np.array([playback(ev) for run in runs for ev in run]) * 1000
+    stalls, buffered = play[:, 0], play[:, 1]
 
     def per_run(f) -> float:
         return float(np.median([f(run) for run in runs]))
@@ -135,6 +139,7 @@ def summarize(runs: list[list[list[tuple[float, int]]]], peaks: list[float]) -> 
            "throughput": per_run(lambda r: audio(r) / done(r)),
            "stalled_share": float((stalls > 0).mean()), "stall_ms_max": float(stalls.max()),
            "stall_ms_p90": float(np.percentile(stalls, 90)),
+           "buffer_ms_min": float(buffered.min()) if np.isfinite(buffered).any() else None,
            "peak_gb": max(peaks)}
     out["ttfa_ms"] = {k: round(float(v), 2) for k, v in out["ttfa_ms"].items()}
     return {k: round(v, 3) if isinstance(v, float) else v for k, v in out.items()}

@@ -131,3 +131,14 @@ def test_stream_batched_matches_stream(tmp_path, prosody):
         ref = list(synth.stream(text, seed=3 + i, **kw))
         assert [p.numel() for p in got[i]] == [p.numel() for p in ref]
         torch.testing.assert_close(torch.cat(got[i]), torch.cat(ref), rtol=0, atol=1e-5)
+
+
+def test_batchable_prosody_sources(tmp_path):
+    from drifting_tts.batched import batchable, synth_mels
+
+    synth = _synth(tmp_path, prosody=True)
+    assert batchable(synth)
+    other = synth.variant(prosody=synth.prosody, prosody_durations="sampled", prosody_duration_temperature=0.3)
+    assert not batchable(other)  # a duration row of its own: not batched
+    with pytest.raises(NotImplementedError):
+        synth_mels(other, ["merhaba."], 2, 1.0, 1.0, [torch.Generator()])
