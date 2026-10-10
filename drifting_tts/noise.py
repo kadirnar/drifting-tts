@@ -57,6 +57,17 @@ try:  # pragma: no cover - needs a GPU
         ok = (e < C * L) & (ll < tl.load(len_ptr + b))
         tl.store(out_ptr + b * stride_b + c * stride_c + ll * stride_l, tl.where(ok, v, 0.0), mask=e < C * L)
 
+    @triton.jit
+    def _randint_kernel(out_ptr, seed_ptr, sent_ptr, n, high, stream, BLOCK: tl.constexpr):
+        b = tl.program_id(0)
+        j = tl.arange(0, BLOCK)
+        z = tl.zeros_like(j).to(tl.uint32)
+        w0, w1, w2, w3 = _tl_philox(tl.load(seed_ptr + b), (j // 4).to(tl.uint32), z, z + stream,
+                                    z + tl.load(sent_ptr + b).to(tl.uint32))
+        lane = j % 4
+        w = tl.where(lane == 0, w0, tl.where(lane == 1, w1, tl.where(lane == 2, w2, w3)))
+        tl.store(out_ptr + b * n + j, (w % high.to(tl.uint32)).to(tl.int64), mask=j < n)
+
     HAS_TRITON = True
 except ImportError:  # pragma: no cover
     HAS_TRITON = False
@@ -124,7 +135,13 @@ def philox_normal(seeds: Tensor, sentences: Tensor, stream: str, channels: int, 
 
 def philox_randint(seeds: Tensor, sentences: Tensor, stream: str, n: int, high: int) -> Tensor:
     """Integers in ``[0, high)`` ``[B, n]``: element ``j`` is word ``j % 4`` of counter ``j // 4`` mod ``high``
-    (unbiased when ``high`` divides 2^32, e.g. the 64 style classes). Small: always computed with PyTorch ops."""
+    (unbiased when ``high`` divides 2^32, e.g. the 64 style classes)."""
+    if HAS_TRITON and seeds.is_cuda:
+        out = torch.empty(seeds.shape[0], n, dtype=torch.long, device=seeds.device)
+        if seeds.shape[0]:
+            _randint_kernel[(seeds.shape[0],)](out, seeds, sentences, n, high, STREAMS[stream],
+                                               BLOCK=triton.next_power_of_2(n))
+        return out
     j = torch.arange(n, device=seeds.device)[None].expand(seeds.shape[0], n)
     w, _ = _words(seeds, sentences, STREAMS[stream], j)
     return w % high

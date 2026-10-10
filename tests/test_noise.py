@@ -43,6 +43,8 @@ def test_triton_kernel_matches_the_pytorch_reference():
     philox_normal(seeds.cuda(), sent.cuda(), "dit", 100, 300, starts=starts.cuda(), lengths=lengths.cuda(),
                   scale=0.3, out=out)
     torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=2e-6)
+    labels = philox_randint(seeds, sent, "style", 32, 64)
+    assert torch.equal(philox_randint(seeds.cuda(), sent.cuda(), "style", 32, 64).cpu(), labels)
 
 
 def test_dit_noise_windows():
