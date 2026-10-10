@@ -22,8 +22,9 @@ Two modes:
   that were used), the sentence-final F0 (median of the last 25 voiced, non-silent frames against the sentence
   median, as in docs/POCKET_TTS_GATE.md) and the internal pauses (>= 100 ms, 35 dB below the loud level).
 
-Systems: ``name=regressors`` (the TTS model's own), ``name=<prosody_ema.pt>@<T>[,<T pitch>][:<spread>[,<pitch
-spread>]][|<pitch model>]`` (``|``: the token pitch from a second predictor, the durations from the first).
+Systems: ``name=regressors`` (the TTS model's own), ``name=<prosody_ema.pt>@<T>[,<T durations>][:<spread>][|<pitch
+model>]``: the prosody temperature T (pitch and pauses) and, apart, the letters' durations' (``duration_temperature``);
+``|``: the token pitch from a second predictor (at T), the durations from the first.
 
     python scripts/eval_sentence_prosody.py --heldout --reference train --cache runs/pm_cache/targets_v31.pt \\
         --systems v3.1=regressors v3.2=runs/pm_drift_final/prosody_ema.pt@0.5 --out runs/p2_eval/heldout.json
@@ -43,7 +44,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from drifting_tts.models.prosody_net import ProsodyPredictor, word_index
+from drifting_tts.models.prosody_net import ProsodyPredictor, boundary_tokens, word_index
 from drifting_tts.prosody import voiced_tokens
 from drifting_tts.sentence_features import SENTENCE_FEATURES, sentence_features, sentence_type
 from drifting_tts.text import SYMBOLS, normalize, split_sentences, text_to_ids
@@ -142,11 +143,10 @@ def parse_system(spec: str):
         return name, None, None
     rest, _, pitch_model = rest.partition("|")
     path, _, opts = rest.partition("@")
-    temps, _, spreads = (opts or "1").partition(":")
+    temps, _, spread = (opts or "1").partition(":")
     t = [float(x) for x in temps.split(",")]
-    s = [float(x) for x in spreads.split(",")] if spreads else [1.0]
-    return name, path, {"temperature": t[0], "pitch_temperature": t[-1], "spread": s[0], "pitch_spread": s[-1],
-                        "pitch_model": pitch_model or None}
+    return name, path, {"temperature": t[0], "duration_temperature": t[1] if len(t) > 1 else None,
+                        "spread": float(spread) if spread else 1.0, "pitch_model": pitch_model or None}
 
 
 def heldout(args, tts, st: float) -> dict:
@@ -179,15 +179,12 @@ def heldout(args, tts, st: float) -> dict:
                 s["pcont"] = it["pitch_det"][None]
         else:
             pred = ProsodyPredictor.load(path, args.device, tts=tts)
-            two = kw["pitch_model"] is not None
             smp = sample_split(pred, tts, data, list(range(args.seeds)), kw["temperature"], args.device,
-                               apply_scales=True, spread=kw["spread"],
-                               pitch_temperature=None if two else kw["pitch_temperature"],
-                               pitch_spread=None if two else kw["pitch_spread"])
-            if two:  # the pitch from the second predictor
+                               apply_scales=True, spread=kw["spread"], duration_temperature=kw["duration_temperature"])
+            if kw["pitch_model"] is not None:  # the pitch from the second predictor
                 pred2 = ProsodyPredictor.load(kw["pitch_model"], args.device, tts=tts)
-                smp2 = sample_split(pred2, tts, data, list(range(args.seeds)), kw["pitch_temperature"], args.device,
-                                    spread=kw["pitch_spread"])
+                smp2 = sample_split(pred2, tts, data, list(range(args.seeds)), kw["temperature"], args.device,
+                                    spread=kw["spread"])
                 for a, b in zip(smp, smp2):
                     a["pcont"] = b["pcont"]
         res[name] = summarize(measure(data, smp))
@@ -212,16 +209,15 @@ def sample_sentence(tts, pred, kw, text: str, spk: int, seed: int, device, pred2
     g = torch.Generator(device=device).manual_seed(seed)
     h, _, logw, x_mask = tts.encoder(ids, n, s)
     cond, base = pred.condition(tts, h, x_mask, s, logw, pred.stats, pred.word_tokens(ids, n), pred.sent_tokens(ids, n))
+    dt = kw["duration_temperature"]  # the letters' durations at their own temperature (ProsodyPredictor.predict)
     y, vlogit = pred.sample(cond, base, x_mask, kw["temperature"], generator=g, spread=kw["spread"],
-                            pitch_temperature=None if pred2 else kw["pitch_temperature"],
-                            pitch_spread=None if pred2 else kw["pitch_spread"])
+                            duration_temperature=dt, duration_mask=None if dt is None else ~boundary_tokens(ids))
     frames, pitch = pred.frames_and_pitch(y, vlogit, x_mask, pred.duration_scales.get(spk, 1.0))
     _, pc = pred.stats.denorm(y)
     if pred2 is not None:  # the pitch from the second predictor, drawn after the first one's noise (as Synthesizer)
         cond2, base2 = pred2.condition(tts, h, x_mask, s, logw, pred2.stats, pred2.word_tokens(ids, n),
                                        pred2.sent_tokens(ids, n))
-        y2, vlogit = pred2.sample(cond2, base2, x_mask, kw["pitch_temperature"], generator=g,
-                                  spread=kw["pitch_spread"] or 1.0)
+        y2, vlogit = pred2.sample(cond2, base2, x_mask, kw["temperature"], generator=g, spread=kw["spread"])
         _, pitch = pred2.frames_and_pitch(y2, vlogit, x_mask)
         _, pc = pred2.stats.denorm(y2)
     return ids[0].cpu().numpy(), frames[0].cpu().numpy(), pc[0].cpu().numpy(), pitch[0, 0].cpu().numpy()
@@ -294,8 +290,7 @@ def diagnostic(args, tts, st: float) -> dict:
             synths[name] = Synthesizer(args.model, args.device, vocoder=args.vocoder, prosody=path,
                                        prosody_temperature=None if kw is None else kw["temperature"],
                                        prosody_spread=1.0 if kw is None else kw["spread"],
-                                       prosody_pitch_temperature=None if kw is None else kw["pitch_temperature"],
-                                       prosody_pitch_spread=None if kw is None else kw["pitch_spread"],
+                                       prosody_duration_temperature=None if kw is None else kw["duration_temperature"],
                                        prosody_pitch=None if kw is None else kw["pitch_model"])
         for spk in args.speakers:
             for seed in range(args.seeds):

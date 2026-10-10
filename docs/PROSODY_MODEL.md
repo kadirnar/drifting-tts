@@ -11,6 +11,7 @@ and a flow-matching baseline on the same backbone.
 - [Design](#design)
 - [Results](#results)
 - [Usage](#usage)
+- [Sampled rhythm without the slips](#sampled-rhythm-without-the-slips)
 - [Word-level context (#40)](#word-level-context-40)
 - [Notes and pitfalls](#notes-and-pitfalls)
 - [Phase 2: conditional intonation (#40)](#phase-2-conditional-intonation-40)
@@ -239,16 +240,21 @@ steps.
 
 ## Usage
 
-**Recommended setting** (from the tables above): the drift sampler at prosody temperature 0.5 with its own voice
-factors (`train-prosody --calibrate-only calibrate.temperature=0.5` stores both, so `--prosody` alone selects it).
-It keeps Freya-100 intelligibility (WER 0.99%, CER 0.22%, v3.1 1.10% / 0.22%), raises UTMOSv2 (2.712 vs 2.627) and
-gives the held-out studio sentences the recordings' intonation range. `--prosody-durations regressor` (pitch only)
-is the conservative option: v3.1's rhythm and pauses with the new intonation (Freya-100 WER 0.77%, UTMOSv2 2.693).
-The default stays the regressors until a listening test.
+**Release v3.2 samples only the token pitch** (`prosody="drift"`, the published `prosody_drift_v3.2.pt`, at
+prosody temperature 0.5, `prosody_durations="regressor"`): the new intonation with v3.1's rhythm, durations and
+per-voice factors. On Freya-100 (studio) sampled durations at T 0.5 had looked safe (WER 0.99%, CER 0.22%, v3.1
+1.10% / 0.22%), but the release evaluation on all 495 sentences and three voices did not hold that up: with Vocos v2,
+sampled durations give WER 1.89% (studio), 5.78% (male) and 11.28% (female), against 1.33%, 2.28% and 3.99% with the
+pitch only (v3.1 + BigVGAN-v2-ft: 1.23%, 1.74%, 3.02%; [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)).
+The voices with little training data cannot render the sampled short sounds on new text. Sampled durations
+(`prosody_durations="sampled"`, the sampler's own voice factors from `train-prosody --calibrate-only
+calibrate.temperature=0.5`) stay an opt-in for the studio voice; with the letters' durations at prosody temperature
+0.3 (`prosody_duration_temperature=0.3`) they are as intelligible as the release
+([below](#sampled-rhythm-without-the-slips)). The explicit API keeps the regressors by default.
 
 ```bash
 # 1. targets of a trained pitch-conditioned model (~2 min)
-drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data/tr12_eleven \
+drifting-tts prosody-cache --model runs/release/drifting_tts_v3.1.pt --data data/train \
     --out runs/pm_cache/targets_v31.pt
 # 2. train (configs/prosody_drift.yaml; net.kind=mse / flow for the baselines)
 drifting-tts train-prosody --workdir runs/pm_drift tts=runs/release/drifting_tts_v3.1.pt \
@@ -267,19 +273,221 @@ drifting-tts benchmark --model runs/release/drifting_tts_v3.1.pt --num 100 --spe
 ```python
 synth = Synthesizer("drifting_tts_v3.1.pt", vocoder="vocos-ft", prosody="prosody_ema.pt")  # T from the checkpoint
 wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)
+synth = Synthesizer.from_pretrained("v3.2")   # prosody="drift", pitch only, vocos-v2, pause="punct"
+wav, _ = synth(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0, prosody_temperature=0.7)  # per call
 ```
 
 - **Seeds.** The prosody noise is drawn from the same seeded generator as the DiT noise, before it, so a seed
   fixes the whole rendition.
-- **Speaking rate.** The sampler has its own per-voice duration factors (`train-prosody --calibrate-only`: the median
-  recorded / sampled length on training utterances, never on the evaluation splits). It replaces the v3.1 factors,
-  which compensate the regressors' log-domain bias and `ceil`. `length_scale` still applies on top.
-- **`fast=True`.** The CUDA-graph acoustic path (`drifting_tts/fast.py`) covers only the regressors. With `prosody`
-  set, the acoustic model runs eagerly, and only the streaming vocoder windows use CUDA graphs.
+- **Speaking rate.** With sampled durations the sampler uses its own per-voice duration factors (`train-prosody
+  --calibrate-only`: the median recorded / sampled length on training utterances, never on the evaluation splits)
+  instead of the v3.1 factors, which compensate the regressors' log-domain bias and `ceil`. With
+  `prosody_durations="regressor"` (v3.2) the v3.1 factors stay. `length_scale` applies on top either way.
+- **`fast=True`.** A one-pass sampler (`drift`, `mse`; no word features, spread 1) runs inside the text encoder's
+  CUDA graph (`drifting_tts/fast.py`), its noise drawn outside the graph in the eager order: the same draws and
+  mels within float noise of the eager path (with sampled durations, a rounding can flip on that noise: 9 of 366
+  test sentences got one frame more or less). Flow matching, BERTurk features and `spread` != 1 run eagerly, with
+  only the streaming vocoder windows in CUDA graphs.
+- **Publishing.** `scripts/prepare_release.py` keeps what `ProsodyPredictor.load` reads (no training config, cache
+  or TTS paths) and records a fingerprint of the text encoder: loading the predictor with another acoustic model
+  warns. It also stores the edge silence of the predictor's generated sentences per voice (`pause_edges`, studio
+  0.20 s against 0.16 s with the regressors), which `pause="punct"` subtracts from the measured pauses when the
+  sampled durations are used.
 - **Cost.** One 165-token sentence on the shared (busy) RTX 5090: text encoder 6.6 ms, + drift sampler 9.9 ms in
   total (one pass), flow matching with 8 Euler steps 35.7 ms, drift + BERTurk 48 ms (BERT dominates). Busy-GPU
   numbers, 2–4× above an idle GPU; the drift sampler adds a few milliseconds to time-to-first-audio.
 - **Not ported:** ONNX / WebGPU and MLX still use the regressors.
+
+## Sampled rhythm without the slips
+
+Listening, the owner preferred v3.2 with **sampled durations** on the studio voice: pauses inside sentences and a
+rhythm closer to the recordings. The demo offers it as an opt-in, but on Freya-495 it costs intelligibility (Vocos
+v2, T 0.3, α 2, prosody T 0.5): WER 1.89% against 1.33% for the release (pitch only) on the studio voice, 5.78%
+against 2.28% (male) and 11.28% against 3.99% (female). This section finds where the slips come from and removes
+them for the studio voice without retraining: **the letters' durations at prosody temperature 0.3, the pauses and the
+pitch at 0.5.**
+
+### Where the slips come from
+
+Freya-495 for each voice, the renditions reproduced exactly (same seeds and draws) to read the durations behind every
+word error (the analysis scripts are in `runs/agents/rhythm/scripts`, outside the repository; the WERs come from
+the same Whisper transcripts).
+
+- **Not the speaking rate.** The sampled renditions are as long as the pitch-only ones (total length 0.99 / 1.00 /
+  1.04 of them for studio / male / female); both sets of per-voice factors come from the same kind of calibration on
+  training utterances.
+- **The letters, not the pauses.** Sampling the durations of the letters (a character and the blank after it) and
+  of the tokens between words (spaces, punctuation and the blanks next to them, where pauses live) at different
+  temperatures separates the two (studio, one seed set, paired with the release on the same sentences and seeds;
+  95% bootstrap intervals over sentences; the three-seed check is below):
+
+| letters | pauses | WER | ΔWER vs pitch only | sentences with a pause ≥ 0.1 s | syllables/s |
+|---|---|---:|---|---:|---:|
+| regressors | regressors (the release) | 1.33% | – | 0.6% | 6.11 |
+| T 0.5 | T 0.5 (sampled durations, the demo's opt-in) | 1.89% | +0.56 pp [+0.15, +1.01] | 11.3% | 6.24 |
+| T 0.5 | T 0.3 | 1.66% | +0.33 pp [−0.03, +0.70] | 6.1% | 6.25 |
+| T 0.3 | T 0.3 | 1.33% | +0.00 pp [−0.33, +0.33] | 6.7% | 6.28 |
+| **T 0.3** | **T 0.5** | 1.36% | +0.03 pp [−0.33, +0.39] | 10.7% | 6.27 |
+| T 0 | T 0.5 | 1.41% | +0.08 pp [−0.26, +0.43] | 10.9% | 6.29 |
+| regressors | T 0.5 | 1.33% | +0.00 pp [−0.25, +0.26] | 10.5% | 6.15 |
+
+  The letters at T 0.5 cost the words; the pauses do not. Letters at T 0.3 with pauses at T 0.5 keep both the
+  pauses (10.7% of these short everyday sentences get one, as with T 0.5) and the release's intelligibility.
+- **Where the short letters land.** The studio recordings have 9.9% of their letters at ≤ 2 frames, and the sampler
+  keeps that share at every temperature: on Freya 41–43% of the words get such a letter at T 0.3 and at T 0.5 (0.3%
+  with the regressors). At T 0.5 the words with a short letter fail more often than the others (2.04% against 1.26%
+  word errors); at T 0.3 they do not (1.31% against 1.21%). The noise at T 0.5 puts short letters where the text does
+  not support them; at T 0.3 they stay where the zero-noise output, which already has the recordings'
+  letter-duration spread (phase 2), puts them. The failing words are spread over the sentence (first word 5.1%
+  against 4.2% with the regressors, middle words 1.4% against 0.9%).
+- **Male and female: the sampler reproduces their recordings, and those are irregular.** MAS durations of the
+  training recordings against the sampler on 200 Freya sentences:
+
+| | letters ≤ 2 frames | jitter (mean \|Δ log\| of neighbouring letters) | first letter ≤ 2 frames | leading blank ≤ 2 frames |
+|---|---:|---:|---:|---:|
+| studio: recordings / sampled (T 0.5) | 9.9% / 9.1% | 0.60 / 0.55 | 6% / 0% | 15% / 2% |
+| male: recordings / sampled | 10.7% / 8.1% | 0.71 / 0.69 | 19% / 6% | 14% / 9% |
+| female: recordings / sampled | 16.5% / 14.8% | 0.76 / 0.77 | 46% / 57% | 100% / 100% |
+| regressors (any voice) | ≤ 0.05% | 0.34–0.35 | 0% | 0–100% |
+
+  The female recordings start abruptly: the leading blank has at most two frames in all of them (one in most), and
+  the first letter is cut to ≤ 2 frames in 46%. The sampler reproduces that, and the generator renders it as a dropped or changed first
+  sound: 26% of the female first words fail with sampled durations (pitch only: 13.5%; studio: 4–5%), and the words
+  inside the sentence fail 3× as often as with the regressors (7.9% against 2.4%). The temperature hardly changes
+  these distributions (female, T 0 / 0.3 / 0.5: 13.4 / 13.9 / 14.8% short letters), so lowering it does not fix
+  these voices (female, durations at T 0.3: 8.34%).
+
+### Male and female voices
+
+Inference-only remedies, Freya-495, one seed set, paired with the pitch-only release of each voice:
+
+| durations of the male / female voice | male WER | Δ [95% CI] | female WER | Δ [95% CI] |
+|---|---:|---|---:|---|
+| regressors (the release) | 2.28% | – | 3.99% | – |
+| its own, T 0.5 (sampled durations) | 5.78% | +3.50 [+2.67, +4.39] | 11.28% | +7.29 [+6.12, +8.46] |
+| its own, T 0.3 | 4.32% | +2.05 [+1.34, +2.80] | 8.34% | +4.35 [+3.31, +5.41] |
+| its own, T 0.5, leading blank ≥ 5 and first letter ≥ 4 frames | | | 9.72% | +5.73 [+4.53, +6.94] |
+| regressors for the letters, its own pauses at T 0.5 | 3.22% | +0.95 [+0.38, +1.54] | 5.40% | +1.41 [+0.69, +2.16] |
+| the studio voice's rhythm at its rate, T 0.5 | 3.48% | +1.20 [+0.57, +1.86] | 5.19% | +1.20 [+0.31, +2.10] |
+| the same, its leading blank from its regressor | 3.30% | +1.02 [+0.38, +1.68] | 5.29% | +1.30 [+0.36, +2.24] |
+| the same, its leading blank and first letter from its regressor | | | 4.81% | +0.82 [−0.08, +1.73] |
+| **the studio voice's rhythm at its rate, T 0.3** | 2.76% | +0.49 [−0.08, +1.05] | 4.70% | +0.72 [−0.13, +1.49] |
+| the same, its leading blank and first letter from its regressor | 3.09% | +0.82 [+0.23, +1.43] | 4.55% | +0.56 [−0.26, +1.32] |
+| the same, also the sentence end (final punctuation and blank) | 2.86% | +0.59 [−0.03, +1.25] | 4.32% | +0.33 [−0.47, +1.16] |
+| regressors with a leading blank ≥ 5 frames (pitch only) | | | 3.94% | −0.05 [−0.60, +0.53] |
+
+Three seed sets (as for the studio voice below) for the remedy that works, borrowing the studio voice's rhythm at
+T 0.3:
+
+| voice | durations | WER [95% CI] | ΔWER vs v3.2 [95% CI] | UTMOSv2 | ΔUTMOSv2 [95% CI] |
+|---|---|---|---|---:|---|
+| male | v3.2 (regressors) | 2.52% [2.17, 2.88] | – | 2.895 | – |
+| male | studio rhythm, factor from his recordings' length (1.50) | 3.06% [2.71, 3.43] | +0.54 [+0.18, +0.91] | 2.831 | −0.064 [−0.078, −0.049] |
+| male | the same with his own sentence edges, factor from his regressors' length (1.46; the checkpoint) | 3.13% [2.75, 3.51] | +0.61 [+0.26, +0.97] | 2.843 | −0.052 [−0.066, −0.038] |
+| female | v3.2 (regressors) | 4.15% [3.72, 4.57] | – | 2.718 | – |
+| female | studio rhythm, factor from her recordings' length (1.33) | 4.92% [4.46, 5.39] | +0.77 [+0.26, +1.28] | 2.751 | +0.033 [+0.018, +0.048] |
+| female | the same with her own sentence edges | 4.41% [3.97, 4.84] | +0.26 [−0.22, +0.74] | 2.734 | +0.016 [+0.003, +0.031] |
+| female | own edges, factor from her regressors' length (1.30; the checkpoint) | 4.55% [4.13, 5.02] | +0.40 [−0.07, +0.87] | 2.767 | +0.049 [+0.034, +0.062] |
+
+- **Borrowing the studio voice's rhythm** (its sampler conditioned on speaker 722, scaled to the voice's length on
+  its training utterances; the pitch stays the voice's own) is the only remedy that removes most of the cost. It
+  leaves +0.5–0.6 pp for the male voice and +0.3–0.4 pp for the female voice (with her own sentence edges), above
+  the 0.2–0.3 pp the studio voice reaches. The male voice also loses UTMOSv2 (−0.05 to −0.06): the studio rhythm
+  stretched to his length slows his articulation (4.60 against 4.90 syllables/s on Freya with the checkpoint's
+  factor, 4.46 with the recordings' one).
+- **Sentence edges matter for the female voice.** Her recordings start abruptly; with the studio rhythm her
+  generator renders a full-length first consonant as an extra syllable (`geçen → ilçen`, `bahar → kulahar`; first
+  words fail in 18–19% of the sentences against 13.9% with the regressors). Taking her leading blank, first letter
+  and sentence end from her own regressor brings the cost from +0.77 to +0.26–0.40 pp. For the male voice it
+  changes nothing measurable. Floors alone (leading blank ≥ 5, first letter ≥ 4 frames) on her own sampled
+  durations recover only 1.6 of 7.3 pp, and a longer leading blank leaves the pitch-only voice unchanged (3.94%).
+- **The voices' own pauses also cost words** (regressor letters, own pauses: +0.95 / +1.41 pp), unlike the studio
+  voice's (+0.00 pp): their tokens between words include the blank after a word's last letter, and their sampled
+  values are as irregular as their letters.
+- **Retraining was not tried** (a speaker-pooled duration model, a penalty on short letters): even the best-modelled
+  rhythm of the corpus, the studio voice's at T 0.3 with their own edges, costs these voices 0.4–0.6 pp, which
+  points at how their generator renders varied durations rather than at their duration model. A speaker-pooled
+  sampler would sit between their own rhythm and the studio's.
+
+So **sampled rhythm stays a studio-voice option**; for the male and female voices the demo keeps falling back to
+v3.2 (pitch only). The borrowed studio rhythm is in the recommended checkpoint for them (`rhythm` below): the
+female voice is close (+0.40 pp [−0.07, +0.87]) and could be offered after listening; the male voice is not.
+
+### Recommendation: letters at T 0.3, pauses and pitch at T 0.5
+
+Studio voice, Freya-495 with three seed sets (seed = sentence index + 0 / 1000 / 2000: 1,485 renditions, 11,733
+words), paired with the release on the same sentences and seeds:
+
+| durations | WER [95% CI] | CER | UTMOSv2 | ΔWER vs v3.2 [95% CI] | ΔUTMOSv2 [95% CI] | sentences with a pause | syllables/s |
+|---|---|---:|---:|---|---|---:|---:|
+| v3.2 (regressors) | 1.36% [1.12, 1.60] | 0.26% | 3.016 | – | – | 0.6% | 6.11 |
+| sampled, T 0.5 (the demo's opt-in so far) | 1.67% [1.40, 1.96] | 0.32% | 3.026 | +0.32 pp [+0.09, +0.54] | +0.010 [−0.002, +0.021] | 11.1% | 6.24 |
+| sampled, T 0.3 | 1.50% [1.23, 1.77] | 0.28% | 3.030 | +0.14 pp [−0.06, +0.36] | +0.014 [+0.003, +0.025] | 6.0% | 6.27 |
+| **letters T 0.3, pauses T 0.5** | **1.40%** [1.15, 1.66] | 0.27% | **3.032** | **+0.04 pp** [−0.15, +0.24] | +0.015 [+0.003, +0.026] | 11.6% | 6.26 |
+
+Held-out studio `val` (`drifting-tts prosody`, the 100 recordings against each system's rendition of their texts,
+sentence by sentence, as in [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos-v2-punctuation-pauses)):
+
+| system | F0 std | F0 range | pauses/utt | pause s | syl/s | DTW F0 r | CER | WER | UTMOSv2 | SIM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| recording | 3.68 | 11.9 | 1.39 | 0.139 | 6.22 | – | 0.88% | 2.06% | 3.093 | – |
+| v3.2 (regressors) | 3.53 | 11.3 | 1.54 | 0.175 | 6.01 | 0.579 | 0.42% | 2.02% | 2.990 | 0.940 |
+| v3.2, sampled durations at T 0.5 | 3.56 | 11.4 | 2.35 | 0.186 | 6.08 | 0.572 | 0.50% | 2.32% | 3.000 | 0.943 |
+| **v3.2, letters T 0.3, pauses T 0.5** | 3.56 | 11.4 | 2.37 | 0.184 | 6.08 | 0.569 | 0.46% | 2.32% | 3.019 | 0.944 |
+
+- **Intelligibility as the release.** Over three seed sets the recommended setting is +0.04 pp from v3.2 (the
+  interval reaches +0.24 pp), where the demo's sampled durations at T 0.5 cost +0.32 pp. One seed set is too noisy
+  for differences of this size: T 0.5 cost +0.56, +0.21 and +0.18 pp on the three.
+- **The rhythm the owner liked is kept.** Pauses inside the sentence (2.37 per held-out utterance against 2.35 at
+  T 0.5; Freya: 11.6% of the sentences against 11.1%), speaking rate (6.08 syllables/s against 6.08) and intonation
+  (F0 std 3.56 against 3.56) are those of the T 0.5 setting. The letters' durations keep almost all of their spread
+  at T 0.3 (phase 2, `dev`: letter-duration spread 0.934 of the recordings' at T 0.3, 0.941 at T 0.5, 0.430 for the
+  regressors).
+- **UTMOSv2** is +0.015 above v3.2 (interval above 0), as for every sampled-duration setting.
+- **Pauses at T 0.5 are not worse than at T 0.3** (1.40% against 1.50%, within the noise), so nothing argues for
+  sampling them colder.
+
+The checkpoint `runs/rh_final/prosody_drift_v3.2_rhythm.pt` (local, not published) is the release's
+`prosody_drift_v3.2.pt` with this operating point stored: preferred duration temperature 0.3, the per-voice factors
+calibrated for it (studio 1.053, the release file's 1.0445 were calibrated with every duration at T 0.5), the male
+and female voices borrowing the studio rhythm with their own sentence edges (factors 1.460 / 1.300, see below) and
+the edge silence of its sentences for `pause="punct"` (studio 0.199 s, male 0.220 s, female 0.108 s). Through
+`drifting-tts benchmark` (the package path, seed set 0) it gives studio WER 1.38%, CER 0.25%, UTMOSv2 3.032, as the
+exploratory runner (1.36% / 3.040).
+
+### Usage
+
+```python
+synth = Synthesizer.from_pretrained("v3.2")                   # pitch only (the release)
+rhythm = synth.variant(prosody=synth.prosody, prosody_durations="sampled", prosody_duration_temperature=0.3)
+wav, _ = rhythm(text, speaker="studio", cfg_scale=2.0, temperature=0.3, seed=0)   # pitch and pauses at T 0.5
+```
+
+```bash
+drifting-tts synthesize --release v3.2 --prosody-durations sampled --prosody-duration-temperature 0.3 --text "..."
+drifting-tts benchmark --model drifting_tts_v3.2.pt --vocoder vocos-v2 --prosody drift --pause punct \
+    --prosody-durations sampled --prosody-duration-temperature 0.3 --speaker studio
+# store the operating point in a checkpoint: the preferred duration temperature, a voice -> rhythm table and the
+# factors calibrated for both (training utterances only)
+drifting-tts train-prosody --workdir runs/pm_drift --calibrate-only tts=... cache=... calibrate.temperature=0.5 \
+    calibrate.duration_temperature=0.3 "calibrate.rhythm={389: 722, 323: 722}"
+```
+
+- **`prosody_duration_temperature`** (`ProsodyPredictor.sample(duration_temperature=)`): the noise temperature of
+  the letters' durations. The tokens between words (`boundary_tokens`: spaces, punctuation and the blanks next to
+  them) keep the prosody temperature of the call, like the pitch. The same unit noise runs as a second row of the
+  sampler's batch (as on the phase-2 branch), so a seed still fixes the rendition and the cost is one more row.
+- **`rhythm`** (checkpoint key, `calibrate.rhythm`): voice → speaker whose durations it samples (all of them, its
+  pauses included, at the duration temperature). The voice keeps its own pitch and its own sentence edges (the
+  leading blank, the first letter and the final punctuation with its blank take its regressor durations:
+  `edge_tokens`), and its `duration_scales` entry brings the borrowed rhythm to the length of its own regressor
+  durations on its training utterances (the release's speaking rate; matching its recordings' length instead slows
+  the male voice's articulation, since his recordings have long pauses).
+- **`fast=True`** runs the second row inside the encoder's CUDA graph (one encoder pass per speaker, as the eager
+  path). Against the eager path on 366 sentences (3 voices × 61 texts × 2 prosody temperatures), the frame counts
+  agree on 364 with the recommended checkpoint (one sentence, at both temperatures, is one frame longer) and the mels
+  within 72 dB SNR; the one-row graph of the release with sampled durations agrees on 357 (that predates this
+  change: the rounding of a few durations flips on float noise of the padded buckets).
 
 ## Word-level context (#40)
 
@@ -341,10 +549,21 @@ intelligibility. Every row uses the frozen v3.1 acoustic model. Audio rows use t
 (`runs/voc_p3/vocos_ft_10000.pt`, the vocoder of the v3.2 dry run), so they are not comparable with the `vocos-ft`
 rows above.
 
+> **Since these measurements** (merged with #52): the "v3.2" rows here are the dry-run setting, durations and pitch
+> both sampled at T 0.5. v3.2 as released keeps v3.1's durations and samples only the token pitch
+> ([EXPERIMENTS.md §9](EXPERIMENTS.md#9-release-v32)). The separate temperatures of section 1 now use #52's API: the
+> prosody temperature is the pitch's (`prosody_temperature`, `--prosody-temperature`), and `duration_temperature`
+> (`Synthesizer(prosody_duration_temperature=)`, `--prosody-duration-temperature`) sets the letters' durations apart.
+> This phase measured them with its first version (`pitch_temperature`), in which the pauses followed the durations'
+> temperature (now the pitch's, as in [Sampled rhythm without the slips](#sampled-rhythm-without-the-slips)) and the
+> output spread could be set per channel (`pitch_spread`, one row below; dropped). The second pitch predictor, the
+> sentence features and the context branch are unchanged; with `fast=True` they run eagerly.
+
 - **Separate temperatures work without retraining.** The same noise run at two temperatures (one more row in the
-  sampler's batch) gives durations and pitch their own temperatures; equal temperatures reproduce v3.2 exactly.
-  Raising only the pitch temperature widens the F0 (pitch T 1: F0 std 3.38 → 3.60) but lowers the contour
-  correlation (DTW F0 r 0.578 → 0.529), at no significant cost in intelligibility. It is a dial, not a better tune.
+  sampler's batch) gives durations and pitch their own temperatures; equal temperatures reproduce the one-pass
+  sample. This is #52's `duration_temperature`. Raising only the pitch temperature widens the F0 (pitch T 1: F0 std
+  3.38 → 3.60) but lowers the contour correlation (DTW F0 r 0.578 → 0.529), at no significant cost in
+  intelligibility. It is a dial, not a better tune.
 - **Vocos v2 narrows the measured F0** (copy synthesis 3.55 st, recordings 3.68, `vocos-ft` copy synthesis 3.69).
   Under it v3.2 sits at 3.38 st and v3.1 at 2.93.
 - **Duration safety comes from the duration temperature, not from a floor.** A 3-frame letter floor recovers 0.4 of
@@ -367,8 +586,8 @@ rows above.
 
 | piece | where | what |
 |---|---|---|
-| per-channel temperatures | `ProsodyPredictor.sample(pitch_temperature=, pitch_spread=)`, `Synthesizer(prosody_pitch_temperature=, prosody_pitch_spread=)`, `--prosody-pitch-temperature`, `--prosody-pitch-spread` | the pitch channel (and the voicing) at its own noise temperature and output spread; inference only |
-| a second predictor for the pitch | `Synthesizer(prosody_pitch=)`, `--prosody-pitch-model` | the durations from `--prosody`, the token pitch from another sampler (e.g. one with word features), drawn after the first one's noise |
+| separate temperatures | #52's `ProsodyPredictor.sample(duration_temperature=)`, `Synthesizer(prosody_duration_temperature=)`, `--prosody-duration-temperature` | the letters' durations at their own noise temperature, the pitch (and the voicing, the pauses) at the prosody temperature; inference only (measured here with this phase's first version, see the note above) |
+| a second predictor for the pitch | `Synthesizer(prosody_pitch=)`, `set_prosody(pitch=)`, `--prosody-pitch-model` | the durations from `--prosody`, the token pitch from another sampler (e.g. one with word features) at the prosody temperature and spread, drawn after the first one's noise; runs eagerly |
 | letter floor | `floor_letters`, `predict(min_letter_frames=, rel_letter_floor=)` | a letter (character + following blank) gets at least N frames, or a ratio of the regressors' duration |
 | sentence features | `drifting_tts/sentence_features.py` | 18 rule-based features per word: sentence type, mI host / particle / after, wh-word / after, sentence-final, comma, positions |
 | context branch | `net.ctx_pitch_only`, `net.pitch_layers`, `net.ctx_boundaries` | word and sentence features bypass the trunk and feed two more layers that predict the pitch (and, with `ctx_boundaries`, the durations between words) |
@@ -406,10 +625,12 @@ on the studio `val` recordings that gives 1.6 per utterance, against 1.39 audio 
 
 The sampler's noise (16 per-token and 32 global channels) enters one trunk that predicts both channels, so it cannot be
 scaled per channel without retraining. What works without retraining: the same unit noise runs at two temperatures as
-one batch of two rows; the log-durations come from the first row, the pitch and the voicing from the second
-(`pitch_temperature`). Equal temperatures reproduce the one-pass sample exactly, and the two channels stay coupled
-through the shared noise direction. The output-space spread is per channel too (`pitch_spread`). The cost is one
-more row in the sampler's batch.
+one batch of two rows; the pitch and the voicing come from the first row (the prosody temperature), the
+log-durations from the second (`duration_temperature`, #52). Equal temperatures reproduce the one-pass sample, and
+the two channels stay coupled through the shared noise direction. The cost is one more row in the sampler's batch.
+These rows were measured with this phase's first version, in which every duration (the pauses too) followed the
+duration temperature; with #52's API the pauses keep the prosody temperature. The last row used a per-channel
+output spread (`pitch_spread`), which was dropped when merging.
 
 **Token level** (`dev`, all speakers, v3.2's sampler, 8 seeds):
 
@@ -424,10 +645,11 @@ more row in the sampler's batch.
 | 0.3 | 0.7 | 0.960 | 1.018 | 0.401 | 0.302 | 0.934 | 0.453 | 0.391 | 0.077 | 0.954 |
 | 0 | 1 | 0.998 | 1.057 | 0.374 | 0.294 | 0.931 | 0.477 | 0.512 | 0.078 | 0.948 |
 | 1 | 1 | 0.998 | 1.057 | 0.374 | 0.294 | 0.981 | 0.344 | 0.327 | 0.092 | 1.006 |
-| 0.5 | 1, pitch spread 0.8 | 0.874 | 0.930 | 0.416 | 0.295 | 0.940 | 0.419 | 0.354 | 0.081 | 0.961 |
+| 0.5 | 1, pitch spread 0.8 (dropped option) | 0.874 | 0.930 | 0.416 | 0.295 | 0.940 | 0.419 | 0.354 | 0.081 | 0.961 |
 
 **Audio** (studio `val`, 100 utterances, one pass, T 0.3, α 2, Vocos v2 preview, harvest F0; `eval_prosody_audio.py`
-systems `drift-T<t>-P<pitch t>`):
+systems now named `drift-T<pitch t>-D<duration t>`, with the pauses at the pitch temperature; these rows ran with the
+pauses at the duration temperature):
 
 | system | F0 std | F0 range | move | micro | reversals/s | pauses/utt | syl/s | DTW F0 r | F0 RMSE | length |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -754,7 +976,12 @@ Against v3.2 on the same vocoder:
 | prosody networks / word encoder | 8.1 M / – | 8.1 M + 8.3 M / BERTurk 111 M |
 
 - **Cost:** a second 8.3 M sampler and BERTurk (111 M parameters, `transformers`) per sentence; phase 1 measured
-  ~40 ms of BERT per sentence on the busy GPU. Not CUDA-graph-ready (see the notes).
+  ~40 ms of BERT per sentence on the busy GPU. It runs eagerly: with `fast=True` only the vocoder uses CUDA graphs
+  (see the notes).
+- **Durations:** the candidate samples them (studio voice measured). v3.2 as released keeps the regressors'
+  durations; for the male and female voices sampled durations cost words
+  ([EXPERIMENTS.md §9](EXPERIMENTS.md#9-release-v32)). `--prosody-durations regressor` gives v3.2's durations with
+  the BERTurk pitch (not measured).
 - **Lighter alternative:** the ELECTRA branch (`p2_electra_pitch`, one 11.9 M sampler + ELECTRA-small 13.7 M): the
   best intelligibility (Freya-495 1.51%, −0.33 pp n.s.) with a smaller gain in conditional pitch (r 0.451, DTW F0 r
   0.596, held-out pre-mI −0.91).
@@ -771,9 +998,10 @@ Against v3.2 on the same vocoder:
 - **GPU memory.** The context branch at B8 × G16 reserved up to 8.0 GB uncapped (nvidia-smi); under
   `train.max_gpu_gb=6.5` it ran out of memory on a long batch after 2.9k steps. B6 × G16 (5.8 GB in nvidia-smi) and
   B3 × G32 (4.6 GB) fit the cap at 9–12 it/s.
-- **Release integration (#49).** The CUDA-graph prosody path of the release (`fast.graphable`) takes one-pass
-  samplers without word features. Once #49 is on main, it must also turn away the sentence features (computed from the
-  text on the CPU) and a pitch temperature different from the duration temperature, or learn to run them.
+- **Release integration (#49, #52).** The CUDA-graph prosody path (`fast.graphable`) takes one-pass samplers without
+  word or sentence features (both are computed from the text on the host). A second pitch predictor also runs
+  eagerly (`Synthesizer` warns and graphs only the vocoder). Separate temperatures run in the graphs (#52's
+  duration row).
 - **Word features at inference** are computed from the normalised sentence (ELECTRA-small or BERTurk, `transformers`);
   the sentence features need no model.
 - **Male and female voices** (diagnostic set, token level, 4 seeds): the female voice (323), which has no questions in
@@ -794,12 +1022,13 @@ drifting-tts train-prosody --workdir runs/p2_electra_pitch tts=runs/release/drif
     net.word_dim=1 net.sent_dim=1 net.ctx_pitch_only=true calibrate.temperature=0.5
 #   variants: net.ctx_boundaries=true, loss.centroid=1.0, cache=runs/pm_cache/targets_v31_bert.pt (BERTurk),
 #   drift.gen_per_cond=32 train.batch_size=3 train.steps=20000 (G = 32)
-# store the preferred temperatures (durations, pitch) and the voice factors at the duration temperature
+# store the preferred temperatures (pitch: calibrate.temperature, letters' durations: calibrate.duration_temperature)
+# and the voice factors at that operating point
 drifting-tts train-prosody --workdir runs/p2_electra_pitch --calibrate-only tts=... cache=... \
-    calibrate.temperature=0.5 calibrate.pitch_temperature=0.7
+    calibrate.temperature=0.7 calibrate.duration_temperature=0.5
 # synthesis with separate temperatures (the defaults: the checkpoint's)
 drifting-tts synthesize --model runs/release/drifting_tts_v3.1.pt --prosody runs/p2_electra_pitch/prosody_ema.pt \
-    --prosody-temperature 0.5 --prosody-pitch-temperature 0.7 --vocoder runs/voc_p3/vocos_ft_10000.pt --text "..."
+    --prosody-temperature 0.7 --prosody-duration-temperature 0.5 --vocoder runs/voc_p3/vocos_ft_10000.pt --text "..."
 # durations from v3.2's sampler, token pitch from the BERTurk sampler (the phase-2 candidate)
 drifting-tts synthesize --model runs/release/drifting_tts_v3.1.pt --prosody runs/pm_drift_final/prosody_ema.pt \
     --prosody-pitch-model runs/p2_bert_g32/prosody_ema.pt --prosody-temperature 0.5 \
@@ -808,17 +1037,18 @@ drifting-tts synthesize --model runs/release/drifting_tts_v3.1.pt --prosody runs
 drifting-tts train-prosody --workdir runs/p2_bert_g32 tts=runs/release/drifting_tts_v3.1.pt \
     cache=runs/pm_cache/targets_v31_bert.pt net.word_dim=1 train.batch_size=3 drift.gen_per_cond=32 \
     train.steps=20000 train.max_gpu_gb=6.5 calibrate.temperature=0.5
-# token level with pitch temperatures, intonation by sentence type, the diagnostic set (token level; --audio adds
-# synthesis with the vocoder and harvest F0), the audio systems with a pitch temperature
+# token level with pitch temperatures (the durations at 0.5), intonation by sentence type (`@<T>,<T durations>`), the
+# diagnostic set (token level; --audio adds synthesis with the vocoder and harvest F0), the audio systems with a
+# duration temperature of their own (`-D`)
 python scripts/eval_prosody_tokens.py --cache runs/pm_cache/targets_v31.pt --tts runs/release/drifting_tts_v3.1.pt \
-    --prosody drift=runs/pm_drift_final/prosody_ema.pt --temperatures 0.5 --pitch-temperatures 0.5 0.7 1.0 --scales \
+    --prosody drift=runs/pm_drift_final/prosody_ema.pt --temperatures 0.5 0.7 1.0 --duration-temperatures 0.5 --scales \
     --out runs/p2_eval/tokens
 python scripts/eval_sentence_prosody.py --heldout --reference train --systems v31=regressors \
-    v32=runs/pm_drift_final/prosody_ema.pt@0.5 cand=runs/p2_electra_pitch/prosody_ema.pt@0.5,0.7 --out runs/p2_eval/heldout.json
+    v32=runs/pm_drift_final/prosody_ema.pt@0.5 cand=runs/p2_electra_pitch/prosody_ema.pt@0.7,0.5 --out runs/p2_eval/heldout.json
 python scripts/eval_sentence_prosody.py --texts scripts/prosody_diagnostic_tr.jsonl --speakers 722 --seeds 4 \
     --systems v31=regressors v32=runs/pm_drift_final/prosody_ema.pt@0.5 --audio --vocoder runs/voc_p3/vocos_ft_10000.pt \
     --out runs/p2_eval/diag.json
 python scripts/eval_prosody_audio.py --prosody-model drift=runs/pm_drift_final/prosody_ema.pt \
-    --systems recording copy onepass drift-T0.5 drift-T0.5-P0.7 drift-T1-F3 --vocoder runs/voc_p3/vocos_ft_10000.pt \
+    --systems recording copy onepass drift-T0.5 drift-T0.7-D0.5 drift-T1-F3 --vocoder runs/voc_p3/vocos_ft_10000.pt \
     --asr none --sv none --mos none --out runs/p2_audio/val722
 ```

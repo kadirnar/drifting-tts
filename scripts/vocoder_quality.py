@@ -7,7 +7,10 @@ held-out recordings (docs/VOCODERS.md, "Training Vocos further").
   the F0 micro-variation of docs/EXPERIMENTS.md §5 and the mean periodicity of voiced frames, plus the F0 and
   periodicity of each output against ``--ref`` (default ``bigvgan-v2-ft``) on the same mels.
 * ``copy``: recorded mel -> vocoder against the recording, on the first ``--copy-num`` utterances of the ``val``
-  split (``val``: all speakers, the set of ``resynthesis_benchmark.py``) or of speaker 722 in it (``studio``):
+  split (``val``: all speakers, the set of ``resynthesis_benchmark.py``), of speaker 722 in it (``studio``), of the
+  other speakers (``others``) or of one speaker (``spk<ID>``). ``@<split>`` takes them from another split, e.g.
+  ``spk389@train``, and ``@unseen`` from the ``train`` utterances that the fine-tune of ``--train-config`` leaves
+  out (its ``data`` filters, length limits):
   log-mel L1 (the BigVGAN front end) and its mean bias per band in dB, multi-resolution log-STFT L1, UTMOSv2,
   DNSMOS OVRL, and against the recording's WORLD harvest F0: voicing decision error (VDE), gross pitch error (GPE,
   > 20% off), the RMS of the other frames in cents, periodicity RMSE and bias, and the F0 micro-variation of output
@@ -30,6 +33,7 @@ import argparse
 import gc
 import json
 import math
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -232,9 +236,12 @@ def run_freya(args, specs: dict, res: dict, pool, out: Path) -> None:
             dnsmos = DnsMos(args.device)
         if args.no_asr:  # UTMOSv2 and DNSMOS only (2 GB of GPU memory instead of 5)
             w16 = [band_match(w, 0) for w in wavs]
-            d = dnsmos.score(w16)
-            q = {"mos": float(np.mean([judges.mos(w) for w in w16])), "dnsmos_ovrl": float(d[:, 2].mean()),
+            d, mos = dnsmos.score(w16), [judges.mos(w) for w in w16]
+            q = {"mos": float(np.mean(mos)), "dnsmos_ovrl": float(d[:, 2].mean()),
                  "dnsmos_p808": float(d[:, 3].mean()), "wer": None, "wer_ci": None, "cer": None}
+            with open(out / f"freya{args.num}_{name}.jsonl", "w") as f:  # per sentence, as with ASR
+                f.writelines(json.dumps({"id": i, "mos": float(m), "dnsmos_ovrl": float(x[2])}) + "\n"
+                             for i, (m, x) in enumerate(zip(mos, d)))
         else:
             q = score(wavs, refs, judges, dnsmos, 8000, out / f"freya{args.num}_{name}.jsonl")
         table[name] = {"spec": spec, "wer": q["wer"], "wer_ci": q["wer_ci"], "cer": q["cer"], "utmosv2": q["mos"],
@@ -255,14 +262,14 @@ def run_freya(args, specs: dict, res: dict, pool, out: Path) -> None:
 def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
     import torchaudio
 
-    from drifting_tts.data import MelDataset
     from drifting_tts.judges import UTMOSv2
     from drifting_tts.score import DnsMos
     from drifting_tts.vocoder import load_vocoder
 
-    ds = MelDataset(args.data, "val", min_frames=1, max_frames=10**9, with_audio=True, with_f0=True)
     speakers, gta = which.removesuffix("_gta"), which.endswith("_gta")
-    idx = [i for i, e in enumerate(ds.items) if speakers == "val" or e["spk_id"] == 722][: args.copy_num]
+    ds, idx = copy_set(args, speakers)
+    if len(idx) < args.copy_num:
+        print(f"copy_{which}: {len(idx)} utterances", flush=True)
     items = [ds[i] for i in idx]
     rec = [it["audio"] for it in items]
     mels = gta_mels(args, items, out / f"gta_mels_{speakers}{len(idx)}.pt") if gta else \
@@ -312,6 +319,39 @@ def run_copy(args, specs: dict, res: dict, pool, out: Path, which: str) -> None:
     free()
 
 
+COPY_SET = re.compile(r"(studio|val|others|spk\d+)(@\w+)?(_gta)?")
+
+
+def copy_set_name(name: str) -> str:
+    if not COPY_SET.fullmatch(name):
+        raise argparse.ArgumentTypeError(f"{name!r}: expected studio, val, others or spk<ID>, then optionally "
+                                          "@<split> or @unseen, then optionally _gta")
+    return name
+
+
+def copy_set(args, name: str):
+    """The dataset and the indices of the first ``--copy-num`` utterances of copy set ``name`` (without ``_gta``)."""
+    from drifting_tts.config import load_config
+    from drifting_tts.data import MelDataset
+
+    who, _, split = name.partition("@")
+    split = split or "val"
+    ds = MelDataset(args.data, "train" if split == "unseen" else split, min_frames=1, max_frames=10**9,
+                    with_audio=True, with_f0=True)
+    seen = set()
+    if split == "unseen":  # what the fine-tune trains on: its data selection on the same prepared data
+        if not args.train_config:
+            raise SystemExit("@unseen copy sets need --train-config")
+        cfg = load_config(args.train_config)
+        d = cfg.data
+        seen = {e["offset"] for e in MelDataset(args.data, "train", min_quality=d.get("min_quality", 0),
+                                                min_frames=cfg.train.segment_frames, max_frames=d.max_frames,
+                                                filters=d.get("filters")).items}
+    match = {"val": lambda s: True, "studio": lambda s: s == 722, "others": lambda s: s != 722}.get(who)
+    match = match or (lambda s: s == int(who[3:]))
+    return ds, [i for i, e in enumerate(ds.items) if match(e["spk_id"]) and e["offset"] not in seen][: args.copy_num]
+
+
 @torch.no_grad()
 def gta_mels(args, items: list[dict], path: Path) -> list[torch.Tensor]:
     """The acoustic model's mels of the recordings under their ground-truth alignment and pitch (as in vocoder
@@ -353,9 +393,7 @@ def tables(res: dict, order: list[str]) -> str:
                     f"{r['periodicity_voiced']:.3f} | "
                     + (f"{100 * v['vde']:.1f}% | {100 * v['gpe']:.2f}% | {v['cents']:.1f} | {v['per_rmse']:.3f} |"
                        if v else "– | – | – | – |") + "\n")
-    for key in ("copy_studio", "copy_studio_gta", "copy_val"):
-        if key not in res:
-            continue
+    for key in [k for k in res if k.startswith("copy_")]:
         c = res[key]
         out += (f"\n{key}:\n\n| system | mel L1 | mel L1 to input | log-STFT L1 | UTMOSv2 | DNSMOS OVRL | VDE | GPE | "
                 "cents | periodicity RMSE | periodicity bias | F0 micro-var (st) |\n|---" + "|---" * 11 + "|\n")
@@ -377,9 +415,12 @@ def main() -> None:
     p.add_argument("--vocoders", nargs="*", default=["vocos-ft"], help="registry names or checkpoint paths")
     p.add_argument("--extra", nargs="+", default=[], metavar="NAME=PATH", help="more vocoders: checkpoint paths")
     p.add_argument("--phases", nargs="+", default=["freya", "copy"], choices=["freya", "copy"])
-    p.add_argument("--copy-sets", nargs="+", default=["studio"], choices=["studio", "studio_gta", "val", "val_gta"],
-                   help="recorded mels of speaker 722 (studio) or of all speakers (val) in the val split; _gta: the "
-                   "acoustic model's mels of the same utterances under their ground-truth alignment and pitch")
+    p.add_argument("--copy-sets", nargs="+", default=["studio"], type=copy_set_name,
+                   help="recorded mels of speaker 722 (studio), of all speakers (val), of all but 722 (others) or of "
+                   "one speaker (spk<ID>) in the val split, or in another with @<split> (@unseen: train utterances "
+                   "--train-config does not train on); _gta: the acoustic model's mels of the same utterances under "
+                   "their ground-truth alignment and pitch")
+    p.add_argument("--train-config", default=None, help="the vocoder fine-tune's config (@unseen copy sets)")
     p.add_argument("--copy-num", type=int, default=100)
     p.add_argument("--num", type=int, default=100, help="Freya sentences")
     p.add_argument("--ref", default="bigvgan-v2-ft", help="reference vocoder for the Freya F0 / periodicity")

@@ -91,6 +91,10 @@ drifting-tts finetune-vocoder --config configs/vocoder_vocos_v2.yaml --workdir r
     tts.path=runs/tts_v3/model_ema.pt train.init_from=runs/vocos_bigvgan/last.pt
 ```
 
+`train.speaker_balance` (any vocoder fine-tune, opt-in) gives chosen speakers fixed shares of the batches.
+`configs/vocoder_vocos_v2_balance.yaml` continues the Vocos v2 run with more of the `male` and `female` voices
+([VOCODERS.md](VOCODERS.md#speaker-balance)).
+
 ## GAN-free vocoder fine-tuning (drifting, experimental)
 
 `vocoder.objective: drift` fine-tunes a Vocos or a BigVGAN-base **without a discriminator**. The drifting field in a

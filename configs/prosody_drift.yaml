@@ -57,4 +57,6 @@ calibrate:                 # per-voice duration factors at the end of training (
   enabled: true            # on training utterances); re-run: train-prosody --calibrate-only calibrate.temperature=T
   temperature: 1.0
   spread: 1.0              # output-space temperature of the operating point (the length depends on it)
-  pitch_temperature: null  # --calibrate-only: also store a preferred temperature of the pitch channel
+  duration_temperature: null  # the letters' durations at their own noise temperature (null: temperature; the pauses
+                           # keep it); stored as the preferred one
+  rhythm: {}               # voice -> speaker whose rhythm its sampled durations borrow, e.g. {389: 722, 323: 722}

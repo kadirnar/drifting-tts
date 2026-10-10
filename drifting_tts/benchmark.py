@@ -25,7 +25,7 @@ import soundfile as sf
 import torch
 
 from .audio import SAMPLE_RATE
-from .synthesize import add_prosody_channel_args, add_vocoder_args
+from .synthesize import add_vocoder_args, pause_arg
 from .voices import DEFAULT_VOICE, VOICES
 
 FREYA = "freyavoice/freya-tr-eval"
@@ -46,11 +46,17 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--save-wavs", type=int, default=20)
     p.add_argument("--stream", action="store_true", help="synthesise with Synthesizer.stream (streaming vocoder)")
     p.add_argument("--fast", action="store_true", help="CUDA graphs, Synthesizer(fast=True); implies --stream")
-    p.add_argument("--prosody", default=None, help="stochastic prosody predictor checkpoint (train-prosody)")
+    p.add_argument("--prosody", default=None, help="stochastic prosody predictor: drift or a train-prosody checkpoint")
     p.add_argument("--prosody-temperature", type=float, default=None, help="default: the checkpoint's preferred one")
     p.add_argument("--prosody-spread", type=float, default=1.0)
-    add_prosody_channel_args(p)
     p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled")
+    p.add_argument("--prosody-duration-temperature", type=float, default=None,
+                   help="noise temperature of the sampled durations (default: the checkpoint's preferred one, else "
+                        "--prosody-temperature)")
+    p.add_argument("--prosody-pitch-model", default=None,
+                   help="a second prosody predictor that samples the token pitch; the durations stay --prosody's")
+    p.add_argument("--pause", type=pause_arg, default=0.15,
+                   help="silence between the sentences of a multi-sentence item: seconds or 'punct' (per voice)")
     p.add_argument("--out", default="outputs/benchmark")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -90,9 +96,9 @@ def run(args) -> None:
     items = items[: args.num] if args.num else items
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel, fast=args.fast,
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
-                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations,
-                        prosody_pitch_temperature=args.prosody_pitch_temperature,
-                        prosody_pitch_spread=args.prosody_pitch_spread, prosody_pitch=args.prosody_pitch_model)
+                        prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations, pause=args.pause,
+                        prosody_duration_temperature=args.prosody_duration_temperature,
+                        prosody_pitch=args.prosody_pitch_model)
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
 
@@ -129,9 +135,9 @@ def run(args) -> None:
                "stream": args.stream or args.fast, "fast": args.fast,
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
                "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
-               "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations,
-               "prosody_pitch_temperature": synth.prosody_pitch_temperature if args.prosody else None,
-               "prosody_pitch_spread": args.prosody_pitch_spread, "prosody_pitch_model": args.prosody_pitch_model}
+               "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations, "pause": args.pause,
+               "prosody_duration_temperature": synth.prosody_duration_temperature if args.prosody else None,
+               "prosody_pitch_model": args.prosody_pitch_model}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
     (out / "results.md").write_text(format_table([res]) + "\n")
     print(format_table([res]))

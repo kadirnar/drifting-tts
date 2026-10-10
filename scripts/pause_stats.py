@@ -24,7 +24,7 @@ import torch
 
 from drifting_tts.audio import HOP_LENGTH, SAMPLE_RATE
 from drifting_tts.data import MelDataset
-from drifting_tts.prosody import FRAME_MS, PUNCTUATION, frame_level_db, silent_frames, token_targets
+from drifting_tts.prosody import FRAME_MS, PUNCTUATION, edge_silence, frame_level_db, silent_frames, token_targets
 from drifting_tts.text import SYMBOLS, split_sentences
 
 VOICES = (722, 389, 323)
@@ -91,19 +91,6 @@ def data_pauses(model, ds: MelDataset, items: list[int], device: str) -> dict:
 
 
 @torch.no_grad()
-def edge_silence(synth, texts: list[str], speaker: int) -> dict:
-    lead, trail = [], []
-    for k, text in enumerate(texts):
-        wav, _ = synth(text, speaker=speaker, cfg_scale=2.0, temperature=0.3, seed=k)
-        s = silent_frames(frame_level_db(wav.numpy()))
-        speech = np.nonzero(~s)[0]
-        if len(speech):
-            lead.append(speech[0] * FRAME_MS / 1000)
-            trail.append((len(s) - 1 - speech[-1]) * FRAME_MS / 1000)
-    return {"n": len(lead), "lead_mean": float(np.mean(lead)), "trail_mean": float(np.mean(trail)),
-            "lead_std": float(np.std(lead)), "trail_std": float(np.std(trail))}
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", default="runs/release/drifting_tts_v3.1.pt")

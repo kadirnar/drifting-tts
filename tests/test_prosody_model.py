@@ -5,6 +5,8 @@ from drifting_tts.models.prosody_net import (
     ProsodyNet,
     ProsodyPredictor,
     ProsodyStats,
+    boundary_tokens,
+    edge_tokens,
     prosody_features,
     word_index,
 )
@@ -175,30 +177,76 @@ def test_word_features_are_broadcast_to_their_tokens():
     assert torch.all(w[1, : n[1]] == 3) and torch.all(w[1, n[1]:] == 0)
 
 
+def test_durations_at_their_own_temperature_and_with_a_borrowed_rhythm():
+    """A second row of the sampler's batch gives the log-durations: the same noise draw at the duration temperature
+    for the letters (the pauses keep the call's), or for another speaker (all of them); the pitch stays the one-row
+    sample's."""
+    tts = _tiny_pitch_tts()
+    pred = ProsodyPredictor({"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4,
+                             "noise_glob": 4, "out_init": 1.0}, cond_dim=16 + 8 + 2).eval()
+    ids, lens, _ = _batch(["merhaba dünya, bugün nasılsın."])
+
+    def run(seed, spk=1, **kw):
+        g = torch.Generator().manual_seed(seed)
+        return pred.predict(tts, ids, lens, torch.tensor([spk]), 0.7, generator=g, **kw)
+
+    frames, pitch = run(0)
+    same_f, same_p = run(0, duration_temperature=0.7)  # two rows, equal temperatures: the one-row sample
+    torch.testing.assert_close(same_f, frames)
+    torch.testing.assert_close(same_p, pitch)
+    cold = [run(s, duration_temperature=0.0) for s in (0, 1)]
+    torch.testing.assert_close(cold[0][1], pitch)  # the pitch keeps the call's temperature and noise
+    gap = boundary_tokens(ids)
+    assert gap.any() and (~gap).any()
+    assert torch.equal(cold[0][0][~gap], cold[1][0][~gap])  # zero temperature: the same letters for every seed
+    torch.testing.assert_close(cold[0][0][gap], frames[gap])  # the pauses keep the call's temperature
+    assert not torch.equal(cold[0][1], cold[1][1])
+    borrowed_f, borrowed_p = run(0, duration_speaker=torch.tensor([0]))
+    torch.testing.assert_close(borrowed_p, pitch)  # pitch of speaker 1
+    torch.testing.assert_close(borrowed_f, run(0, spk=0)[0])  # all durations as speaker 0's
+    edged_f, _ = run(0, duration_speaker=torch.tensor([0]), edge_scale=1.3)  # the sentence's edges: speaker 1's own
+    edges = edge_tokens(lens, ids.shape[1])
+    _, _, logw, _ = tts.encoder(ids, lens, torch.tensor([1]))
+    torch.testing.assert_close(edged_f[edges], torch.ceil(torch.exp(logw[:, 0]) * 1.3)[edges])
+    torch.testing.assert_close(edged_f[~edges], borrowed_f[~edges])
+    assert edges.sum() == 5
+
+
 def _tiny_pred(**net):
     cfg = {"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4, "noise_glob": 4,
            "out_init": 1.0, **net}
     return ProsodyPredictor(cfg, cond_dim=16 + 8 + 2).eval()
 
 
-def test_pitch_temperature_sets_the_pitch_channel_apart():
-    tts, pred = _tiny_pitch_tts(), _tiny_pred()
-    ids, lens, _ = _batch(["merhaba dünya, nasılsın?"])
+def test_phase2_options_unset_keep_the_v32_sampler():
+    """Without sentence features, a context branch or a letter floor the predictor is v3.2's: a v3.2 ``net_cfg`` builds
+    the same network (context options without context are ignored) and ``predict`` is the condition, one draw (or
+    main's duration row), frames and pitch."""
+    base = _tiny_pred()
+    idle = _tiny_pred(sent_dim=0, ctx_pitch_only=True, ctx_boundaries=True, pitch_layers=3)  # no context: no branch
+    assert not idle.net.ctx_pitch_only and not idle.net.ctx_boundaries
+    def shapes(pred):
+        return {k: v.shape for k, v in pred.net.state_dict().items()}
+
+    assert shapes(idle) == shapes(base)
+    idle.net.load_state_dict(base.net.state_dict())
+    tts = _tiny_pitch_tts()
+    ids, lens, _ = _batch(["ali dün mü geldi? evet, geldi."])
     spk = torch.tensor([1])
+    assert base.sent_tokens(ids, lens) is None and base.word_tokens(ids, lens) is None
 
-    def run(t, tp=None, spread=1.0, pitch_spread=None):
-        return pred.predict(tts, ids, lens, spk, t, generator=torch.Generator().manual_seed(3), spread=spread,
-                            pitch_temperature=tp, pitch_spread=pitch_spread)
+    def run(pred, **kw):
+        return pred.predict(tts, ids, lens, spk, 0.5, 1.2, generator=torch.Generator().manual_seed(5), **kw)
 
-    f, p = run(0.5)
-    assert all(torch.equal(a, b) for a, b in zip(run(0.5, 0.5), (f, p)))  # equal temperatures: the one-pass sample
-    f2, p2 = run(0.5, 1.0)
-    assert torch.equal(f2, f) and not torch.equal(p2, p)  # durations from the first temperature
-    f3, p3 = run(1.0, 0.5)
-    assert torch.allclose(p3, p, atol=1e-5)  # pitch and voicing from the second one (batched: float tolerance)
-    fs, ps = run(1.0, 1.0, spread=0.5, pitch_spread=1.0)
-    fs2, ps2 = run(1.0, 1.0, spread=0.5, pitch_spread=0.0)
-    assert torch.equal(fs, fs2) and not torch.equal(ps, ps2)  # per-channel output-space spread
+    h, _, logw, x_mask = tts.encoder(ids, lens, spk)
+    cond, b0 = ProsodyPredictor.condition(tts, h, x_mask, spk, logw, base.stats)
+    ref = base.frames_and_pitch(*base._draw(cond, b0, x_mask, 0.5, torch.Generator().manual_seed(5), None), x_mask, 1.2)
+    for kw in ({}, {"duration_temperature": 0.3}, {"spread": 0.8}):
+        out = run(base, **kw)
+        assert all(torch.equal(a, b) for a, b in zip(run(idle, **kw), out))
+        assert all(torch.equal(a, b) for a, b in zip(run(base, min_letter_frames=0, rel_letter_floor=0, **kw), out))
+        if not kw:
+            assert all(torch.equal(a, b) for a, b in zip(out, ref))
 
 
 def test_floor_letters_raises_short_letters_only():
