@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import random
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -236,10 +238,15 @@ class BucketBatchSampler(Sampler[list[int]]):
         self.lengths, self.max_frames, self.max_batch = lengths, max_frames, max_batch
         self.bucket, self.seed, self.drop_last, self.epoch = bucket, seed, drop_last, 0
 
-    def _batches(self) -> list[list[int]]:
-        rng = random.Random(self.seed + self.epoch)
+    def _order(self, rng: random.Random) -> list[int]:
+        """The utterances of one epoch: every one once, shuffled."""
         order = list(range(len(self.lengths)))
         rng.shuffle(order)
+        return order
+
+    def _batches(self) -> list[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        order = self._order(rng)
         batches = []
         for s in range(0, len(order), self.bucket):
             chunk = sorted(order[s: s + self.bucket], key=lambda i: self.lengths[i])
@@ -260,3 +267,39 @@ class BucketBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         return len(self._batches())
+
+
+class WeightedBucketBatchSampler(BucketBatchSampler):
+    """:class:`BucketBatchSampler` whose epochs draw ``len(lengths)`` utterances with replacement, in proportion to
+    ``weights`` (e.g. :func:`speaker_balance_weights`), instead of taking every utterance once."""
+
+    def __init__(self, lengths: list[int], weights: list[float], **kw):
+        super().__init__(lengths, **kw)
+        if len(weights) != len(lengths) or min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError("weights: one non-negative weight per utterance, not all zero")
+        self.cum_weights = list(itertools.accumulate(float(w) for w in weights))
+
+    def _order(self, rng: random.Random) -> list[int]:
+        return rng.choices(range(len(self.lengths)), cum_weights=self.cum_weights, k=len(self.lengths))
+
+
+def speaker_balance_weights(speakers: list[int], lengths: list[int], shares: dict | None = None,
+                            temperature: float = 1.0) -> list[float]:
+    """Per-utterance sampling weights (summing to 1) that give speaker ``s`` the share ``shares[s]`` of the draws and
+    split the rest over the other speakers in proportion to ``frames_s ** temperature``, ``frames_s`` being the
+    speaker's total length: 1 in proportion to their audio, 0 every speaker equally often. A speaker's utterances
+    are drawn equally often, as by :class:`BucketBatchSampler`."""
+    shares = {int(k): float(v) for k, v in (shares or {}).items()}
+    count, frames = Counter(speakers), Counter()
+    for s, n in zip(speakers, lengths):
+        frames[s] += n
+    if unknown := sorted(set(shares) - set(count)):
+        raise ValueError(f"speaker_balance.shares: speakers {unknown} have no utterances")
+    rest = [s for s in count if s not in shares]
+    fixed = sum(shares.values())
+    if min(shares.values(), default=0.0) < 0 or fixed > 1 + 1e-9 or (not rest and fixed <= 0):
+        raise ValueError(f"speaker_balance.shares must be non-negative and sum to at most 1, got {shares}")
+    z = sum(frames[s] ** temperature for s in rest)
+    share = {**{s: max(0.0, 1 - fixed) * frames[s] ** temperature / z for s in rest}, **shares} if rest else \
+        {s: v / fixed for s, v in shares.items()}
+    return [share[s] / count[s] for s in speakers]

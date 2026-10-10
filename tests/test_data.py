@@ -140,3 +140,49 @@ def test_merge_data_keeps_the_base_and_appends_new_speakers(tmp_path):
     assert new["spk_id"] == 2 and new["offset"] == 7 and new["audio_offset"] == 7 * 256
     assert mels.shape[0] == f0.shape[0] == 14 and audio.shape[0] == 14 * 256
     assert mels[new["offset"], 0] == 0 and f0[new["offset"]] == 0  # first frame of the new voice's data
+
+
+def test_speaker_balance_weights_give_the_shares():
+    import pytest
+
+    from drifting_tts.data import speaker_balance_weights
+
+    speakers = [0] * 80 + [1] * 15 + [2] * 5
+    lengths = [100] * 80 + [100] * 15 + [300] * 5  # frames: speaker 1 has 1500, speaker 2 has 1500
+
+    def shares(w):
+        return {s: sum(x for x, t in zip(w, speakers) if t == s) for s in (0, 1, 2)}
+
+    w = speaker_balance_weights(speakers, lengths, {0: 0.5}, temperature=1.0)
+    assert sum(w) == pytest.approx(1.0) and len(set(w[:80])) == 1  # one speaker's utterances drawn alike
+    assert shares(w) == pytest.approx({0: 0.5, 1: 0.25, 2: 0.25})  # the rest in proportion to the frames
+    w = speaker_balance_weights(speakers, lengths, None, temperature=0.0)  # every speaker equally often
+    assert shares(w) == pytest.approx({0: 1 / 3, 1: 1 / 3, 2: 1 / 3})
+    w = speaker_balance_weights(speakers, lengths, {"2": 0.1}, temperature=1.0)  # keys may be strings (overrides)
+    assert shares(w) == pytest.approx({0: 0.9 * 8000 / 9500, 1: 0.9 * 1500 / 9500, 2: 0.1})
+    for bad in ({7: 0.1}, {0: 0.8, 1: 0.3}, {0: -0.1}):
+        with pytest.raises(ValueError):
+            speaker_balance_weights(speakers, lengths, bad)
+
+
+def test_weighted_bucket_sampler_draws_by_weight_and_resumes():
+    from collections import Counter
+
+    from drifting_tts.data import WeightedBucketBatchSampler, speaker_balance_weights
+
+    speakers = [0] * 90 + [1] * 10
+    lengths = [50 + i % 40 for i in range(100)]
+    w = speaker_balance_weights(speakers, lengths, {1: 0.5})
+    kw = dict(max_frames=400, max_batch=4, bucket=32, seed=3, drop_last=False)
+    sampler = WeightedBucketBatchSampler(lengths, w, **kw)
+    drawn = Counter()
+    for _ in range(40):
+        batches = list(iter(sampler))
+        assert all(len(b) <= 4 and len(b) * max(lengths[i] for i in b) <= 400 for b in batches)
+        drawn.update(speakers[i] for b in batches for i in b)
+    assert sampler.epoch == 40 and sum(drawn.values()) == 40 * 100  # len(lengths) draws per epoch
+    assert abs(drawn[1] / 4000 - 0.5) < 0.03  # 10% of the utterances, half of the draws
+    again = WeightedBucketBatchSampler(lengths, w, **kw)
+    again.epoch = 39  # restored from a checkpoint
+    sampler.epoch = 39
+    assert list(iter(again)) == list(iter(sampler))
