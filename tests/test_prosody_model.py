@@ -5,6 +5,7 @@ from drifting_tts.models.prosody_net import (
     ProsodyNet,
     ProsodyPredictor,
     ProsodyStats,
+    boundary_tokens,
     prosody_features,
     word_index,
 )
@@ -173,3 +174,32 @@ def test_word_features_are_broadcast_to_their_tokens():
     space = text_to_ids("bir iki.", normalized=True).index(text_to_ids(" ", normalized=True)[1])
     assert torch.all(w[0, :space] == 1) and torch.all(w[0, space: n[0]] == 2)
     assert torch.all(w[1, : n[1]] == 3) and torch.all(w[1, n[1]:] == 0)
+
+
+def test_durations_at_their_own_temperature_and_with_a_borrowed_rhythm():
+    """A second row of the sampler's batch gives the log-durations: the same noise draw at the duration temperature
+    for the letters (the pauses keep the call's), or for another speaker (all of them); the pitch stays the one-row
+    sample's."""
+    tts = _tiny_pitch_tts()
+    pred = ProsodyPredictor({"kind": "drift", "d": 32, "layers": 1, "heads": 2, "ffn": 64, "noise_tok": 4,
+                             "noise_glob": 4, "out_init": 1.0}, cond_dim=16 + 8 + 2).eval()
+    ids, lens, _ = _batch(["merhaba dünya, bugün nasılsın."])
+
+    def run(seed, spk=1, **kw):
+        g = torch.Generator().manual_seed(seed)
+        return pred.predict(tts, ids, lens, torch.tensor([spk]), 0.7, generator=g, **kw)
+
+    frames, pitch = run(0)
+    same_f, same_p = run(0, duration_temperature=0.7)  # two rows, equal temperatures: the one-row sample
+    torch.testing.assert_close(same_f, frames)
+    torch.testing.assert_close(same_p, pitch)
+    cold = [run(s, duration_temperature=0.0) for s in (0, 1)]
+    torch.testing.assert_close(cold[0][1], pitch)  # the pitch keeps the call's temperature and noise
+    gap = boundary_tokens(ids)
+    assert gap.any() and (~gap).any()
+    assert torch.equal(cold[0][0][~gap], cold[1][0][~gap])  # zero temperature: the same letters for every seed
+    torch.testing.assert_close(cold[0][0][gap], frames[gap])  # the pauses keep the call's temperature
+    assert not torch.equal(cold[0][1], cold[1][1])
+    borrowed_f, borrowed_p = run(0, duration_speaker=torch.tensor([0]))
+    torch.testing.assert_close(borrowed_p, pitch)  # pitch of speaker 1
+    torch.testing.assert_close(borrowed_f, run(0, spk=0)[0])  # all durations as speaker 0's

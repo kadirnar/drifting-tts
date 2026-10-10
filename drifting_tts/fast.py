@@ -25,6 +25,7 @@ import torch
 from torch import Tensor
 
 from .alignment import sequence_mask
+from .models.prosody_net import boundary_tokens
 from .models.text_encoder import durations_to_alignment, frames_to_alignment
 
 
@@ -75,13 +76,16 @@ class GraphedAcoustic:
     """:meth:`DriftingTTS.synthesize` (one step, one utterance) as bucketed CUDA graphs, with the same random draws.
 
     ``prosody``: a stochastic prosody predictor (:func:`graphable`) whose durations (``prosody_durations="sampled"``)
-    and token pitch replace the regressors', as ``ProsodyPredictor.predict`` followed by ``synthesize``."""
+    and token pitch replace the regressors', as ``ProsodyPredictor.predict`` followed by ``synthesize``.
+    ``duration_row``: the sampled durations get their own row in the predictor's batch (a duration temperature of
+    their own, another speaker's rhythm: ``ProsodyPredictor.sample``); every call then runs both rows."""
 
     def __init__(self, model, token_bucket: int = 32, frame_bucket: int = 64, compile: bool = False,
-                 tf32: bool = False, prosody=None, prosody_durations: str = "sampled"):
+                 tf32: bool = False, prosody=None, prosody_durations: str = "sampled", duration_row: bool = False):
         if not graphable(prosody):
             raise ValueError("this prosody predictor cannot run in a CUDA graph (flow matching, word features)")
         self.prosody, self.prosody_durations = prosody, prosody_durations
+        self.duration_row = bool(duration_row and prosody is not None and prosody_durations == "sampled")
         self.model, self.token_bucket, self.frame_bucket, self.tf32 = model, token_bucket, frame_bucket, tf32
         self.device = next(model.parameters()).device
         self.pool = torch.cuda.graph_pool_handle()
@@ -113,13 +117,38 @@ class GraphedAcoustic:
                 h, _ = m.pitch_condition(h, x_mask, spk, pitch)
                 return h, mu, logw, x_mask, frames
 
+            def encode_prosody2(ids: Tensor, length: Tensor, spk: Tensor, z_tok: Tensor, z_glob: Tensor,
+                                scale: Tensor, temps: Tensor, rspk: Tensor):
+                """As encode_prosody with the durations' row (ProsodyPredictor._draw): unit noise, the temperatures
+                (pitch, durations) and the speaker whose rhythm the durations follow."""
+                h, mu, logw, x_mask = m.encoder(ids, length, spk)
+                cond, base = pros.condition(m, h, x_mask, spk, logw, pros.stats)
+                hd, _, logwd, _ = m.encoder(ids, length, rspk)  # as the eager path: one encoder pass per speaker
+                cd, bd = pros.condition(m, hd, x_mask, rspk, logwd, pros.stats)
+                xm2 = torch.cat([x_mask, x_mask])
+                if pros.kind == "drift":
+                    out = pros.net(torch.cat([cond, cd]), xm2, torch.cat([z_tok * temps[0], z_tok * temps[1]]),
+                                   torch.cat([z_glob * temps[0], z_glob * temps[1]]))
+                else:
+                    out = pros.net(torch.cat([cond, cd]), xm2)
+                y = (torch.cat([base, bd]) + out[:, :2]) * xm2
+                own = (rspk == spk)[:, None, None]  # no borrowed rhythm: the pauses keep the first row's (predict)
+                ld = torch.where(boundary_tokens(ids)[:, None] & own, y[:1, :1], y[1:, :1])
+                y = torch.cat([ld, y[:1, 1:]], 1)
+                frames, pitch = pros.frames_and_pitch(y, out[:1, 2], x_mask, scale)
+                h, _ = m.pitch_condition(h, x_mask, spk, pitch)
+                return h, mu, logw, x_mask, frames
+
             bufs = [torch.zeros(1, nb, dtype=torch.long, device=dev), torch.full((1,), nb, device=dev),
                     torch.zeros(1, dtype=torch.long, device=dev)]
             if pros is not None:
                 net = pros.net
                 bufs += [torch.zeros(1, net.noise_tok, nb, device=dev), torch.zeros(1, net.noise_glob, device=dev),
                          torch.ones(1, device=dev)]
-            self.encoders[nb] = Graph(encode if pros is None else encode_prosody, bufs, self.pool, self.tf32)
+            if self.duration_row:
+                bufs += [torch.ones(2, device=dev), torch.zeros(1, dtype=torch.long, device=dev)]
+            fn = encode if pros is None else encode_prosody2 if self.duration_row else encode_prosody
+            self.encoders[nb] = Graph(fn, bufs, self.pool, self.tf32)
         return self.encoders[nb]
 
     def _generator(self, t: int) -> Graph:
@@ -148,9 +177,14 @@ class GraphedAcoustic:
 
     @torch.no_grad()
     def __call__(self, ids: Tensor, spk: Tensor, cfg_scale: float, temperature: float, length_scale: float,
-                 generator: torch.Generator | None = None, prosody_temperature: float = 1.0) -> Tensor:
+                 generator: torch.Generator | None = None, prosody_temperature: float = 1.0,
+                 duration_temperature: float | None = None, rhythm: Tensor | None = None) -> Tensor:
         """Token ids ``[1, N]`` -> normalised mel ``[1, n_mels, T]``, as ``synthesize`` with ``steps=1`` (with a
-        prosody predictor: as ``ProsodyPredictor.predict`` at ``prosody_temperature``, then ``synthesize``)."""
+        prosody predictor: as ``ProsodyPredictor.predict`` at ``prosody_temperature`` / ``duration_temperature``,
+        for the rhythm of speaker ``rhythm``, then ``synthesize``). The last two need ``duration_row``."""
+        if (duration_temperature is not None or rhythm is not None) and self.prosody_durations == "sampled" \
+                and not self.duration_row:
+            raise ValueError("a duration temperature or rhythm of its own needs GraphedAcoustic(duration_row=True)")
         n = ids.shape[1]
         enc = self._encoder(n)
         nb = enc.inputs[0].shape[1]
@@ -165,10 +199,18 @@ class GraphedAcoustic:
             z_glob = torch.zeros(1, net.noise_glob, device=self.device)
             if self.prosody.kind == "drift":
                 z_tok[..., :n] = torch.randn(1, net.noise_tok, n, device=self.device, generator=generator)
-                z_tok *= prosody_temperature
-                z_glob = torch.randn(1, net.noise_glob, device=self.device, generator=generator) * prosody_temperature
+                z_glob = torch.randn(1, net.noise_glob, device=self.device, generator=generator)
+                if not self.duration_row:  # the two-row graph scales the unit noise per row
+                    z_tok *= prosody_temperature
+                    z_glob = z_glob * prosody_temperature
             scale = torch.full((1,), float(length_scale), device=self.device)
-            h, mu, logw, x_mask, frames = enc(padded, torch.tensor([n], device=self.device), spk, z_tok, z_glob, scale)
+            extra = []
+            if self.duration_row:
+                dt = prosody_temperature if duration_temperature is None else duration_temperature
+                extra = [torch.tensor([prosody_temperature, dt], dtype=torch.float32, device=self.device),
+                         spk if rhythm is None else rhythm]
+            h, mu, logw, x_mask, frames = enc(padded, torch.tensor([n], device=self.device), spk, z_tok, z_glob, scale,
+                                              *extra)
             if self.prosody_durations == "sampled":
                 attn, y_len = frames_to_alignment(frames, x_mask)
             else:
