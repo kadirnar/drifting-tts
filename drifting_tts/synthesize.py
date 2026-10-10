@@ -13,7 +13,8 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
-from .audio import SAMPLE_RATE
+from .audio import HOP_LENGTH, SAMPLE_RATE
+from .chunked import Chunking
 from .data import MelStats
 from .latents import VAE_BACKENDS
 from .text import normalize, split_sentences, text_to_ids  # noqa: F401 (split_sentences re-exported)
@@ -369,6 +370,50 @@ class Synthesizer:
                                        pitch_shift=pitch_shift, steps=steps, durations=durations, pitch=pitch)
         return mel
 
+    def _prepare(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
+                 length_scale: float, prosody_temperature: float | None = None,
+                 rhythm: tuple[torch.Tensor, float] | None = None) -> tuple[torch.Tensor, ...]:
+        """:meth:`_mel` without the DiT, for :mod:`drifting_tts.chunked`: the noise scaled by ``temperature``
+        ``[1, n_mels, T]``, the aligned condition ``[1, C, T]``, the CFG scale ``[1]`` and the style codes, with the
+        same draws from ``g`` (CUDA graphs for the encoder when ``fast`` allows it)."""
+        ids = torch.tensor([text_to_ids(sentence, normalized=True)], device=self.device)
+        pt = self.prosody_temperature if prosody_temperature is None else prosody_temperature
+        dt = self.prosody_duration_temperature if self.prosody_durations == "sampled" else None
+        if dt is None and self._duration_row():
+            dt = pt
+        rs, edge_scale = (None, None) if rhythm is None else (rhythm[0], length_scale * rhythm[1])
+        if self.acoustic is not None:
+            return self.acoustic.prepare(ids, spk, cfg_scale, temperature, length_scale, generator=g,
+                                         prosody_temperature=1.0 if pt is None else pt, duration_temperature=dt,
+                                         rhythm=rs, edge_scale=edge_scale)
+        ids_len = torch.tensor([ids.shape[1]], device=self.device)
+        durations = pitch = None
+        if self.prosody is not None:  # as _mel
+            durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
+                                                    spread=self.prosody_spread, duration_temperature=dt,
+                                                    duration_speaker=rs, edge_scale=edge_scale)
+            if self.prosody_pitch is not None:
+                _, pitch = self.prosody_pitch.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
+                                                      spread=self.prosody_spread)
+            if self.prosody_durations == "regressor":
+                durations = None
+        cond, _ = self.model.aligned_condition(ids, ids_len, spk, length_scale, durations=durations, pitch=pitch)
+        z = torch.randn(1, self.model.n_mels, cond.shape[-1], device=self.device, generator=g)
+        labels = self.model.style_codes(1, self.device, g)
+        return z * temperature, cond, torch.full((1,), float(cfg_scale), device=self.device), labels
+
+    def _window_generator(self):
+        """``generate(z, cond, spk, alpha, mask, labels)`` of :class:`~drifting_tts.chunked.WindowedMel` for one
+        request: the acoustic model's CUDA graphs when ``fast``, else the eager rollout."""
+        if self.acoustic is not None:
+            return self.acoustic.generate_window
+        model = self.model
+
+        def generate(z, cond, spk, alpha, mask, labels):
+            return model.rollout(z, cond, spk, alpha, model.generator.num_steps, mask=mask, noise_labels=labels)
+
+        return generate
+
     @torch.no_grad()
     def mels(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
              length_scale: float = 1.0, seed: int = 0, prosody_temperature: float | None = None) -> list[torch.Tensor]:
@@ -415,12 +460,22 @@ class Synthesizer:
     @torch.no_grad()
     def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
                length_scale: float = 1.0, seed: int = 0, pause: Pause | None = None,
-               first: int = 32, chunk: int = 256, prosody_temperature: float | None = None) -> Iterator[torch.Tensor]:
+               first: int = 32, chunk: int = 256, prosody_temperature: float | None = None,
+               chunked: Chunking | bool | None = None) -> Iterator[torch.Tensor]:
         """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
 
         Each sentence is generated in one pass. The vocoder then streams: the first ``first`` mel frames (0.34 s), then
         ``chunk``-frame windows, each with the vocoder's ``context`` (32 frames for BigVGAN-v2; see
-        :func:`drifting_tts.fast.stream_vocoder`). A vocoder without one (Griffin-Lim) yields each sentence whole."""
+        :func:`drifting_tts.fast.stream_vocoder`). A vocoder without one (Griffin-Lim) yields each sentence whole.
+
+        ``chunked`` (a :class:`~drifting_tts.chunked.Chunking`, or ``True`` for its defaults): the DiT streams too.
+        It runs on windows of the sentence (the first one ``first`` + the vocoder's context + ``right`` frames long),
+        so the first piece no longer waits for the whole sentence's mel; ``chunk`` is then ``chunked.chunk``. The
+        output is another sample of the same model, not the same audio (docs/LATENCY.md)."""
+        if chunked:
+            yield from self._stream_chunked(text, speaker, cfg_scale, temperature, length_scale, seed, pause, first,
+                                            prosody_temperature, Chunking() if chunked is True else chunked)
+            return
         from .fast import stream_vocoder
 
         spk, tempo = self._speaker(speaker)
@@ -437,6 +492,38 @@ class Synthesizer:
             for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, context=self.vocoder.context,
                                         graphs=self.vocoder_graphs):
                 yield piece.cpu()
+
+    def _stream_chunked(self, text: str, speaker: str | int, cfg_scale: float, temperature: float,
+                        length_scale: float, seed: int, pause: Pause | None, first: int,
+                        prosody_temperature: float | None, chunking: Chunking) -> Iterator[torch.Tensor]:
+        """:meth:`stream` with the DiT on windows (:mod:`drifting_tts.chunked`): each vocoder window runs as soon as
+        the DiT has committed its frames."""
+        from .batched import stream_windows
+        from .chunked import WindowedMel
+        from .fast import vocode_window
+
+        spk, tempo = self._speaker(speaker)
+        rhythm = self._rhythm(speaker)
+        pause = self._pause(pause, speaker)
+        g = torch.Generator(device=self.device).manual_seed(seed)
+        rng, previous = random.Random(seed), None
+        voc, ctx = self.vocoder, self.vocoder.context
+        sizes = () if ctx is None else (first + ctx, chunking.chunk + 2 * ctx)
+        generate = self._window_generator()
+        for sentence in split_sentences(normalize(text)):
+            z, cond, alpha, labels = self._prepare(sentence, spk, g, cfg_scale, temperature, length_scale * tempo,
+                                                   prosody_temperature, rhythm)
+            t = z.shape[-1]
+            wm = WindowedMel(generate, z, cond, spk, alpha, labels, [t], chunking, first + (ctx or 0))
+            if previous is not None:
+                yield silence(pause, previous, rng)
+            previous = sentence
+            for a, b, start, n in stream_windows(t, first, chunking.chunk, ctx):
+                while wm.committed[0] < b:
+                    wm.step([0])
+                x = self.stats.denormalize(wm.mel[..., a:b])
+                yield vocode_window(voc, x, self.vocoder_graphs, sizes)[start * HOP_LENGTH: (start + n) * HOP_LENGTH
+                                                                        ].cpu()
 
     def _pause(self, pause: Pause | None, speaker: str | int):
         """The pause of a call: ``"punct"`` uses the prosody predictor's measured edge silence of this voice when its

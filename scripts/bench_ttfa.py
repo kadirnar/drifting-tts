@@ -6,6 +6,9 @@ TTFA runs from the input text to the first audio on the host. ``--mode``:
 - ``fast``: ``stream`` with CUDA graphs (``Synthesizer(fast=True)``); ``--compile`` / ``--tf32`` add
   ``torch.compile`` / TF32 matmuls.
 
+``--chunked`` (``stream`` / ``fast``): the DiT streams too, on frame windows (``Synthesizer.stream(chunked=...)``), so
+TTFA no longer waits for the whole first sentence's mel.
+
 ``--prosody`` samples the token pitch (and, unless ``--prosody-durations regressor``, the durations) with a stochastic
 prosody predictor (``drift`` or a checkpoint); in ``fast`` mode it runs inside the acoustic model's CUDA graphs.
 ``--release`` loads a published release (``Synthesizer.from_pretrained``); the other options override its parts.
@@ -71,12 +74,14 @@ def run(synth: Synthesizer, text: str, seed: int, speaker: int, temperature: flo
 
 
 @torch.no_grad()
-def run_stream(synth: Synthesizer, text: str, seed: int, speaker: int, temperature: float, cfg: float) -> dict:
+def run_stream(synth: Synthesizer, text: str, seed: int, speaker: int, temperature: float, cfg: float,
+               chunked=None) -> dict:
     """:meth:`Synthesizer.stream`: TTFA is the arrival of its first piece on the host."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     marks, samples = {}, 0
-    for piece in synth.stream(text, speaker=speaker, cfg_scale=cfg, temperature=temperature, seed=seed, pause=0.0):
+    for piece in synth.stream(text, speaker=speaker, cfg_scale=cfg, temperature=temperature, seed=seed, pause=0.0,
+                              chunked=chunked):
         if not marks:
             marks["ttfa"] = time.perf_counter() - t0
             marks["first_audio_s"] = piece.numel() / SAMPLE_RATE
@@ -107,8 +112,16 @@ def main() -> None:
     p.add_argument("--speaker", default=DEFAULT_VOICE, help="voice name or speaker ID")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--cfg", type=float, default=2.0)
+    p.add_argument("--chunked", action="store_true",
+                   help="--mode stream / fast: the DiT streams too, on frame windows (drifting_tts.chunked)")
+    p.add_argument("--chunk-right", type=int, default=64, help="--chunked: the DiT's lookahead in frames")
+    p.add_argument("--chunk-left", type=int, default=32, help="--chunked: left context of the later windows")
+    p.add_argument("--chunk-size", type=int, default=256, help="--chunked: frames committed per later window")
+    p.add_argument("--crossfade", type=int, default=16, help="--chunked: frames blended at each join")
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
+    if args.chunked and args.mode == "sentence":
+        p.error("--chunked streams: use --mode stream or fast")
     opts = dict(cuda_kernel=args.cuda_kernel, fast=args.mode == "fast", compile=args.compile, tf32=args.tf32,
                 prosody_temperature=args.prosody_temperature,
                 prosody_duration_temperature=args.prosody_duration_temperature)
@@ -130,12 +143,21 @@ def main() -> None:
     args.vocoder, args.prosody_durations = synth.vocoder.name, synth.prosody_durations
     kw = dict(speaker=voice_id(args.speaker), temperature=args.temperature, cfg=args.cfg)
     fn = run if args.mode == "sentence" else run_stream
+    if args.chunked:
+        from functools import partial
+
+        from drifting_tts.chunked import Chunking
+
+        fn = partial(run_stream, chunked=Chunking(right=args.chunk_right, left=args.chunk_left,
+                                                  chunk=args.chunk_size, crossfade=args.crossfade))
 
     cold = fn(synth, TEXTS["long sentence"], 0, **kw)  # first call after loading: CUDA / cuDNN initialisation
     for _ in range(10):
         fn(synth, TEXTS["4-sentence paragraph"], 1, **kw)
     res = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda_kernel": args.cuda_kernel,
            "release": args.release, "mode": args.mode, "compile": args.compile, "tf32": args.tf32,
+           "chunked": {k: getattr(args, k) for k in ("chunk_right", "chunk_left", "chunk_size", "crossfade")}
+           if args.chunked else None,
            "vocoder": args.vocoder, "prosody": args.prosody if args.prosody or not synth.prosody else "release",
            "prosody_durations": args.prosody_durations if synth.prosody else None,
            "prosody_duration_temperature": synth.prosody_duration_temperature if synth.prosody else None,

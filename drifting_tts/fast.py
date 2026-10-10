@@ -191,6 +191,33 @@ class GraphedAcoustic:
         prosody predictor: as ``ProsodyPredictor.predict`` at ``prosody_temperature`` / ``duration_temperature``,
         for the rhythm of speaker ``rhythm`` with the voice's regressor durations at ``edge_scale`` on the sentence's
         edges, then ``synthesize``). The last three need ``duration_row``."""
+        z, cond, alpha, labels = self.prepare(ids, spk, cfg_scale, temperature, length_scale, generator,
+                                              prosody_temperature, duration_temperature, rhythm, edge_scale)
+        return self.generate_window(z, cond, spk, alpha, None, labels)
+
+    @torch.no_grad()
+    def generate_window(self, z: Tensor, cond: Tensor, spk: Tensor, alpha: Tensor, mask: Tensor | None,
+                        labels: Tensor) -> Tensor:
+        """The DiT's CUDA graph of the frame bucket of ``z`` ``[1, n_mels, t]`` (scaled noise) and ``cond``
+        ``[1, C, t]``: the normalised mel ``[1, n_mels, t]`` (``mask`` is ignored: all ``t`` frames are valid)."""
+        t = z.shape[-1]
+        gen = self._generator(t)
+        tb = gen.inputs[0].shape[-1]
+        z_pad = torch.zeros(1, self.model.n_mels, tb, device=self.device)
+        z_pad[..., :t] = z
+        cond_pad = torch.zeros(1, cond.shape[1], tb, device=self.device)
+        cond_pad[..., :t] = cond
+        mask = sequence_mask(torch.tensor([t], device=self.device), tb)
+        return gen(z_pad, cond_pad, mask, spk, alpha, labels)[..., :t].clone()
+
+    @torch.no_grad()
+    def prepare(self, ids: Tensor, spk: Tensor, cfg_scale: float, temperature: float, length_scale: float,
+                generator: torch.Generator | None = None, prosody_temperature: float = 1.0,
+                duration_temperature: float | None = None, rhythm: Tensor | None = None,
+                edge_scale: float | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """The DiT's inputs of :meth:`__call__` (the encoder's graph, the alignment and the draws): the noise scaled
+        by ``temperature`` ``[1, n_mels, T]``, the aligned condition ``[1, C, T]``, the CFG scale ``[1]`` and the
+        style codes."""
         if (duration_temperature is not None or rhythm is not None) and self.prosody_durations == "sampled" \
                 and not self.duration_row:
             raise ValueError("a duration temperature or rhythm of its own needs GraphedAcoustic(duration_row=True)")
@@ -229,18 +256,20 @@ class GraphedAcoustic:
         t = cond.shape[-1]
         # the same draws, in the same order, as DriftingTTS.synthesize / rollout
         z = torch.randn(1, self.model.n_mels, t, device=self.device, generator=generator)
-        net = self.model.generator
-        labels = torch.randint(0, net.noise_classes, (1, max(1, net.noise_coords)), device=self.device,
-                               generator=generator)
-        gen = self._generator(t)
-        tb = gen.inputs[0].shape[-1]
-        z_pad = torch.zeros(1, self.model.n_mels, tb, device=self.device)
-        z_pad[..., :t] = z * temperature
-        cond_pad = torch.zeros(1, cond.shape[1], tb, device=self.device)
-        cond_pad[..., :t] = cond
-        mask = sequence_mask(y_len, tb)
+        labels = self.model.style_codes(1, self.device, generator)
         alpha = torch.full((1,), float(cfg_scale), device=self.device)
-        return gen(z_pad, cond_pad, mask, spk, alpha, labels)[..., :t].clone()
+        return z * temperature, cond, alpha, labels
+
+
+def vocode_window(vocode: Callable[[Tensor], Tensor], x: Tensor, graphs: dict | None, sizes: tuple[int, ...]) -> Tensor:
+    """``vocode(x)[0]`` for a window ``x`` ``[1, n_mels, w]``: as a CUDA graph cached in ``graphs`` when ``w`` is one of
+    ``sizes`` (the fixed window sizes of :func:`stream_vocoder`), else eagerly."""
+    w = x.shape[-1]
+    if graphs is None or w not in sizes:
+        return vocode(x)[0]
+    if w not in graphs:
+        graphs[w] = Graph(vocode, [torch.zeros_like(x)], pool=graphs.get("pool"))
+    return graphs[w](x)[0]
 
 
 def stream_vocoder(vocode: Callable[[Tensor], Tensor], mel: Tensor, hop: int = 256, first: int = 32,
@@ -255,12 +284,7 @@ def stream_vocoder(vocode: Callable[[Tensor], Tensor], mel: Tensor, hop: int = 2
         return
 
     def run(a: int, b: int) -> Tensor:
-        x = mel[..., a:b]
-        if graphs is None or b - a not in (first + context, chunk + 2 * context):
-            return vocode(x)[0]
-        if b - a not in graphs:
-            graphs[b - a] = Graph(vocode, [torch.zeros_like(x)], pool=graphs.get("pool"))
-        return graphs[b - a](x)[0]
+        return vocode_window(vocode, mel[..., a:b], graphs, (first + context, chunk + 2 * context))
 
     yield run(0, first + context)[: first * hop].clone()
     for s in range(first, t, chunk):
