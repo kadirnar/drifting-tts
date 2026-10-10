@@ -142,3 +142,64 @@ def test_batchable_prosody_sources(tmp_path):
     assert not batchable(other)  # a duration row of its own: not batched
     with pytest.raises(NotImplementedError):
         synth_mels(other, ["merhaba."], 2, 1.0, 1.0, [torch.Generator()])
+
+
+@pytest.mark.parametrize("buckets", [2, 3])
+def test_length_buckets_keep_every_row(buckets):
+    from drifting_tts.batched import Serving, length_groups
+
+    groups = length_groups([5, 1, 4, 4, 9, 2], buckets)
+    assert sorted(sum(groups, [])) == list(range(6)) and len(groups) == buckets
+    model, pred = _models()
+    ids = [text_to_ids(t) for t in TEXTS]
+    gens = lambda: [torch.Generator().manual_seed(s) for s in range(4)]  # noqa: E731
+    ref, ref_len = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7)
+    mel, lens = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7,
+                               serving=Serving(buckets=buckets, min_bucket=1))
+    assert torch.equal(lens, ref_len)
+    torch.testing.assert_close(mel, ref, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_in_place_draws_on_cuda_match_single_requests():
+    """On CUDA the per-request noise is drawn in place into the padded batch: the same values as torch.randn."""
+    model, pred = _models()
+    model, pred = model.cuda(), pred.cuda()
+    ids = [text_to_ids(t) for t in TEXTS]
+    tf32, torch.backends.cudnn.allow_tf32 = torch.backends.cudnn.allow_tf32, False  # exact convolutions
+    try:
+        _compare_cuda(model, pred, ids)
+    finally:
+        torch.backends.cudnn.allow_tf32 = tf32
+
+
+def _compare_cuda(model, pred, ids):
+    mel, lens = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3,
+                               [torch.Generator(device="cuda").manual_seed(s) for s in range(4)], prosody=pred,
+                               prosody_temperature=0.7)
+    for b, x in enumerate(ids):
+        g = torch.Generator(device="cuda").manual_seed(b)
+        text, n, s = torch.tensor([x], device="cuda"), torch.tensor([len(x)], device="cuda"), \
+            torch.tensor([2], device="cuda")
+        durations, pitch = pred.predict(model, text, n, s, 0.7, 1.3, generator=g)
+        ref, _ = model.synthesize(text, n, s, cfg_scale=1.5, temperature=0.5, length_scale=1.3, generator=g,
+                                  durations=durations, pitch=pitch)
+        t = int(lens[b])
+        torch.testing.assert_close(mel[b: b + 1, :, :t], ref, rtol=0, atol=1e-4)
+
+
+def test_expand_by_durations_is_the_alignment_matmul():
+    from drifting_tts.batched import expand_by_durations
+    from drifting_tts.models.text_encoder import frames_to_alignment
+    from drifting_tts.models.tts import DriftingTTS
+
+    torch.manual_seed(0)
+    h, mu = torch.randn(3, 5, 7), torch.randn(3, 4, 7)
+    frames = torch.randint(0, 4, (3, 7)).float()
+    frames[2] = 0  # no frames at all: one zero frame, as frames_to_alignment
+    x_mask = torch.ones(3, 1, 7)
+    x_mask[1, :, 5:] = 0
+    attn, y_len = frames_to_alignment(frames, x_mask)
+    ref = DriftingTTS.frame_condition(h, mu, attn)
+    got = expand_by_durations(torch.cat([mu, h], 1), frames * x_mask[:, 0], int(y_len.max()))
+    assert torch.equal(got, ref)

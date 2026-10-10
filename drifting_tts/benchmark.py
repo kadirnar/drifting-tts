@@ -57,6 +57,33 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="a second prosody predictor that samples the token pitch; the durations stay --prosody's")
     p.add_argument("--pause", type=pause_arg, default=0.15,
                    help="silence between the sentences of a multi-sentence item: seconds or 'punct' (per voice)")
+    p.add_argument("--chunked", action="store_true",
+                   help="stream the DiT on frame windows (drifting_tts.chunked; implies --stream)")
+    p.add_argument("--chunk-right", type=int, default=64, help="--chunked: the DiT's lookahead in frames")
+    p.add_argument("--chunk-left", type=int, default=32, help="--chunked: left context of the later windows")
+    p.add_argument("--chunk-size", type=int, default=256, help="--chunked: frames committed per later window")
+    p.add_argument("--crossfade", type=int, default=16, help="--chunked: frames blended at each join")
+    p.add_argument("--noise", choices=["torch", "philox"], default="torch",
+                   help="--chunked: the noise scheme (philox: counter-based, drifting_tts.noise)")
+    p.add_argument("--dit-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the DiT's precision (autocast)")
+    p.add_argument("--prosody-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the prosody predictor network's precision (autocast)")
+    p.add_argument("--fast-serving", action="store_true",
+                   help="Serving.fast(): buckets, fp16 text encoder / prosody network / DiT / vocoder, all compiled")
+    p.add_argument("--buckets", type=int, default=1, help="--batch: length buckets of the batched passes")
+    p.add_argument("--compile-dit", action="store_true", help="--batch: torch.compile the batched DiT")
+    p.add_argument("--text-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the text encoder's precision (autocast; the duration rounding stays fp32)")
+    p.add_argument("--vocoder-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the batched vocoder's precision (autocast)")
+    p.add_argument("--compile-text", action="store_true", help="--batch: torch.compile the text pass")
+    p.add_argument("--min-bucket", type=int, default=64, help="--batch: rows per length bucket at least")
+    p.add_argument("--pipeline", action="store_true", help="first round group by group, each yielded when ready")
+    p.add_argument("--compile-vocoder", action="store_true", help="torch.compile the batched vocoder")
+    p.add_argument("--batch", type=int, default=0,
+                   help="synthesise the sentences N at a time with drifting_tts.batched.stream_batched (the serving "
+                        "path; one voice; seed = sentence index as without it; 0: one at a time)")
     p.add_argument("--out", default="outputs/benchmark")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -84,6 +111,30 @@ def band_match(wav: torch.Tensor, band: int) -> np.ndarray:
     return torchaudio.functional.resample(x, SAMPLE_RATE, 16_000).numpy()
 
 
+def batch_synthesize(synth, items: list[dict], args, temperature: float, chunked,
+                     serving) -> list[tuple[torch.Tensor, dict]]:
+    """Every sentence through :func:`drifting_tts.batched.stream_batched`, ``args.batch`` at a time (seed = sentence
+    index): ``(waveform, {"rtf_total"})`` per sentence, the RTF of its batch."""
+    from .batched import stream_batched
+
+    if len(args.speaker) != 1:
+        raise ValueError("--batch synthesises one voice")
+    out = []
+    for s in range(0, len(items), args.batch):
+        idx = list(range(s, min(s + args.batch, len(items))))
+        pieces = {i: [] for i in idx}
+        t0 = time.perf_counter()
+        for rnd in stream_batched(synth, [items[i]["text"] for i in idx], speaker=args.speaker[0],
+                                  cfg_scale=args.cfg, temperature=temperature, seeds=idx, pause=None, chunked=chunked,
+                                  serving=serving):
+            for j, p in rnd:
+                pieces[idx[j]].append(p)
+        wavs = [torch.cat(pieces[i]) for i in idx]
+        rtf = (time.perf_counter() - t0) / max(sum(w.numel() for w in wavs) / SAMPLE_RATE, 1e-6)
+        out += [(w, {"rtf_total": rtf}) for w in wavs]
+    return out
+
+
 def run(args) -> None:
     from .evaluate import _plain, format_table, summarize
     from .judges import load_judges
@@ -102,20 +153,42 @@ def run(args) -> None:
     temperature = synth.default_temperature if args.temperature is None else args.temperature
     judges = load_judges(args.asr, None, args.mos, args.device)
 
+    chunked = None
+    if args.chunked:
+        from .chunked import Chunking
+
+        chunked = Chunking(right=args.chunk_right, left=args.chunk_left, chunk=args.chunk_size,
+                           crossfade=args.crossfade, noise=args.noise)
+    serving = None
+    if args.batch:
+        from .batched import Serving
+
+        serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
+                          prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
+                          compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype,
+                          compile_vocoder=args.compile_vocoder, pipeline=args.pipeline)
+        if args.fast_serving:
+            serving = Serving.fast(pipeline=args.pipeline)
+    elif (args.dit_dtype, args.prosody_dtype, args.text_dtype, args.vocoder_dtype) != ("fp32",) * 4 \
+            or args.buckets != 1 or args.compile_dit or args.compile_text or args.compile_vocoder \
+            or args.fast_serving or args.pipeline:
+        raise ValueError("--fast-serving, --buckets, --*-dtype, --compile-* and --pipeline apply to --batch")
+
     def generate(text: str, speaker: str, seed: int) -> tuple[torch.Tensor, dict]:
-        if not (args.stream or args.fast):
+        if not (args.stream or args.fast or chunked):
             return synth(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature, seed=seed)
         t0 = time.perf_counter()
         wav = torch.cat(list(synth.stream(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature,
-                                          seed=seed)))
+                                          seed=seed, chunked=chunked)))
         return wav, {"rtf_total": (time.perf_counter() - t0) / max(wav.numel() / SAMPLE_RATE, 1e-6)}
 
     generate("Merhaba.", args.speaker[0], 0)  # warm-up for the RTF
+    batched = batch_synthesize(synth, items, args, temperature, chunked, serving) if args.batch else None
 
     rows = []
     for i, item in enumerate(items):
         spk = args.speaker[i % len(args.speaker)]
-        wav, info = generate(item["text"], spk, i)
+        wav, info = batched[i] if batched else generate(item["text"], spk, i)
         ref = _plain(item["text"])
         row = {"id": item.get("id", i), "speaker": spk, "ref": ref, "rtf": info["rtf_total"]}
         if judges.asr is not None:
@@ -132,7 +205,9 @@ def run(args) -> None:
     res = {"system": "drifting_tts", "temperature": temperature, "cfg": args.cfg, **summarize(rows),
            "rtf": float(np.mean([r["rtf"] for r in rows]))}
     results = {"texts": args.texts, "sentences": len(rows), "band_hz": args.band, "voices": args.speaker,
-               "stream": args.stream or args.fast, "fast": args.fast,
+               "stream": args.stream or args.fast or args.chunked or args.batch > 0, "fast": args.fast,
+               "batch": args.batch, "serving": None if serving is None else vars(serving),
+               "chunked": None if chunked is None else vars(chunked),
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
                "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
                "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations, "pause": args.pause,

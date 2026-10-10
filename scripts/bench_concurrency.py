@@ -33,8 +33,9 @@ import numpy as np
 import torch
 
 from drifting_tts.audio import HOP_LENGTH, SAMPLE_RATE
-from drifting_tts.batched import batchable, stream_batched, synth_mels, vocode_masked
+from drifting_tts.batched import Serving, batchable, stream_batched, synth_mels, synth_prepare, vocode_masked
 from drifting_tts.benchmark import FREYA, load_texts
+from drifting_tts.chunked import Chunking, WindowedMel
 from drifting_tts.synthesize import Synthesizer, add_vocoder_args
 from drifting_tts.text import normalize, split_sentences
 from drifting_tts.voices import DEFAULT_VOICE, voice_id
@@ -94,7 +95,7 @@ def run_batched(synth, texts: list[str], kw: dict, group: int | None = None) -> 
     for s in range(0, len(texts), group):
         idx = list(range(s, min(s + group, len(texts))))
         for out in stream_batched(synth, [texts[i] for i in idx], seeds=[kw["seeds"][i] for i in idx],
-                                  **kw["stream"]):
+                                  serving=kw["serving"], **kw["stream"]):
             t = time.perf_counter() - t0
             for j, piece in out:
                 events[idx[j]].append((t, piece.numel()))
@@ -166,7 +167,7 @@ def measure_single(name: str, synth, texts: list[str], kw: dict, runs: int) -> d
     peaks = []
     for warm in (True, False):
         for j in range(min(runs, 10) if warm else runs):
-            sub = {"seeds": [kw["seeds"][j]], "stream": kw["stream"]}
+            sub = {"seeds": [kw["seeds"][j]], "stream": kw["stream"], "serving": kw["serving"]}
             torch.cuda.reset_peak_memory_stats()
             ev = run_fifo(synth, [texts[j]], sub) if name == "fifo" else run_batched(synth, [texts[j]], sub)
             if not warm:
@@ -185,10 +186,12 @@ def measure_single(name: str, synth, texts: list[str], kw: dict, runs: int) -> d
 @torch.no_grad()
 def profile_first_round(synth, texts: list[str], kw: dict, repeats: int = 5) -> dict:
     """Stages of the batched first round (synchronised between stages): frontend (normalisation and sentence split
-    on the host), acoustic model (with the per-request noise draws), first vocoder windows, copy to the host."""
-    from drifting_tts.batched import _take, stream_windows
+    on the host), acoustic model (with the per-request noise draws; chunked: the text encoder, prosody predictor and
+    draws, then the DiT's first windows), first vocoder windows, copy to the host."""
+    from drifting_tts.batched import _take, batched_generator, stream_windows
 
-    st = kw["stream"]
+    st, sv = kw["stream"], kw["serving"]
+    chunking = st.get("chunked")
     rows = []
     for r in range(repeats + 1):
         torch.cuda.synchronize()
@@ -196,7 +199,18 @@ def profile_first_round(synth, texts: list[str], kw: dict, repeats: int = 5) -> 
         first = [split_sentences(normalize(t))[0] for t in texts]
         t1 = time.perf_counter()
         gens = [torch.Generator(device=synth.device).manual_seed(s) for s in kw["seeds"][: len(texts)]]
-        mel, lens = synth_mels(synth, first, st["speaker"], st["cfg_scale"], st["temperature"], gens)
+        if chunking is None:
+            mel, lens = synth_mels(synth, first, st["speaker"], st["cfg_scale"], st["temperature"], gens, serving=sv)
+            t_prep = None
+        else:
+            z, cond, spk, alpha, labels, lens = synth_prepare(synth, first, st["speaker"], st["cfg_scale"],
+                                                              st["temperature"], gens, serving=sv)
+            torch.cuda.synchronize()
+            t_prep = time.perf_counter()
+            wm = WindowedMel(batched_generator(synth.model, sv.dit_dtype, sv.compile), z, cond, spk, alpha, labels,
+                             lens.tolist(), chunking, 32 + synth.vocoder.context)
+            wm.step()
+            mel = wm.mel
         mel = synth.stats.denormalize(mel)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
@@ -210,10 +224,13 @@ def profile_first_round(synth, texts: list[str], kw: dict, repeats: int = 5) -> 
         wav.cpu()
         t4 = time.perf_counter()
         if r:  # the first pass is a warm-up
-            rows.append((t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0))
+            rows.append((t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0, (t_prep or t2) - t1, t2 - (t_prep or t1)))
     med = np.median(np.array(rows), 0) * 1000
-    return {k: round(float(v), 2) for k, v in zip(("frontend_ms", "acoustic_ms", "vocoder_ms", "to_host_ms",
-                                                    "total_ms"), med)}
+    out = {k: round(float(v), 2) for k, v in zip(("frontend_ms", "acoustic_ms", "vocoder_ms", "to_host_ms",
+                                                   "total_ms", "encoder_prosody_ms", "dit_ms"), med)}
+    if chunking is None:
+        out.pop("encoder_prosody_ms"), out.pop("dit_ms")
+    return out
 
 
 def snr(ref: torch.Tensor, x: torch.Tensor) -> float:
@@ -256,12 +273,14 @@ def check(synth, texts: list[str], kw: dict) -> dict:
     eager.acoustic, eager.vocoder_graphs = None, None
     first = [split_sentences(normalize(t))[0] for t in texts]
     gens = [torch.Generator(device=synth.device).manual_seed(s) for s in seeds]
-    mel, lens = synth_mels(synth, first, st["speaker"], st["cfg_scale"], st["temperature"], gens)
+    mel, lens = synth_mels(synth, first, st["speaker"], st["cfg_scale"], st["temperature"], gens,
+                           serving=kw["serving"])
     pieces = {i: [] for i in range(len(texts))}
-    for out in stream_batched(synth, texts, seeds=seeds, **st):
+    for out in stream_batched(synth, texts, seeds=seeds, serving=kw["serving"], **st):
         for i, p in out:
             pieces[i].append(p)
     res = {"requests": len(texts)}
+    chunked = st.get("chunked") is not None
     for name in ("batched", "reference"):
         mel_snr, wav_snr, wav_mel, wav_worst, frames, samples = [], [], [], [], 0, 0
         for b, (text, s) in enumerate(zip(texts, seeds)):
@@ -272,9 +291,11 @@ def check(synth, texts: list[str], kw: dict) -> dict:
             else:
                 got = eager.mels(text, st["speaker"], st["cfg_scale"], st["temperature"], seed=s)[0]
                 wav = torch.cat(list(eager.stream(text, seed=s, **st)))
-            if got.shape == ref.shape:
+            if got.shape == ref.shape and not chunked:  # chunked: the mel is compared through the audio only
                 frames += 1
                 mel_snr.append(snr(synth.stats.normalize(ref), synth.stats.normalize(got)))
+            elif got.shape == ref.shape:
+                frames += 1
             ref_wav = torch.cat(list(synth.stream(text, seed=s, **st)))
             if wav.numel() == ref_wav.numel():
                 samples += 1
@@ -282,7 +303,8 @@ def check(synth, texts: list[str], kw: dict) -> dict:
                 mean, worst = mel_distance(ref_wav, wav)
                 wav_mel.append(mean)
                 wav_worst.append(worst)
-        res[name] = {"frames_equal": frames, "samples_equal": samples, "mel_snr_db": _stats(mel_snr),
+        res[name] = {"frames_equal": frames, "samples_equal": samples,
+                     "mel_snr_db": _stats(mel_snr) if mel_snr else None,
                      "audio_snr_db": _stats(wav_snr), "audio_logmel_db": _stats(wav_mel),
                      "audio_logmel_worst_0.1s_db": _stats(wav_worst)}
     return res
@@ -309,8 +331,42 @@ def main() -> None:
     p.add_argument("--tf32", action="store_true",
                    help="TF32 matmuls everywhere (the fast path's CUDA graphs and the batched passes); changes the "
                         "output slightly (default: fp32 as shipped)")
+    p.add_argument("--chunked", action="store_true",
+                   help="stream the DiT too (drifting_tts.chunked): every strategy runs it on frame windows")
+    p.add_argument("--chunk-right", type=int, default=64, help="--chunked: the DiT's lookahead in frames")
+    p.add_argument("--chunk-left", type=int, default=32, help="--chunked: left context of the later windows")
+    p.add_argument("--chunk-size", type=int, default=256, help="--chunked: frames committed per later window")
+    p.add_argument("--crossfade", type=int, default=16, help="--chunked: frames blended at each join")
+    p.add_argument("--noise", choices=["torch", "philox"], default="torch",
+                   help="--chunked: the noise scheme (philox: counter-based, drifting_tts.noise)")
+    p.add_argument("--dit-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the DiT's precision (autocast; changes the output)")
+    p.add_argument("--prosody-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the prosody predictor network's precision (autocast)")
+    p.add_argument("--fast-serving", action="store_true",
+                   help="Serving.fast(): buckets, fp16 text encoder / prosody network / DiT / vocoder, all compiled")
+    p.add_argument("--buckets", type=int, default=1,
+                   help="batched strategies: length buckets of the text encoder and prosody predictor (and of the "
+                        "whole-sentence DiT)")
+    p.add_argument("--compile-dit", action="store_true", help="batched strategies: torch.compile the DiT")
+    p.add_argument("--text-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the text encoder's precision (autocast; the duration rounding stays fp32)")
+    p.add_argument("--vocoder-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the batched vocoder's precision (autocast)")
+    p.add_argument("--compile-text", action="store_true", help="batched strategies: torch.compile the text pass")
+    p.add_argument("--min-bucket", type=int, default=64, help="batched strategies: rows per length bucket at least")
+    p.add_argument("--pipeline", action="store_true", help="first round group by group, each yielded when ready")
+    p.add_argument("--compile-vocoder", action="store_true", help="torch.compile the batched vocoder")
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
+    chunking = Chunking(right=args.chunk_right, left=args.chunk_left, chunk=args.chunk_size,
+                        crossfade=args.crossfade, noise=args.noise) if args.chunked else None
+    serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
+                      prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
+                      compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype,
+                      compile_vocoder=args.compile_vocoder, pipeline=args.pipeline)
+    if args.fast_serving:
+        serving = Serving.fast(pipeline=args.pipeline)
 
     env = environment(Path(__file__).resolve().parents[1])  # before loading: other processes on the GPU
     over = {"vocoder": args.vocoder} if args.vocoder else {}
@@ -323,7 +379,7 @@ def main() -> None:
     texts = request_mix(args.texts, n_max, args.paragraph_every, args.paragraph_sentences)
     kw = {"seeds": list(range(n_max)),
           "stream": dict(speaker=voice_id(args.speaker), cfg_scale=args.cfg, temperature=args.temperature,
-                         pause=args.pause)}
+                         pause=args.pause, chunked=chunking), "serving": serving}
     res = {"env": env,
            "config": {**{k: v for k, v in vars(args).items() if k != "out"}, "vocoder_name": synth.vocoder.name,
                       "prosody": synth.prosody is not None, "prosody_durations": synth.prosody_durations,

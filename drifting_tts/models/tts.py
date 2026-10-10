@@ -59,9 +59,7 @@ class DriftingTTS(nn.Module):
         Unless given, one style code per trajectory is drawn from ``generator`` (the RNG of ``z``), so a seeded
         generator fully determines the output."""
         if kw.get("noise_labels") is None:
-            net = self.generator
-            kw["noise_labels"] = torch.randint(0, net.noise_classes, (spk.shape[0], max(1, net.noise_coords)),
-                                               device=spk.device, generator=generator)
+            kw["noise_labels"] = self.style_codes(spk.shape[0], spk.device, generator)
         x = z
         for k in range(steps):
             x = self.generate(x, cond, spk, cfg_scale, step=k, **kw)
@@ -71,6 +69,27 @@ class DriftingTTS(nn.Module):
     def frame_condition(h: Tensor, mu: Tensor, attn: Tensor) -> Tensor:
         """Aligned generator condition ``[B, n_mels + d, T]``: prior mean and text features."""
         return torch.cat([expand(mu, attn), expand(h, attn)], 1)
+
+    @torch.no_grad()
+    def aligned_condition(self, text: Tensor, text_len: Tensor, spk: Tensor, length_scale: float = 1.0,
+                          pitch_shift: float = 0.0, durations: Tensor | None = None,
+                          pitch: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        """The text half of :meth:`synthesize`: the generator's aligned condition ``[B, n_mels + d, T]`` and the mel
+        lengths ``[B]`` (same arguments)."""
+        h, mu, logw, x_mask = self.encoder(text, text_len, spk)
+        if self.pitch_enabled:
+            h, _ = self.pitch_condition(h, x_mask, spk, pitch, pitch_shift=pitch_shift)
+        if durations is None:
+            attn, y_len = durations_to_alignment(logw, x_mask, length_scale)
+        else:
+            attn, y_len = frames_to_alignment(durations, x_mask)
+        return self.frame_condition(h, mu, attn), y_len
+
+    def style_codes(self, batch: int, device, generator: torch.Generator | None = None) -> Tensor:
+        """One style code per trajectory ``[B, noise_coords]``, drawn as :meth:`rollout` draws them."""
+        net = self.generator
+        return torch.randint(0, net.noise_classes, (batch, max(1, net.noise_coords)), device=device,
+                             generator=generator)
 
     @torch.no_grad()
     def synthesize(self, text: Tensor, text_len: Tensor, spk: Tensor, cfg_scale: float = 1.0,
@@ -83,15 +102,8 @@ class DriftingTTS(nn.Module):
         ``z`` and the style codes both come from ``generator``. Returns normalised mels and lengths.
         Prosody overrides (:mod:`drifting_tts.prosody`): ``durations`` (frames per token ``[B, N]``, used as they are,
         without ``length_scale``) and ``pitch`` (normalised token log-F0 ``[B, 1, N]``) replace the predicted ones."""
-        h, mu, logw, x_mask = self.encoder(text, text_len, spk)
-        if self.pitch_enabled:
-            h, _ = self.pitch_condition(h, x_mask, spk, pitch, pitch_shift=pitch_shift)
-        if durations is None:
-            attn, y_len = durations_to_alignment(logw, x_mask, length_scale)
-        else:
-            attn, y_len = frames_to_alignment(durations, x_mask)
-        cond = self.frame_condition(h, mu, attn)
-        z = torch.randn(cond.shape[0], mu.shape[1], cond.shape[-1], device=cond.device, generator=generator)
+        cond, y_len = self.aligned_condition(text, text_len, spk, length_scale, pitch_shift, durations, pitch)
+        z = torch.randn(cond.shape[0], self.n_mels, cond.shape[-1], device=cond.device, generator=generator)
         mask = sequence_mask(y_len, cond.shape[-1])
         alpha = torch.full((text.shape[0],), float(cfg_scale), device=text.device)
         steps = self.generator.num_steps if steps is None else steps
