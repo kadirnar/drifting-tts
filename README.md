@@ -227,6 +227,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 |---|---|
 | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | **experiment log**: every experiment since v3.1, what worked and what did not, pitfalls, open work |
 | [docs/RESULTS.md](docs/RESULTS.md) | benchmark details, voices, latency and parameter counts |
+| [docs/LATENCY.md](docs/LATENCY.md) | time to first audio of v3.2: one request, and 64 / 128 / 256 requests at once (one by one, batched, micro-batched) |
 | [docs/SPEAKERS.md](docs/SPEAKERS.md) | WER, CER, DNSMOS, UTMOSv2, pitch and speaking rate of all 723 speaker IDs |
 | [docs/VOCODERS.md](docs/VOCODERS.md) | the vocoder registry and a comparison on the same mels: quality, speed, streaming |
 | [docs/TRAINING.md](docs/TRAINING.md) | the training recipe, the evidence behind each choice, adding a voice |
@@ -241,6 +242,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
 | [scripts/bench_ttfa.py](scripts/bench_ttfa.py) | latency benchmark |
+| [scripts/bench_concurrency.py](scripts/bench_concurrency.py) | latency of N requests arriving at once ([docs/LATENCY.md](docs/LATENCY.md)) |
 | [scripts/eval_release.sh](scripts/eval_release.sh) | the evaluation of a release against v3.1 (Freya, prosody); `scripts/prepare_release.py` stages its files |
 | [scripts/compare_vocoders.py](scripts/compare_vocoders.py) | vocoder comparison ([docs/VOCODERS.md](docs/VOCODERS.md)) |
 

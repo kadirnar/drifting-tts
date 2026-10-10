@@ -8,11 +8,14 @@ TTFA runs from the input text to the first audio on the host. ``--mode``:
 
 ``--prosody`` samples the token pitch (and, unless ``--prosody-durations regressor``, the durations) with a stochastic
 prosody predictor (``drift`` or a checkpoint); in ``fast`` mode it runs inside the acoustic model's CUDA graphs.
+``--release`` loads a published release (``Synthesizer.from_pretrained``); the other options override its parts.
+Under concurrency (many requests at once): ``scripts/bench_concurrency.py``.
 
     python scripts/bench_ttfa.py --mode fast --cuda-kernel     # weights from huggingface.co/Vyvo/drifting-tts-tr
     python scripts/bench_ttfa.py --mode fast --vocoder bigvgan-base --cuda-kernel   # any vocoder of the registry
     python scripts/bench_ttfa.py --model drifting_tts_v3.2.pt --mode fast --vocoder vocos-v2 --prosody drift \
         --prosody-durations regressor                                                # release v3.2
+    python scripts/bench_ttfa.py --release v3.2 --mode fast                          # the same, from the Hub
 """
 
 import argparse
@@ -85,13 +88,19 @@ def run_stream(synth: Synthesizer, text: str, seed: int, speaker: int, temperatu
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model", default=None, help="TTS checkpoint (default: Vyvo/drifting-tts-tr)")
+    p.add_argument("--release", default=None, help="a published release (Synthesizer.from_pretrained), e.g. v3.2")
+    p.add_argument("--model", default=None, help="TTS checkpoint (default: the release's, else Vyvo/drifting-tts-tr "
+                                                 "v3.1)")
     add_vocoder_args(p, default="bigvgan-v2-ft")  # fine-tuned BigVGAN-v2 from Vyvo/drifting-tts-tr
+    p.set_defaults(vocoder=None)  # None: the release's, else bigvgan-v2-ft
     p.add_argument("--mode", choices=["sentence", "stream", "fast"], default="sentence")
     p.add_argument("--prosody", default=None, help="stochastic prosody predictor: drift or a checkpoint")
     p.add_argument("--prosody-temperature", type=float, default=None, help="default: the checkpoint's")
-    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default="sampled",
-                   help="regressor: only the token pitch is sampled (release v3.2)")
+    p.add_argument("--prosody-durations", choices=["sampled", "regressor"], default=None,
+                   help="regressor: only the token pitch is sampled (release v3.2); default: the release's, else "
+                        "sampled")
+    p.add_argument("--prosody-duration-temperature", type=float, default=None,
+                   help="noise temperature of the sampled letters' durations (default: the checkpoint's)")
     p.add_argument("--compile", action="store_true", help="--mode fast: also torch.compile the DiT")
     p.add_argument("--tf32", action="store_true", help="--mode fast: TF32 matmuls")
     p.add_argument("--runs", type=int, default=100)
@@ -100,15 +109,25 @@ def main() -> None:
     p.add_argument("--cfg", type=float, default=2.0)
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
-    if args.model is None:
-        from huggingface_hub import hf_hub_download
-
-        args.model = hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt")
+    opts = dict(cuda_kernel=args.cuda_kernel, fast=args.mode == "fast", compile=args.compile, tf32=args.tf32,
+                prosody_temperature=args.prosody_temperature,
+                prosody_duration_temperature=args.prosody_duration_temperature)
+    given = {k: v for k, v in (("model", args.model), ("vocoder", args.vocoder), ("prosody", args.prosody),
+                               ("prosody_durations", args.prosody_durations)) if v is not None}
+    if str(given.get("prosody", "")).lower() == "none":  # the model's deterministic regressors
+        given["prosody"] = None
     t = time.perf_counter()
-    synth = Synthesizer(args.model, "cuda", vocoder=args.vocoder, cuda_kernel=args.cuda_kernel,
-                        fast=args.mode == "fast", compile=args.compile, tf32=args.tf32, prosody=args.prosody,
-                        prosody_temperature=args.prosody_temperature, prosody_durations=args.prosody_durations)
+    if args.release:
+        synth = Synthesizer.from_pretrained(args.release, "cuda", **opts, **given)
+    else:
+        if args.model is None:
+            from huggingface_hub import hf_hub_download
+
+            args.model = hf_hub_download("Vyvo/drifting-tts-tr", "drifting_tts_v3.1.pt")
+        synth = Synthesizer(args.model, "cuda", vocoder=args.vocoder or "bigvgan-v2-ft", prosody=args.prosody,
+                            prosody_durations=args.prosody_durations or "sampled", **opts)
     load_s = time.perf_counter() - t
+    args.vocoder, args.prosody_durations = synth.vocoder.name, synth.prosody_durations
     kw = dict(speaker=voice_id(args.speaker), temperature=args.temperature, cfg=args.cfg)
     fn = run if args.mode == "sentence" else run_stream
 
@@ -116,16 +135,18 @@ def main() -> None:
     for _ in range(10):
         fn(synth, TEXTS["4-sentence paragraph"], 1, **kw)
     res = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda_kernel": args.cuda_kernel,
-           "mode": args.mode, "compile": args.compile, "tf32": args.tf32, "vocoder": args.vocoder,
-           "prosody": args.prosody, "prosody_durations": args.prosody_durations if args.prosody else None,
+           "release": args.release, "mode": args.mode, "compile": args.compile, "tf32": args.tf32,
+           "vocoder": args.vocoder, "prosody": args.prosody if args.prosody or not synth.prosody else "release",
+           "prosody_durations": args.prosody_durations if synth.prosody else None,
+           "prosody_duration_temperature": synth.prosody_duration_temperature if synth.prosody else None,
            "prosody_graphed": synth.prosody is not None and synth.acoustic is not None,
            "peak_gb": None, "load_s": round(load_s, 1),
            "cold_ttfa_ms": round(1000 * cold["ttfa"], 1), "rows": {}}
     print(f"{res['gpu']}, mode {args.mode}, compile {args.compile}, tf32 {args.tf32}, cuda kernel {args.cuda_kernel}, "
-          f"vocoder {args.vocoder}, prosody {args.prosody} (graphed: {res['prosody_graphed']}): "
+          f"vocoder {args.vocoder}, prosody {res['prosody']} (graphed: {res['prosody_graphed']}): "
           f"load {load_s:.1f} s, cold first call TTFA {res['cold_ttfa_ms']} ms")
-    head = ("input", "TTFA p50", "p90", "1st audio", "total", "RTF")
-    print(f"{head[0]:22s} " + " ".join(f"{h:>{w}s}" for h, w in zip(head[1:], (9, 7, 9, 8, 7))))
+    head = ("input", "TTFA p50", "p90", "p99", "1st audio", "total", "RTF")
+    print(f"{head[0]:22s} " + " ".join(f"{h:>{w}s}" for h, w in zip(head[1:], (9, 7, 7, 9, 8, 7))))
     for name, text in TEXTS.items():
         runs = [fn(synth, text, seed, **kw) for seed in range(args.runs)]
 
@@ -133,13 +154,15 @@ def main() -> None:
             return np.array([r[k] for r in runs])
 
         row = {"ttfa_ms_p50": 1000 * np.median(get("ttfa")), "ttfa_ms_p90": 1000 * np.percentile(get("ttfa"), 90),
+               "ttfa_ms_p99": 1000 * np.percentile(get("ttfa"), 99),
                "first_audio_s": get("first_audio_s").mean(), "total_ms": 1000 * np.median(get("total")),
                "audio_s": get("audio_s").mean()}
         if args.mode == "sentence":
             row |= {"acoustic_ms": 1000 * np.median(get("acoustic")), "vocoder_ms": 1000 * np.median(get("vocoder"))}
         row["rtf"] = row["total_ms"] / 1000 / row["audio_s"]
         res["rows"][name] = {k: round(float(v), 4 if k == "rtf" else 2) for k, v in row.items()}
-        print(f"{name:22s} {row['ttfa_ms_p50']:7.1f}ms {row['ttfa_ms_p90']:5.1f}ms {row['first_audio_s']:8.2f}s "
+        print(f"{name:22s} {row['ttfa_ms_p50']:7.1f}ms {row['ttfa_ms_p90']:5.1f}ms {row['ttfa_ms_p99']:5.1f}ms "
+              f"{row['first_audio_s']:8.2f}s "
               f"{row['total_ms']:6.1f}ms {row['rtf']:7.4f}")
     res["peak_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
     if args.out:
