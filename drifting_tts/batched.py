@@ -36,24 +36,34 @@ from .text import normalize, split_sentences, text_to_ids
 class Serving:
     """Speed options of the batched passes; the defaults are the reference behaviour (docs/LATENCY.md).
 
-    ``buckets``: the batch's sentences are sorted by length and split into this many groups for the text encoder and
-    the prosody predictor (and, without chunking, for the DiT), so less of each pass is padding (each row as without
-    them, up to float rounding). ``dit_dtype`` / ``prosody_dtype``: run the DiT / the prosody predictor's network under
-    autocast in ``"fp16"`` or ``"bf16"`` (they change the output: a quality check is needed). ``compile``:
-    ``torch.compile`` the DiT (dynamic shapes; the first batch compiles it, about half a minute)."""
+    ``buckets``: a batch's sentences are sorted by length and split into up to this many groups of at least
+    ``min_bucket`` rows for the text encoder and the prosody predictor (and, without chunking, for the DiT), so less
+    of each pass is padding; in the first round the text frontend of each group runs while the GPU works on the
+    groups before it. Each row is as without them, up to float rounding.
+    ``dit_dtype`` / ``text_dtype`` / ``prosody_dtype``: the DiT / the text encoder / the prosody predictor's network
+    under autocast in ``"fp16"`` or ``"bf16"`` (the duration and pitch regressors and the durations' rounding stay
+    fp32). They change the output: a quality check is needed (docs/LATENCY.md).
+    ``vocoder_dtype``: the batched Vocos under autocast (``"fp16"``: log-mel distance 0.014 dB against fp32).
+    ``compile`` / ``compile_text``: ``torch.compile`` the DiT / the text pass (dynamic shapes; compiled on the first
+    batch, about half a minute each); float rounding changes, so a duration can round to another frame."""
 
     buckets: int = 1
+    min_bucket: int = 64
     dit_dtype: str | None = None
     prosody_dtype: str | None = None
     compile: bool = False
+    text_dtype: str | None = None
+    compile_text: bool = False
+    vocoder_dtype: str | None = None
 
 
-def length_groups(lengths: list[int], buckets: int) -> list[list[int]]:
-    """Row indices in ``buckets`` groups of consecutive lengths (one group, in order, for ``buckets`` <= 1)."""
-    if buckets <= 1 or len(lengths) < 2:
+def length_groups(lengths: list[int], buckets: int, min_rows: int = 1) -> list[list[int]]:
+    """Row indices in up to ``buckets`` groups of consecutive lengths, each of at least ``min_rows`` rows (one group,
+    in order, for ``buckets`` <= 1)."""
+    k = min(buckets, len(lengths) // max(1, min_rows))
+    if k <= 1:
         return [list(range(len(lengths)))]
     order = sorted(range(len(lengths)), key=lambda i: lengths[i])
-    k = min(buckets, len(order))
     return [order[j * len(order) // k: (j + 1) * len(order) // k] for j in range(k)]
 
 
@@ -66,41 +76,63 @@ def _randn(out: Tensor, g: torch.Generator) -> None:
         out.copy_(torch.randn(out.shape, generator=g))
 
 
-def _encode(model, ids: list[list[int]], spk: int, length_scale: float, generators: list[torch.Generator],
-            prosody, prosody_temperature: float, prosody_durations: str, prosody_dtype: str | None) -> tuple:
-    """The text half of :func:`prepare_batch` for one group, queued on the GPU without reading anything back: the
-    prosody noise (each row's first draws), the text encoder, the prosody predictor, the token pitch and the
-    integer durations. Returns ``(h, mu, x_mask, durations)``."""
-    dev = next(model.parameters()).device
-    lens = [len(x) for x in ids]
-    B, n = len(ids), max(lens)
-    text = torch.tensor([x + [0] * (n - len(x)) for x in ids]).to(dev)
-    text_len = torch.tensor(lens, device=dev)
-    spk = torch.full((B,), int(spk), dtype=torch.long, device=dev)
-    drift = prosody is not None and prosody.kind == "drift"
-    if drift:  # ProsodyPredictor._draw: token noise, then global noise, from each request's generator
-        net = prosody.net
-        z_tok = torch.zeros(B, net.noise_tok, n, device=dev)
-        z_glob = torch.empty(B, net.noise_glob, device=dev)
-        for b, g in enumerate(generators):
-            _randn(z_tok[b, :, : lens[b]], g)
-            _randn(z_glob[b], g)
-    h, mu, logw, x_mask = model.encoder(text, text_len, spk)
+def _text_pass(model, prosody, text: Tensor, text_len: Tensor, spk: Tensor, z_tok: Tensor | None,
+               z_glob: Tensor | None, prosody_temperature: float, length_scale: float, regressor_durations: bool,
+               text_dtype: str | None = None, prosody_dtype: str | None = None) -> tuple:
+    """The text encoder, the prosody predictor, the token pitch and the integer durations of a padded batch (no host
+    synchronisation; the noise is given): ``(h, mu, x_mask, durations)``. ``text_dtype``: the encoder under
+    autocast; the duration and pitch regressors and the rounding of the durations stay fp32 (on its output)."""
+    dt = text_dtype not in (None, "fp32")
+    with autocast(text_dtype, text.device.type):
+        h, mu, logw, x_mask = model.encoder(text, text_len, spk)
+    if dt:  # the durations from the fp32 regressor on the encoder's output
+        h, mu = h.float(), mu.float()
+        s = model.encoder.spk(spk)[:, :, None].expand(-1, -1, h.shape[-1])
+        logw = model.encoder.duration(torch.cat([h, s], 1), x_mask)
     frames = None
     if prosody is None:
         if model.pitch_enabled:
             h, _ = model.pitch_condition(h, x_mask, spk)
     else:
         cond, base = prosody.condition(model, h, x_mask, spk, logw, prosody.stats)
-        with autocast(prosody_dtype, dev.type):
-            out = (prosody.net(cond, x_mask, z_tok * prosody_temperature, z_glob * prosody_temperature) if drift
-                   else prosody.net(cond, x_mask))
+        with autocast(prosody_dtype, text.device.type):
+            out = (prosody.net(cond, x_mask, z_tok * prosody_temperature, z_glob * prosody_temperature)
+                   if prosody.kind == "drift" else prosody.net(cond, x_mask))
         out = out.float()
         frames, pitch = prosody.frames_and_pitch((base + out[:, :2]) * x_mask, out[:, 2], x_mask, length_scale)
         h, _ = model.pitch_condition(h, x_mask, spk, pitch)
-    if frames is None or prosody_durations == "regressor":  # durations_to_alignment's frames
+    if frames is None or regressor_durations:  # durations_to_alignment's frames
         frames = torch.ceil(torch.exp(logw) * x_mask * length_scale).clamp_min(0)[:, 0]
     return h, mu, x_mask, frames
+
+
+def _encode(model, ids: list[list[int]], spk: int, length_scale: float, generators: list[torch.Generator],
+            prosody, prosody_temperature: float, prosody_durations: str, serving: Serving | None = None) -> tuple:
+    """The text half of :func:`prepare_batch` for one group, queued on the GPU without reading anything back: the
+    prosody noise (each row's first draws), then :func:`_text_pass`. Returns ``(h, mu, x_mask, durations)``."""
+    sv = serving or Serving()
+    dev = next(model.parameters()).device
+    lens = [len(x) for x in ids]
+    B, n = len(ids), max(lens)
+    text = torch.tensor([x + [0] * (n - len(x)) for x in ids]).to(dev)
+    text_len = torch.tensor(lens, device=dev)
+    spk = torch.full((B,), int(spk), dtype=torch.long, device=dev)
+    z_tok = z_glob = None
+    if prosody is not None and prosody.kind == "drift":  # ProsodyPredictor._draw: token noise, then global noise
+        net = prosody.net
+        z_tok = torch.zeros(B, net.noise_tok, n, device=dev)
+        z_glob = torch.empty(B, net.noise_glob, device=dev)
+        for b, g in enumerate(generators):
+            _randn(z_tok[b, :, : lens[b]], g)
+            _randn(z_glob[b], g)
+    fn = _text_pass
+    if sv.compile_text:
+        if getattr(model, "_compiled_text_pass", None) is None:
+            logging.getLogger("torch.utils._sympy.interp").setLevel(logging.ERROR)
+            model._compiled_text_pass = torch.compile(_text_pass, dynamic=True)
+        fn = model._compiled_text_pass
+    return fn(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature), float(length_scale),
+              prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
 
 
 @torch.no_grad()
@@ -143,15 +175,15 @@ def _finish(model, groups: list[list[int]], encoded: list[tuple], spk: int, cfg_
 @torch.no_grad()
 def prepare_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temperature: float, length_scale: float,
                   generators: list[torch.Generator], prosody=None, prosody_temperature: float = 1.0,
-                  prosody_durations: str = "sampled", buckets: int = 1,
-                  prosody_dtype: str | None = None) -> tuple[Tensor, ...]:
+                  prosody_durations: str = "sampled", serving: Serving | None = None) -> tuple[Tensor, ...]:
     """The DiT's inputs of :func:`acoustic_batch` (the text encoder, the prosody predictor, the alignment and every
     row's draws): the noise scaled by ``temperature`` ``[B, n_mels, T]`` and the aligned condition ``[B, C, T]``
     (both zero after each row's length), the speaker ids ``[B]``, the CFG scales ``[B]``, the style codes and the
-    lengths ``[B]``. ``buckets`` / ``prosody_dtype``: :class:`Serving`."""
-    groups = length_groups([len(x) for x in ids], buckets)
+    lengths ``[B]``. ``serving``: :class:`Serving` (length buckets, precision, compilation of the text pass)."""
+    sv = serving or Serving()
+    groups = length_groups([len(x) for x in ids], sv.buckets, sv.min_bucket)
     encoded = [_encode(model, [ids[r] for r in rows], spk, length_scale, [generators[r] for r in rows], prosody,
-                       prosody_temperature, prosody_durations, prosody_dtype) for rows in groups]
+                       prosody_temperature, prosody_durations, serving) for rows in groups]
     return _finish(model, groups, encoded, spk, cfg_scale, temperature, generators)
 
 
@@ -188,17 +220,17 @@ def acoustic_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temp
     sv = serving or Serving()
     z, cond, spk, alpha, labels, y_len = prepare_batch(model, ids, spk, cfg_scale, temperature, length_scale,
                                                        generators, prosody, prosody_temperature, prosody_durations,
-                                                       sv.buckets, sv.prosody_dtype)
+                                                       sv)
     generate = batched_generator(model, sv.dit_dtype, sv.compile)
-    return _dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv.buckets), y_len
+    return _dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv), y_len
 
 
 def _dit_whole(generate, z: Tensor, cond: Tensor, spk: Tensor, alpha: Tensor, labels: Tensor, y_len: Tensor,
-               buckets: int) -> Tensor:
+               serving: Serving) -> Tensor:
     """Whole-sentence mels of a padded batch, zero after each row's length (in length buckets: each one trimmed to
     its longest row)."""
     T, t = cond.shape[-1], y_len.tolist()
-    groups = length_groups(t, buckets)
+    groups = length_groups(t, serving.buckets, serving.min_bucket)
     if len(groups) == 1:
         mask = sequence_mask(y_len, T)
         return generate(z, cond, spk, alpha, mask, labels) * mask[:, None]
@@ -249,7 +281,7 @@ def synth_prepare(synth, sentences: list[str], speaker, cfg_scale: float, temper
     ids, spk, tempo, pt = _batch_args(synth, sentences, speaker, prosody_temperature)
     sv = serving or Serving()
     return prepare_batch(synth.model, ids, spk, cfg_scale, temperature, length_scale * tempo, generators,
-                         synth.prosody, pt, synth.prosody_durations, sv.buckets, sv.prosody_dtype)
+                         synth.prosody, pt, synth.prosody_durations, sv)
 
 
 def _masked_vocos(model, x: Tensor, m: Tensor) -> Tensor:
@@ -260,7 +292,7 @@ def _masked_vocos(model, x: Tensor, m: Tensor) -> Tensor:
     h = bb.norm(h.transpose(1, 2)).transpose(1, 2)
     for block in bb.convnext:
         h = block(h * m)
-    h = head.out(bb.final_layer_norm(h.transpose(1, 2))).transpose(1, 2)
+    h = head.out(bb.final_layer_norm(h.transpose(1, 2))).transpose(1, 2).float()  # the inverse STFT in fp32
     mag, p = h.chunk(2, dim=1)
     spec = torch.exp(mag).clip(max=1e2) * (torch.cos(p) + 1j * torch.sin(p)) * m  # padded frames add nothing
     t = x.shape[-1]
@@ -308,38 +340,6 @@ def stream_windows(t: int, first: int = 32, chunk: int = 256, context: int | Non
 _RAW_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 
-def _encode_fresh(synth, reqs: list[dict], fresh: list[int], speaker, length_scale: float,
-                  prosody_temperature: float | None, buckets: int,
-                  prosody_dtype: str | None = None) -> tuple[list[int], list[list[int]], list[tuple]]:
-    """The first round's text side: the requests in ``buckets`` groups of similar raw first-sentence length (an
-    estimate: only the speed depends on it); each group's text frontend runs, then its text pass (:func:`_encode`) is
-    queued on the GPU before the next group's frontend, so the two overlap. Returns the requests that have a
-    sentence (the batch's rows, group by group), the groups (row indices) and their text passes."""
-    if not batchable(synth):
-        _batch_args(synth, [], speaker, prosody_temperature)  # raises
-    _, tempo = synth._speaker(speaker)
-    spk = synth.speaker_id(speaker)
-    pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
-    est = [len(_RAW_SENTENCE_END.split(reqs[i]["text"].strip(), maxsplit=1)[0]) for i in fresh]
-    need, groups, encoded = [], [], []
-    for rows in length_groups(est, buckets):
-        kept = []
-        for j in rows:
-            r = reqs[fresh[j]]
-            r["sentences"] = split_sentences(normalize(r["text"]))
-            if r["sentences"]:
-                kept.append(fresh[j])
-        if not kept:
-            continue
-        groups.append(list(range(len(need), len(need) + len(kept))))
-        need += kept
-        ids = [text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept]
-        encoded.append(_encode(synth.model, ids, spk, length_scale * tempo, [reqs[i]["g"] for i in kept],
-                               synth.prosody, 1.0 if pt is None else pt, synth.prosody_durations,
-                               prosody_dtype))
-    return need, groups, encoded
-
-
 class _WholeMels:
     """Whole-sentence mels of one acoustic batch, in the interface of :class:`~drifting_tts.chunked.WindowedMel`."""
 
@@ -348,6 +348,32 @@ class _WholeMels:
 
     def step(self, rows: list[int]) -> None:
         raise RuntimeError("whole-sentence mels are complete")
+
+
+class _Pieces:
+    """One vocoder batch's pieces on their way to the host. ``pinned``: a copy into page-locked memory is queued
+    right after the vocoder, so the host can queue more GPU work before it waits for them (:meth:`result`)."""
+
+    def __init__(self, pieces: Tensor, entries: list[tuple[int, int, Tensor | None]], pinned: bool = False):
+        self.entries, self.event = entries, None
+        if pinned and pieces.is_cuda:
+            self.host = torch.empty(pieces.shape, dtype=pieces.dtype, pin_memory=True)
+            self.host.copy_(pieces, non_blocking=True)
+            self.event = torch.cuda.Event()
+            self.event.record()
+        else:
+            self.host = pieces.cpu()
+
+    def result(self) -> list[tuple[int, Tensor]]:
+        """``[(request index, piece), ...]``, each request's pause first when its sentence starts here."""
+        if self.event is not None:
+            self.event.synchronize()
+        out = []
+        for row, (i, keep, gap) in enumerate(self.entries):
+            if gap is not None:
+                out.append((i, gap))
+            out.append((i, self.host[row, :keep]))
+        return out
 
 
 @torch.no_grad()
@@ -369,7 +395,10 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     and only the DiT's first window in its round; every round runs one more DiT window per request (one batch per
     acoustic batch) before the vocoder batch, so the first round costs the first windows, not the longest sentence.
 
-    ``serving``: speed options of the batched passes (:class:`Serving`; default: none)."""
+    ``serving``: speed options of the batched passes (:class:`Serving`; default: none). With length buckets, the
+    first round runs group by group (requests grouped by the raw length of their first sentence): a group's text
+    frontend and text pass are queued while the GPU still works on the group before, and each group's first pieces
+    are yielded as soon as they are on the host."""
     from .chunked import WindowedMel
     from .synthesize import DEFAULT_VOICE, silence
 
@@ -386,38 +415,27 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     sv = serving or Serving()
     generate = batched_generator(synth.model, sv.dit_dtype, sv.compile)
     head = first + (voc.context or 0)
-    while True:
-        fresh = [i for i, r in enumerate(reqs) if r["sentences"] is None]
-        if fresh:  # the first round: the text frontend, group by group, overlapped with the GPU
-            need, groups, encoded = _encode_fresh(synth, reqs, fresh, speaker, length_scale, prosody_temperature,
-                                                  sv.buckets, sv.prosody_dtype)
-            if need:
-                inputs = _finish(synth.model, groups, encoded, synth.speaker_id(speaker), cfg_scale, temperature,
-                                 [reqs[i]["g"] for i in need])
+
+    def add(need: list[int], inputs: tuple) -> None:
+        """A new acoustic batch with the next sentence of each request in ``need``, and its streaming windows."""
+        z, cond, spk, alpha, labels, y_len = inputs
+        lens = y_len.tolist()
+        if chunking is None:
+            batches.append(_WholeMels(_dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv), lens))
         else:
-            need = [i for i, r in enumerate(reqs) if not r["windows"] and r["k"] < len(r["sentences"])]
-            if need:
-                inputs = synth_prepare(synth, [reqs[i]["sentences"][reqs[i]["k"]] for i in need], speaker, cfg_scale,
-                                       temperature, [reqs[i]["g"] for i in need], length_scale, prosody_temperature, sv)
-        if need:
-            z, cond, spk, alpha, labels, y_len = inputs
-            lens = y_len.tolist()
-            if chunking is None:
-                batches.append(_WholeMels(_dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv.buckets),
-                                          lens))
-            else:
-                batches.append(WindowedMel(generate, z, cond, spk, alpha, labels, lens, chunking, head))
-            for row, (i, t) in enumerate(zip(need, lens)):
-                r = reqs[i]
-                gap = silence(pause, r["sentences"][r["k"] - 1], r["rng"]) if r["k"] else None
-                r["windows"].extend((len(batches) - 1, row, *w, k == 0)
-                                    for k, w in enumerate(stream_windows(t, first, chunk, voc.context)))
-                r["gap"], r["k"] = gap, r["k"] + 1
-        active = [i for i, r in enumerate(reqs) if r["windows"]]
-        if not active:
-            return
+            batches.append(WindowedMel(generate, z, cond, spk, alpha, labels, lens, chunking, head))
+        for row, (i, t) in enumerate(zip(need, lens)):
+            r = reqs[i]
+            gap = silence(pause, r["sentences"][r["k"] - 1], r["rng"]) if r["k"] else None
+            r["windows"].extend((len(batches) - 1, row, *w, k == 0)
+                                for k, w in enumerate(stream_windows(t, first, chunk, voc.context)))
+            r["gap"], r["k"] = gap, r["k"] + 1
+
+    def vocode(active: list[int], pinned: bool = False) -> _Pieces:
+        """The next streaming window of every request in ``active`` as one vocoder batch (after the DiT windows
+        they still need: one per request and round when the chunks are aligned)."""
         ws = [reqs[i]["windows"].popleft() for i in active]
-        while True:  # the DiT windows these vocoder windows still need (one per request and round when aligned)
+        while True:
             late = {}
             for w in ws:
                 if batches[w[0]].committed[w[1]] < w[3]:
@@ -436,14 +454,47 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
             order += sel
         x = synth.stats.denormalize(parts[0] if len(parts) == 1 else torch.cat(parts))
         lengths = torch.tensor([ws[j][3] - ws[j][2] for j in order], device=dev)
-        wav = vocode_masked(voc, x, lengths)
+        with autocast(sv.vocoder_dtype, x.device.type):
+            wav = vocode_masked(voc, x, lengths).float()
         keep = [ws[j][5] * HOP_LENGTH for j in order]
-        pieces = _take(wav, torch.tensor([ws[j][4] * HOP_LENGTH for j in order], device=dev), max(keep)).cpu()
-        out = []
-        for row, j in enumerate(order):
-            i = active[j]
-            gap = reqs[i].pop("gap", None) if ws[j][6] else None  # before a sentence's first piece
-            if gap is not None:
-                out.append((i, gap))
-            out.append((i, pieces[row, : keep[row]]))
-        yield out
+        pieces = _take(wav, torch.tensor([ws[j][4] * HOP_LENGTH for j in order], device=dev), max(keep))
+        entries = [(active[j], keep[row], reqs[active[j]].pop("gap", None) if ws[j][6] else None)
+                   for row, j in enumerate(order)]  # the pause before a sentence's first piece
+        return _Pieces(pieces, entries, pinned)
+
+    # the first round, group by group: frontend, text pass, alignment and draws, first DiT window, first vocoder
+    # window; the next group's frontend and text pass are queued before the previous group's pieces are awaited
+    if not batchable(synth):
+        _batch_args(synth, [], speaker, prosody_temperature)  # raises
+    _, tempo = synth._speaker(speaker)
+    spk_id = synth.speaker_id(speaker)
+    pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
+    est = [len(_RAW_SENTENCE_END.split(t.strip(), maxsplit=1)[0]) for t in texts]
+    pending = None
+    for group in length_groups(est, sv.buckets, sv.min_bucket):
+        kept = []
+        for i in group:
+            reqs[i]["sentences"] = split_sentences(normalize(reqs[i]["text"]))
+            if reqs[i]["sentences"]:
+                kept.append(i)
+        if not kept:
+            continue
+        gens = [reqs[i]["g"] for i in kept]
+        encoded = _encode(synth.model, [text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept], spk_id,
+                          length_scale * tempo, gens, synth.prosody, 1.0 if pt is None else pt,
+                          synth.prosody_durations, sv)
+        if pending is not None:
+            yield pending.result()
+        add(kept, _finish(synth.model, [list(range(len(kept)))], [encoded], spk_id, cfg_scale, temperature, gens))
+        pending = vocode(kept, pinned=True)
+    if pending is not None:
+        yield pending.result()
+    while True:
+        need = [i for i, r in enumerate(reqs) if not r["windows"] and r["k"] < len(r["sentences"])]
+        if need:
+            add(need, synth_prepare(synth, [reqs[i]["sentences"][reqs[i]["k"]] for i in need], speaker, cfg_scale,
+                                    temperature, [reqs[i]["g"] for i in need], length_scale, prosody_temperature, sv))
+        active = [i for i, r in enumerate(reqs) if r["windows"]]
+        if not active:
+            return
+        yield vocode(active).result()

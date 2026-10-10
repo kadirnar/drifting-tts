@@ -155,7 +155,7 @@ def test_length_buckets_keep_every_row(buckets):
     gens = lambda: [torch.Generator().manual_seed(s) for s in range(4)]  # noqa: E731
     ref, ref_len = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7)
     mel, lens = acoustic_batch(model, ids, 2, 1.5, 0.5, 1.3, gens(), prosody=pred, prosody_temperature=0.7,
-                               serving=Serving(buckets=buckets))
+                               serving=Serving(buckets=buckets, min_bucket=1))
     assert torch.equal(lens, ref_len)
     torch.testing.assert_close(mel, ref, rtol=0, atol=1e-5)
 

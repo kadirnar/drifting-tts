@@ -107,6 +107,8 @@ class WindowedMel:
         if not rows:
             return
         win = [self.windows[r][self.k[r]] for r in rows]
+        if len(rows) == 1:
+            return self._step_one(rows[0], *win[0])
         dev = self.z.device
         W = max(b - a for a, b, _, _ in win)
         idx = torch.tensor(rows, device=dev)
@@ -135,3 +137,21 @@ class WindowedMel:
         for r, (_, _, _, c1) in zip(rows, win):
             self.k[r] += 1
             self.committed[r] = c1
+
+    def _step_one(self, r: int, a: int, b: int, c0: int, c1: int) -> None:
+        """:meth:`step` for one row (one request), with slices instead of gathers: the same values."""
+        s = slice(r, r + 1)
+        mask = torch.ones(1, b - a, dtype=torch.bool, device=self.z.device)
+        out = self.generate(self.z[s, :, a:b], self.cond[s, :, a:b], self.spk[s], self.alpha[s], mask,
+                            self.labels[s]).float()
+        self.dit_frames += b - a
+        if self.k[r] == 0:
+            self.mel[s, :, a:b] = out
+        else:
+            x = min(self.chunking.crossfade, b - c0)
+            if x:
+                w = (torch.arange(x, device=out.device).float() + 0.5) / self.chunking.crossfade
+                self.mel[s, :, c0: c0 + x] = self.mel[s, :, c0: c0 + x] * (1 - w) + out[..., c0 - a: c0 - a + x] * w
+            self.mel[s, :, c0 + x: b] = out[..., c0 + x - a:]
+        self.k[r] += 1
+        self.committed[r] = c1

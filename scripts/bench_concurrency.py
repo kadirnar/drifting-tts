@@ -345,11 +345,19 @@ def main() -> None:
                    help="batched strategies: length buckets of the text encoder and prosody predictor (and of the "
                         "whole-sentence DiT)")
     p.add_argument("--compile-dit", action="store_true", help="batched strategies: torch.compile the DiT")
+    p.add_argument("--text-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the text encoder's precision (autocast; the duration rounding stays fp32)")
+    p.add_argument("--vocoder-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="batched strategies: the batched vocoder's precision (autocast)")
+    p.add_argument("--compile-text", action="store_true", help="batched strategies: torch.compile the text pass")
+    p.add_argument("--min-bucket", type=int, default=64, help="batched strategies: rows per length bucket at least")
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
     chunking = Chunking(right=args.chunk_right, left=args.chunk_left, chunk=args.chunk_size,
                         crossfade=args.crossfade) if args.chunked else None
-    serving = Serving(args.buckets, args.dit_dtype, args.prosody_dtype, args.compile_dit)
+    serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
+                      prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
+                      compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype)
 
     env = environment(Path(__file__).resolve().parents[1])  # before loading: other processes on the GPU
     over = {"vocoder": args.vocoder} if args.vocoder else {}

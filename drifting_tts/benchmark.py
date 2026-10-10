@@ -69,6 +69,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="--batch: the prosody predictor network's precision (autocast)")
     p.add_argument("--buckets", type=int, default=1, help="--batch: length buckets of the batched passes")
     p.add_argument("--compile-dit", action="store_true", help="--batch: torch.compile the batched DiT")
+    p.add_argument("--text-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the text encoder's precision (autocast; the duration rounding stays fp32)")
+    p.add_argument("--vocoder-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                   help="--batch: the batched vocoder's precision (autocast)")
+    p.add_argument("--compile-text", action="store_true", help="--batch: torch.compile the text pass")
+    p.add_argument("--min-bucket", type=int, default=64, help="--batch: rows per length bucket at least")
     p.add_argument("--batch", type=int, default=0,
                    help="synthesise the sentences N at a time with drifting_tts.batched.stream_batched (the serving "
                         "path; one voice; seed = sentence index as without it; 0: one at a time)")
@@ -151,9 +157,12 @@ def run(args) -> None:
     if args.batch:
         from .batched import Serving
 
-        serving = Serving(args.buckets, args.dit_dtype, args.prosody_dtype, args.compile_dit)
-    elif args.dit_dtype != "fp32" or args.prosody_dtype != "fp32" or args.buckets != 1 or args.compile_dit:
-        raise ValueError("--dit-dtype, --prosody-dtype, --buckets and --compile-dit apply to --batch")
+        serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
+                          prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
+                          compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype)
+    elif (args.dit_dtype, args.prosody_dtype, args.text_dtype, args.vocoder_dtype) != ("fp32",) * 4 \
+            or args.buckets != 1 or args.compile_dit or args.compile_text:
+        raise ValueError("--buckets, --*-dtype and --compile-* apply to --batch")
 
     def generate(text: str, speaker: str, seed: int) -> tuple[torch.Tensor, dict]:
         if not (args.stream or args.fast or chunked):
