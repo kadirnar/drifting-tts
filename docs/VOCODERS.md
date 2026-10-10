@@ -213,6 +213,108 @@ Freya-100 (UTMOSv2, DNSMOS, WER) and copy-synthesis (F0 error, periodicity), bec
 best. The final snapshot (160k steps) is the vocoder of release v3.2, published as `vocos_v2.pt`
 (`scripts/prepare_release.py` keeps only what `load_vocoder` reads).
 
+### Speaker balance
+
+Vocos v2 reached BigVGAN-v2-ft on the studio voice, but not on the voices with little data. Its training set (the
+data filters of `tts_v3.yaml`: 49,926 utterances of 642 speakers) lists the studio voice twice, so the studio voice
+fills 39% of the draws. The `male` voice (speaker 389, 59 min) gets 0.8% and the `female` voice (323, 19 min) 0.3%.
+
+**Where Vocos v2 falls short.** In copy-synthesis (recorded mels, UTMOSv2), Vocos v2 is 0.03 below the recording on
+the studio voice, but 0.18–0.24 below on the other speakers, where BigVGAN-v2-ft stays at the recording's level. The
+two voices have only 2 and 1 held-out utterances, so their sets come from the `train` split:
+
+- `train`: the first 50 training utterances of the speaker, which the vocoder has seen.
+- `unseen`: the first 50 (389) or all 14 (323) `train` utterances that the fine-tune's data filters drop (speaking
+  rate, ASR mismatch, bandwidth below 10 kHz), which no vocoder fine-tune has seen.
+- `others`: the first 200 `val` utterances of the other speakers (156 speakers).
+
+On the TTS mels (Freya-100, v3.1, T = 0.3, α = 2), Vocos v2 is at BigVGAN-v2-ft's level for `studio` (3.015 against
+2.934) and `male` (2.809 against 2.797), and 0.135 below it for `female` (2.661 against 2.796).
+
+**The recipe.** `train.speaker_balance` (opt-in) draws each epoch's utterances with replacement. Chosen speakers get
+fixed shares of the draws, and the other speakers split the rest in proportion to their amount of audio raised to a
+temperature. `configs/vocoder_vocos_v2_balance.yaml` gives the studio voice 30%, `male` 8% and `female` 6%. The
+other 639 speakers share 56% at temperature 0.5, so the smallest of them are drawn up to 10 times as often as before.
+
+- It continues Vocos v2's `last.pt` (160k steps: generator, MPD, MRD and both AdamW states) for 30k steps with the
+  same losses. The rates restart at 2e-5 (generator) and 4e-5 (discriminators), against 5e-6 and 1e-5 at the end of
+  Vocos v2, and decay to 10% with a cosine. The generator warms up over 500 steps.
+- The control is the same continuation without the balance, stopped at 20k.
+- Each `female` training utterance is drawn ~22 times as often as in Vocos v2 (`male`: ~10 times), about 140 times
+  in 20k steps. The generated mels change with every draw (fresh noise at T = 0.3), and the random 64-frame windows
+  move.
+
+Freya-100 UTMOSv2 by voice (v3.1 mels; same mels for every row):
+
+| vocoder | studio | male | female |
+|---|---|---|---|
+| `bigvgan-v2-ft` | 2.934 | 2.797 | 2.796 |
+| Vocos v2 (160k) | 3.015 | 2.809 | 2.661 |
+| balanced, 5k | 2.993 | 2.851 | 2.699 |
+| balanced, 10k | 2.960 | 2.834 | 2.660 |
+| balanced, 15k | 3.013 | 2.882 | 2.698 |
+| **balanced, 20k** | **3.019** | **2.860** | **2.714** |
+| balanced, 25k | 3.028 | 2.861 | 2.697 |
+| balanced, 30k | 3.013 | 2.835 | 2.715 |
+| control, 5k | 3.013 | 2.797 | 2.666 |
+| control, 10k | 3.010 | 2.776 | 2.707 |
+| control, 15k | 2.992 | 2.768 | 2.682 |
+| control, 20k | 2.974 | 2.733 | 2.719 |
+
+Copy-synthesis UTMOSv2 by speaker:
+
+| system | studio (100 `val`) | 389 `train` (50) | 389 `unseen` (50) | 323 `train` (50) | 323 `unseen` (14) | others (200 `val`) |
+|---|---|---|---|---|---|---|
+| recording | 3.093 | 3.217 | 3.285 | 3.062 | 2.902 | 2.897 |
+| `bigvgan-v2-ft` | 3.174 | 3.312 | 3.343 | 3.039 | 2.912 | 2.886 |
+| Vocos v2 (160k) | 3.064 | 3.002 | 3.043 | 2.819 | 2.721 | 2.684 |
+| balanced, 15k | 3.029 | 3.123 | 3.176 | 2.905 | 2.808 | 2.732 |
+| balanced, 20k | 3.046 | 3.046 | 3.122 | 2.881 | 2.771 | 2.712 |
+| control, 15k | 3.040 | 2.974 | 2.999 | 2.797 | 2.675 | 2.682 |
+| control, 20k | 3.025 | 2.967 | 2.980 | 2.844 | 2.717 | 2.672 |
+
+Freya-495 with Whisper (v3.1 mels, T = 0.3, α = 2; WER with 95% bootstrap intervals). The last two rows are the
+paired UTMOSv2 differences of the balanced 20k snapshot, with 95% bootstrap intervals over the 495 sentences:
+
+| vocoder | studio WER | studio UTMOSv2 | male WER | male UTMOSv2 | female WER | female UTMOSv2 |
+|---|---|---|---|---|---|---|
+| `bigvgan-v2-ft` | 1.23% [0.82, 1.68] | 2.935 | 1.74% [1.24, 2.30] | 2.814 | 3.02% [2.38, 3.71] | 2.752 |
+| Vocos v2 (160k) | 1.18% [0.79, 1.62] | 3.017 | 1.48% [1.05, 1.95] | 2.809 | 3.27% [2.59, 4.03] | 2.638 |
+| **balanced, 20k** | 1.33% [0.93, 1.79] | **3.004** | 1.61% [1.15, 2.11] | **2.876** | 3.22% [2.55, 3.95] | **2.688** |
+| control, 20k | 1.38% [0.94, 1.86] | 3.001 | 1.43% [1.01, 1.91] | 2.759 | 3.35% [2.64, 4.07] | 2.671 |
+| balanced − Vocos v2 | | −0.014 [−0.028, +0.001] | | +0.067 [+0.049, +0.086] | | +0.050 [+0.036, +0.065] |
+| balanced − control | | +0.003 [−0.014, +0.019] | | +0.116 [+0.097, +0.135] | | +0.018 [+0.001, +0.034] |
+
+- **The balance is what lifts the `male` voice.** Every balanced snapshot is 0.03–0.07 above Vocos v2 on `male`
+  Freya-100, while the control drifts down by 0.01–0.08. On Freya-495 the balanced 20k snapshot gains 0.067 and
+  passes BigVGAN-v2-ft (2.876 against 2.814), 0.116 above the control. On recorded mels it gains 0.03–0.13 on
+  speaker 389, as much on the `unseen` utterances as on the `train` ones, so it is not memorisation.
+- **The `female` voice gains mostly from the continuation.** On Freya-495 the balanced 20k snapshot gains 0.050,
+  which closes 44% of the gap to BigVGAN-v2-ft (0.114 → 0.064). The control gains 0.032, so the balance adds 0.018.
+  On Freya-100 both runs gain about 0.05 at 20k. On recorded mels of speaker 323, the balanced run is 0.04–0.13
+  above the control at 15k and 20k, and within ±0.06 of it at 5k and 10k.
+- **The studio voice: −0.014 UTMOSv2 and 6 more word errors.** On Freya-100 the balanced snapshots stay within 0.03 of Vocos v2
+  from 15k on (20k: +0.004); on Freya-495 the 20k one loses 0.014 and stays 0.07 above BigVGAN-v2-ft. Its WER rises
+  from 1.18% to 1.33%: 6 more word errors of 3,911, in 5 sentences, one-consonant slips such as *fırından* →
+  *sırından* (BigVGAN-v2-ft: 1.23%). The control loses as much (0.016, 1.38%), so the continuation causes it, not
+  the balance.
+- **WER and DNSMOS.** For `male` and `female`, WER moves within its intervals. DNSMOS OVRL changes by less than
+  0.015 on every voice.
+- **Other speakers gain a little.** On the 200 `val` utterances of the other speakers, the balanced snapshots gain
+  up to 0.05 (20k: +0.03), the control at most 0.02 (20k: −0.01). BigVGAN-v2-ft is still 0.17 higher.
+- **Pitch is untouched.** In copy-synthesis at 15k and 20k, the F0 error moves by at most 2.2 cents and the
+  periodicity RMSE by at most 0.003 (the control's grows by up to 0.010 on speaker 389). Against the recording,
+  Vocos stays at 79–93 cents and 0.08–0.15 on every speaker, against 52–62 cents and 0.05 for BigVGAN-v2-ft. The
+  balance does not address that part of the gap.
+- **Snapshots fluctuate by about ±0.05 per voice.** The balanced run lost 0.055 on the studio voice at 10k and was
+  back at 15k. The snapshot is therefore chosen on all voices: on Freya-100 the 20k one has the best worst-voice gain
+  (+0.051 on `male`, +0.053 on `female`), with the studio voice at +0.004.
+
+**Streaming is unchanged.** On the 24 longest Freya sentences in full fp32, the balanced 20k snapshot gives 88.2 dB
+at 32 frames of context, against 86.3 dB for Vocos v2: both at the fp32 noise floor.
+
+**Cost.** The 30k steps took 2 h 19 min (3.4–4.4 it/s on the shared GPU), with 6.7 GB.
+
 ## Revox Vocoder 1.0 (non-commercial)
 
 [Revox Vocoder 1.0](https://huggingface.co/minori-live/revox-vocoder-1) by **Minori Live** is a 48 kHz PC-NSF-Vocos:
@@ -461,6 +563,11 @@ python scripts/revox_benchmark.py --data data/train --out outputs/revox
   - F0 micro-variation: as in [EXPERIMENTS.md §5](EXPERIMENTS.md#5-robotic-prosody-diagnosis-and-research).
   - Copy-synthesis uses the first 100 `val` utterances of speaker 722: `studio` for the recorded mels, `studio_gta`
     for the acoustic model's (T = 0.3, α = 2, ground-truth durations and pitch, seed = utterance index).
+  - Other copy sets: `others` (every speaker but 722) and `spk<ID>` (one speaker) from `val`; `@<split>` takes them
+    from another split (`spk389@train`), and `@unseen` from the `train` utterances that the fine-tune of
+    `--train-config` leaves out. Freya runs of other voices take `--speaker male` or `--speaker female`.
+  - Speaker balance: the paired intervals bootstrap the per-sentence UTMOSv2 differences of two vocoders on the same
+    100 Freya sentences (`freya100_<name>.jsonl`, also written without ASR).
 
 ```bash
 python scripts/vocoder_quality.py --model drifting_tts_v3.1.pt --data data/train \
@@ -468,4 +575,11 @@ python scripts/vocoder_quality.py --model drifting_tts_v3.1.pt --data data/train
     --vocoders bigvgan-v2-ft --extra vocos-ft=runs/vocos_bigvgan/vocos_ft.pt --copy-sets studio studio_gta
 drifting-tts finetune-vocoder --config configs/vocoder_vocos_v2.yaml --workdir runs/vocos_v2 \
     tts.path=drifting_tts_v3.1.pt train.init_from=runs/vocos_bigvgan/last.pt
+drifting-tts finetune-vocoder --config configs/vocoder_vocos_v2_balance.yaml --workdir runs/vocos_v2_balance \
+    tts.path=drifting_tts_v3.1.pt train.init_from=runs/vocos_v2/last.pt
+python scripts/vocoder_quality.py --model drifting_tts_v3.1.pt --data data/train --phases copy --copy-num 50 \
+    --train-config runs/vocos_v2_balance/config.yaml --copy-sets spk389@train spk389@unseen spk323@train \
+    spk323@unseen --vocoders bigvgan-v2-ft --extra balanced=runs/vocos_v2_balance/vocos_ft_20000.pt
+python scripts/vocoder_quality.py --model drifting_tts_v3.1.pt --phases freya --speaker female --no-asr \
+    --vocoders --extra balanced=runs/vocos_v2_balance/vocos_ft_20000.pt --out outputs/vocoder_quality_female
 ```

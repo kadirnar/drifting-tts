@@ -1,0 +1,16 @@
+# Vocos v2 trained further with speaker-balanced batches (docs/VOCODERS.md, "Speaker balance"): the studio voice
+# fills ~39% of the draws of the Vocos v2 run, the `male` (389) and `female` (323) voices 0.8% and 0.3%. Same
+# generator, ISTFT head, streaming context and losses as `vocoder_vocos_v2.yaml`; a lower learning rate.
+base: vocoder_vocos_v2.yaml
+
+train:
+  init_from: runs/vocos_v2/last.pt   # the finished Vocos v2 run (160k steps): generator, MPD, MRD, AdamW
+  steps: 30000
+  lr: 2.0e-5               # generator peak (Vocos v2: 5e-5, decayed to 5e-6 at its end)
+  lr_disc: 4.0e-5
+  warmup_steps: 500
+  lr_schedule: cosine
+  lr_min_ratio: 0.1
+  speaker_balance:         # draws with replacement (default: every utterance once per epoch)
+    shares: {722: 0.30, 389: 0.08, 323: 0.06}   # studio, male, female: fixed shares of the draws
+    temperature: 0.5       # the other speakers split the rest in proportion to (their audio) ** 0.5
