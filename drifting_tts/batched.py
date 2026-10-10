@@ -14,6 +14,7 @@ The batched passes run eagerly (no CUDA graphs: the shapes change with every bat
 
 from __future__ import annotations
 
+import atexit
 import logging
 import random
 import re
@@ -27,8 +28,8 @@ from torch import Tensor
 
 from .alignment import sequence_mask
 from .audio import HOP_LENGTH, N_FFT
-from .chunked import Chunking, _take, autocast  # noqa: F401 (_take re-exported)
-from .models.text_encoder import frames_to_alignment
+from .chunked import Chunking, _take, autocast, to_device  # noqa: F401 (_take re-exported)
+from .noise import DiTNoise, Philox, philox_normal, philox_randint
 from .text import normalize, split_sentences, text_to_ids
 
 
@@ -45,7 +46,16 @@ class Serving:
     fp32). They change the output: a quality check is needed (docs/LATENCY.md).
     ``vocoder_dtype``: the batched Vocos under autocast (``"fp16"``: log-mel distance 0.014 dB against fp32).
     ``compile`` / ``compile_text``: ``torch.compile`` the DiT / the text pass (dynamic shapes; compiled on the first
-    batch, about half a minute each); float rounding changes, so a duration can round to another frame."""
+    batch, about half a minute each); float rounding changes, so a duration can round to another frame.
+    ``graphs`` (with them): CUDA graphs of the compiled passes (mode ``reduce-overhead``), the shapes padded to a few
+    sizes; it saves most of the host's time per pass.
+    ``compile_vocoder``: ``torch.compile`` the batched Vocos (float rounding only). ``autotune``: compile the DiT with
+    ``max-autotune`` (its matrix multiplies tuned for the GPU; minutes of compilation the first time).
+    ``frontend_workers``: processes that run the first round's text frontend (normalisation, sentence split) for
+    the length groups in parallel (0: in this process, group by group).
+    ``pipeline`` (with buckets): the first round's DiT window and vocoder run group by group too, and each group's
+    first pieces are yielded as soon as they are ready (lower median, higher maximum first-audio time); else one
+    acoustic batch follows the groups' text passes."""
 
     buckets: int = 1
     min_bucket: int = 64
@@ -55,6 +65,11 @@ class Serving:
     text_dtype: str | None = None
     compile_text: bool = False
     vocoder_dtype: str | None = None
+    graphs: bool = False
+    pipeline: bool = False
+    frontend_workers: int = 0
+    compile_vocoder: bool = False
+    autotune: bool = False
 
 
 def length_groups(lengths: list[int], buckets: int, min_rows: int = 1) -> list[list[int]]:
@@ -114,25 +129,49 @@ def _encode(model, ids: list[list[int]], spk: int, length_scale: float, generato
     dev = next(model.parameters()).device
     lens = [len(x) for x in ids]
     B, n = len(ids), max(lens)
-    text = torch.tensor([x + [0] * (n - len(x)) for x in ids]).to(dev)
-    text_len = torch.tensor(lens, device=dev)
+    text = to_device([x + [0] * (n - len(x)) for x in ids], dev)
+    text_len = to_device(lens, dev)
     spk = torch.full((B,), int(spk), dtype=torch.long, device=dev)
     z_tok = z_glob = None
     if prosody is not None and prosody.kind == "drift":  # ProsodyPredictor._draw: token noise, then global noise
         net = prosody.net
-        z_tok = torch.zeros(B, net.noise_tok, n, device=dev)
-        z_glob = torch.empty(B, net.noise_glob, device=dev)
-        for b, g in enumerate(generators):
-            _randn(z_tok[b, :, : lens[b]], g)
-            _randn(z_glob[b], g)
-    fn = _text_pass
-    if sv.compile_text:
-        if getattr(model, "_compiled_text_pass", None) is None:
-            logging.getLogger("torch.utils._sympy.interp").setLevel(logging.ERROR)
-            model._compiled_text_pass = torch.compile(_text_pass, dynamic=True)
-        fn = model._compiled_text_pass
-    return fn(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature), float(length_scale),
-              prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
+        if isinstance(generators, Philox):  # drifting_tts.noise: one launch per stream for the whole group
+            seeds, sentences = generators.tensors(dev)
+            z_tok = philox_normal(seeds, sentences, "prosody_tok", net.noise_tok, n, lengths=text_len)
+            z_glob = philox_normal(seeds, sentences, "prosody_glob", net.noise_glob, 1)[:, :, 0]
+        else:
+            z_tok = torch.zeros(B, net.noise_tok, n, device=dev)
+            z_glob = torch.empty(B, net.noise_glob, device=dev)
+            for b, g in enumerate(generators):
+                _randn(z_tok[b, :, : lens[b]], g)
+                _randn(z_glob[b], g)
+    base = _text_pass
+    if not sv.compile_text:
+        return base(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature),
+                    float(length_scale), prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
+    fn = _compiled(model, "text_pass", base, sv.graphs)
+    if sv.graphs:  # a few shapes: rows to a multiple of 16 (one-token dummies), tokens to a multiple of 32
+        Bp, Np = _round_up(B, 16), _round_up(n, 32)
+        text, text_len, spk = _pad(text, (Bp, Np)), _pad(text_len, (Bp,), 1), _repeat_first(spk, Bp)
+        if z_tok is not None:
+            z_tok, z_glob = _pad(z_tok, (Bp, z_tok.shape[1], Np)), _pad(z_glob, (Bp, z_glob.shape[1]))
+    h, mu, x_mask, frames = fn(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature),
+                               float(length_scale), prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
+    if sv.graphs:  # out of the graphs' memory, unpadded
+        h, mu, x_mask, frames = (h[:B, :, :n].clone(), mu[:B, :, :n].clone(), x_mask[:B, :, :n].clone(),
+                                 frames[:B, :n].clone())
+    return h, mu, x_mask, frames
+
+
+def expand_by_durations(tok: Tensor, durations: Tensor, frames: int) -> Tensor:
+    """Token features ``[B, C, N]`` repeated by their integer durations ``[B, N]`` -> ``[B, C, frames]`` (zero after
+    each row's total): ``DriftingTTS.frame_condition`` with the hard alignment of ``frames_to_alignment``, as one
+    gather instead of a batched matrix multiply with a ``[B, N, frames]`` 0/1 matrix (the same values)."""
+    end = torch.cumsum(durations, 1)  # token n covers frames [end[n - 1], end[n])
+    t = torch.arange(frames, device=tok.device, dtype=end.dtype)[None].expand(tok.shape[0], frames).contiguous()
+    idx = torch.searchsorted(end, t, right=True).clamp_max(tok.shape[-1] - 1)
+    out = tok.gather(2, idx[:, None].expand(-1, tok.shape[1], -1))
+    return out * (t < end[:, -1:])[:, None]
 
 
 @torch.no_grad()
@@ -142,22 +181,29 @@ def _finish(model, groups: list[list[int]], encoded: list[tuple], spk: int, cfg_
     (``groups`` holds row indices), then every row's noise and style codes."""
     dev = next(model.parameters()).device
     B = sum(len(r) for r in groups)
-    conds, y_lens = [], []
-    for h, mu, x_mask, frames in encoded:
-        attn, y_len = frames_to_alignment(frames, x_mask)
-        conds.append(model.frame_condition(h, mu, attn))
-        y_lens.append(y_len)
+    # the token features [mu; h] and integer durations of every row, in the order of the rows
+    toks = [torch.cat([mu, h], 1) for h, mu, _, _ in encoded]
+    durs = [frames.to(x_mask.dtype) * x_mask[:, 0] for _, _, x_mask, frames in encoded]
     if len(groups) == 1 and groups[0] == list(range(B)):
-        cond, y_len = conds[0], y_lens[0]
-    else:  # back to the order of the rows, padded to the longest
-        cond = torch.zeros(B, conds[0].shape[1], max(c.shape[-1] for c in conds), device=dev)
-        y_len = torch.empty(B, dtype=torch.long, device=dev)
-        for rows, c, yl in zip(groups, conds, y_lens):
-            idx = torch.tensor(rows, device=dev)
-            cond[idx, :, : c.shape[-1]] = c
-            y_len[idx] = yl
-    T, t = cond.shape[-1], y_len.tolist()
+        tok, dur = toks[0], durs[0]
+    else:
+        tok = torch.zeros(B, toks[0].shape[1], max(x.shape[-1] for x in toks), device=dev)
+        dur = torch.zeros(B, tok.shape[-1], device=dev)
+        for rows, x, w in zip(groups, toks, durs):
+            idx = to_device(rows, dev)
+            tok[idx, :, : x.shape[-1]] = x
+            dur[idx, : w.shape[-1]] = w
+    y_len = dur.sum(1).clamp_min(1).long()  # frames_to_alignment's lengths
+    t = y_len.tolist()
+    cond = expand_by_durations(tok, dur, max(t))
+    T = cond.shape[-1]
     gen = model.generator
+    spk = torch.full((B,), int(spk), dtype=torch.long, device=dev)
+    alpha = torch.full((B,), float(cfg_scale), device=dev)
+    if isinstance(generators, Philox):  # the DiT's noise is drawn window by window (DiTNoise.window / full)
+        seeds, sentences = generators.tensors(dev)
+        labels = philox_randint(seeds, sentences, "style", max(1, gen.noise_coords), gen.noise_classes)
+        return DiTNoise(generators, model.n_mels, y_len, temperature, T), cond, spk, alpha, labels, y_len
     # DriftingTTS.synthesize: the mel noise, then the style codes (rollout); zero after each row's length, as the
     # single-request path pads a partial patch with zeros
     z = torch.zeros(B, model.n_mels, T, device=dev)
@@ -168,13 +214,12 @@ def _finish(model, groups: list[list[int]], encoded: list[tuple], spk: int, cfg_
             labels[b].random_(0, gen.noise_classes, generator=g)
         else:
             labels[b] = torch.randint(0, gen.noise_classes, labels[b].shape, generator=g)
-    alpha = torch.full((B,), float(cfg_scale), device=dev)
-    return z * temperature, cond, torch.full((B,), int(spk), dtype=torch.long, device=dev), alpha, labels, y_len
+    return z * temperature, cond, spk, alpha, labels, y_len
 
 
 @torch.no_grad()
 def prepare_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temperature: float, length_scale: float,
-                  generators: list[torch.Generator], prosody=None, prosody_temperature: float = 1.0,
+                  generators: list[torch.Generator] | Philox, prosody=None, prosody_temperature: float = 1.0,
                   prosody_durations: str = "sampled", serving: Serving | None = None) -> tuple[Tensor, ...]:
     """The DiT's inputs of :func:`acoustic_batch` (the text encoder, the prosody predictor, the alignment and every
     row's draws): the noise scaled by ``temperature`` ``[B, n_mels, T]`` and the aligned condition ``[B, C, T]``
@@ -182,28 +227,65 @@ def prepare_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, tempe
     lengths ``[B]``. ``serving``: :class:`Serving` (length buckets, precision, compilation of the text pass)."""
     sv = serving or Serving()
     groups = length_groups([len(x) for x in ids], sv.buckets, sv.min_bucket)
-    encoded = [_encode(model, [ids[r] for r in rows], spk, length_scale, [generators[r] for r in rows], prosody,
-                       prosody_temperature, prosody_durations, serving) for rows in groups]
+    def sub(rows):
+        return generators.subset(rows) if isinstance(generators, Philox) else [generators[r] for r in rows]
+
+    encoded = [_encode(model, [ids[r] for r in rows], spk, length_scale, sub(rows), prosody, prosody_temperature,
+                       prosody_durations, serving) for rows in groups]
     return _finish(model, groups, encoded, spk, cfg_scale, temperature, generators)
 
 
-def batched_generator(model, dtype: str | None = None, compile: bool = False):
+def _round_up(n: int, k: int) -> int:
+    return -(-n // k) * k
+
+
+def _pad(x: Tensor, sizes: tuple[int, ...], value=0) -> Tensor:
+    """``x`` padded at the end of each dimension to ``sizes`` with ``value``."""
+    if tuple(x.shape) == tuple(sizes):
+        return x
+    out = torch.full(sizes, value, dtype=x.dtype, device=x.device)
+    out[tuple(slice(0, n) for n in x.shape)] = x
+    return out
+
+
+def _repeat_first(x: Tensor, rows: int) -> Tensor:
+    """``x`` with its first row repeated up to ``rows`` rows (no host synchronisation)."""
+    return x if x.shape[0] == rows else torch.cat([x, x[:1].expand(rows - x.shape[0], *x.shape[1:])])
+
+
+def _compiled(model, name: str, fn, graphs: bool = False, autotune: bool = False):
+    """``torch.compile(fn)`` with dynamic shapes, cached on ``model``; ``graphs``: mode ``reduce-overhead`` (CUDA
+    graphs, one per input shape: the callers pad the shapes to a few sizes); ``autotune``: ``max-autotune``."""
+    mode = ("max-autotune" if graphs else "max-autotune-no-cudagraphs") if autotune else \
+        ("reduce-overhead" if graphs else None)
+    attr = f"_compiled_{name}_{mode}"
+    if getattr(model, attr, None) is None:
+        logging.getLogger("torch.utils._sympy.interp").setLevel(logging.ERROR)  # harmless dynamic-shape noise
+        setattr(model, attr, torch.compile(fn, dynamic=True, mode=mode))
+    return getattr(model, attr)
+
+
+def batched_generator(model, dtype: str | None = None, compile: bool = False, graphs: bool = False,
+                      autotune: bool = False):
     """``generate(z, cond, spk, alpha, mask, labels)`` for a padded batch: the DiT's rollout with the valid-frame
     mask (the interface of :class:`~drifting_tts.chunked.WindowedMel`), under autocast in ``dtype`` and
-    ``torch.compile``-d (dynamic shapes, compiled once per model) if asked."""
-    gen = model.generate
-    if compile:
-        if getattr(model, "_compiled_generate", None) is None:
-            logging.getLogger("torch.utils._sympy.interp").setLevel(logging.ERROR)  # harmless dynamic-shape noise
-            model._compiled_generate = torch.compile(model.generate, dynamic=True)
-        gen = model._compiled_generate
+    ``torch.compile``-d (dynamic shapes, compiled once per model) if asked. ``graphs`` (with ``compile``): CUDA graphs
+    of the compiled DiT; the batch is padded to a multiple of 16 rows and 32 frames (masked), so that a few graphs
+    serve every batch."""
+    gen = _compiled(model, "generate", model.generate, graphs, autotune) if compile else model.generate
 
     def generate(z, cond, spk, alpha, mask, labels):
+        B, W = z.shape[0], z.shape[-1]
+        if compile and graphs:
+            Bp, Wp = _round_up(B, 16), _round_up(W, 32)
+            z, cond = _pad(z, (Bp, z.shape[1], Wp)), _pad(cond, (Bp, cond.shape[1], Wp))
+            spk, alpha = _repeat_first(spk, Bp), _pad(alpha, (Bp,), 1.0)
+            mask, labels = _pad(mask, (Bp, Wp), False), _pad(labels, (Bp, labels.shape[1]))
         with autocast(dtype, z.device.type):
             x = z
             for k in range(model.generator.num_steps):  # DriftingTTS.rollout
                 x = gen(x, cond, spk, alpha, mask=mask, noise_labels=labels, step=k)
-        return x.float()
+        return x[:B, :, :W].float().clone() if compile and graphs else x.float()
 
     return generate
 
@@ -221,7 +303,7 @@ def acoustic_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temp
     z, cond, spk, alpha, labels, y_len = prepare_batch(model, ids, spk, cfg_scale, temperature, length_scale,
                                                        generators, prosody, prosody_temperature, prosody_durations,
                                                        sv)
-    generate = batched_generator(model, sv.dit_dtype, sv.compile)
+    generate = batched_generator(model, sv.dit_dtype, sv.compile, sv.graphs, sv.autotune)
     return _dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv), y_len
 
 
@@ -236,7 +318,7 @@ def _dit_whole(generate, z: Tensor, cond: Tensor, spk: Tensor, alpha: Tensor, la
         return generate(z, cond, spk, alpha, mask, labels) * mask[:, None]
     mel = torch.zeros_like(z)
     for rows in groups:
-        idx, m = torch.tensor(rows, device=z.device), max(t[r] for r in rows)
+        idx, m = to_device(rows, z.device), max(t[r] for r in rows)
         mask = sequence_mask(y_len[idx], m)
         mel[idx, :, :m] = generate(z[idx, :, :m], cond[idx, :, :m], spk[idx], alpha[idx], mask, labels[idx]) \
             * mask[:, None]
@@ -305,17 +387,19 @@ def _masked_vocos(model, x: Tensor, m: Tensor) -> Tensor:
 
 
 @torch.no_grad()
-def vocode_masked(vocoder, mel: Tensor, lengths: Tensor) -> Tensor:
+def vocode_masked(vocoder, mel: Tensor, lengths: Tensor, compile: bool = False) -> Tensor:
     """Unnormalised log-mels ``[B, n_mels, T]`` whose rows have ``lengths`` frames -> waveforms ``[B, T * hop]``:
     row ``b`` equals ``vocoder(mel[b:b+1, :, :lengths[b]])`` on its first ``lengths[b] * hop`` samples (zeros after).
-    One batch for a Vocos with BigVGAN-style mels (vocos-ft, vocos-v2); other vocoders run row by row."""
+    One batch for a Vocos with BigVGAN-style mels (vocos-ft, vocos-v2); other vocoders run row by row.
+    ``compile``: the batch through ``torch.compile`` (float rounding only)."""
     B, _, T = mel.shape
     model = vocoder.model
     if (vocoder.kind == "vocos" and vocoder.mel == "bigvgan" and not vocoder.noise
             and getattr(getattr(model, "head", None), "istft", None) is not None
             and model.head.istft.padding != "center"):
         m = sequence_mask(lengths.to(mel.device), T)[:, None].float()
-        wav = _masked_vocos(model, mel.to(vocoder.device).float(), m)
+        fn = _compiled(model, "masked_vocos", _masked_vocos) if compile else _masked_vocos
+        wav = fn(model, mel.to(vocoder.device).float(), m)
         keep = sequence_mask(lengths.to(mel.device) * HOP_LENGTH, T * HOP_LENGTH)
         return wav.clamp(-1, 1) * keep
     out = torch.zeros(B, T * HOP_LENGTH, device=mel.device)
@@ -338,6 +422,23 @@ def stream_windows(t: int, first: int = 32, chunk: int = 256, context: int | Non
 
 
 _RAW_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
+_POOLS: dict = {}
+
+
+def frontend_pool(workers: int):
+    """A persistent pool of ``workers`` processes for :func:`drifting_tts.text.frontend` (spawned once; they import
+    only the text frontend)."""
+    if workers not in _POOLS:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        from .text import frontend
+
+        pool = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn"))
+        list(pool.map(frontend, [["Merhaba."]] * workers))  # start the processes now
+        atexit.register(pool.shutdown, wait=False, cancel_futures=True)
+        _POOLS[workers] = pool
+    return _POOLS[workers]
 
 
 class _WholeMels:
@@ -396,9 +497,9 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     acoustic batch) before the vocoder batch, so the first round costs the first windows, not the longest sentence.
 
     ``serving``: speed options of the batched passes (:class:`Serving`; default: none). With length buckets, the
-    first round runs group by group (requests grouped by the raw length of their first sentence): a group's text
-    frontend and text pass are queued while the GPU still works on the group before, and each group's first pieces
-    are yielded as soon as they are on the host."""
+    first round's text side runs group by group (requests grouped by the raw length of their first sentence): a
+    group's text frontend and text pass are queued while the GPU still works on the group before; with
+    ``serving.pipeline`` each group's first pieces are also yielded as soon as they are on the host."""
     from .chunked import WindowedMel
     from .synthesize import DEFAULT_VOICE, silence
 
@@ -409,19 +510,29 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     voc, dev = synth.vocoder, synth.device
     pause = synth._pause(pause, speaker)
     seeds = list(range(len(texts))) if seeds is None else seeds
-    reqs = [{"text": t, "sentences": None, "k": 0, "windows": deque(), "rng": random.Random(s),
-             "g": torch.Generator(device=dev).manual_seed(s)} for t, s in zip(texts, seeds)]
+    reqs = [{"text": t, "sentences": None, "k": 0, "windows": deque(), "rng": random.Random(s), "g": None}
+            for t, s in zip(texts, seeds)]
     batches: list = []  # one per acoustic batch: _WholeMels or WindowedMel (normalised mels)
     sv = serving or Serving()
-    generate = batched_generator(synth.model, sv.dit_dtype, sv.compile)
+    generate = batched_generator(synth.model, sv.dit_dtype, sv.compile, sv.graphs, sv.autotune)
     head = first + (voc.context or 0)
+
+    def keys(rows: list[int]):
+        """The noise of these requests' next sentences: their generators, or their counter-based keys."""
+        if chunking is not None and chunking.noise == "philox":
+            return Philox([seeds[i] for i in rows], [reqs[i]["k"] for i in rows])
+        for i in rows:
+            if reqs[i]["g"] is None:
+                reqs[i]["g"] = torch.Generator(device=dev).manual_seed(seeds[i])
+        return [reqs[i]["g"] for i in rows]
 
     def add(need: list[int], inputs: tuple) -> None:
         """A new acoustic batch with the next sentence of each request in ``need``, and its streaming windows."""
         z, cond, spk, alpha, labels, y_len = inputs
         lens = y_len.tolist()
         if chunking is None:
-            batches.append(_WholeMels(_dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv), lens))
+            batches.append(_WholeMels(_dit_whole(generate, z if isinstance(z, Tensor) else z.full(), cond, spk,
+                                                 alpha, labels, y_len, sv), lens))
         else:
             batches.append(WindowedMel(generate, z, cond, spk, alpha, labels, lens, chunking, head))
         for row, (i, t) in enumerate(zip(need, lens)):
@@ -448,16 +559,15 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
         parts, order = [], []
         for src in sorted({w[0] for w in ws}):  # one gather per acoustic batch the windows come from
             sel = [j for j, w in enumerate(ws) if w[0] == src]
-            rows = torch.tensor([ws[j][1] for j in sel], device=dev)
-            starts = torch.tensor([ws[j][2] for j in sel], device=dev)
+            rows, starts = to_device([[ws[j][1] for j in sel], [ws[j][2] for j in sel]], dev)
             parts.append(_take(batches[src].mel[rows], starts, width))
             order += sel
         x = synth.stats.denormalize(parts[0] if len(parts) == 1 else torch.cat(parts))
-        lengths = torch.tensor([ws[j][3] - ws[j][2] for j in order], device=dev)
+        lengths = to_device([ws[j][3] - ws[j][2] for j in order], dev)
         with autocast(sv.vocoder_dtype, x.device.type):
-            wav = vocode_masked(voc, x, lengths).float()
+            wav = vocode_masked(voc, x, lengths, sv.compile_vocoder).float()
         keep = [ws[j][5] * HOP_LENGTH for j in order]
-        pieces = _take(wav, torch.tensor([ws[j][4] * HOP_LENGTH for j in order], device=dev), max(keep))
+        pieces = _take(wav, to_device([ws[j][4] * HOP_LENGTH for j in order], dev), max(keep))
         entries = [(active[j], keep[row], reqs[active[j]].pop("gap", None) if ws[j][6] else None)
                    for row, j in enumerate(order)]  # the pause before a sentence's first piece
         return _Pieces(pieces, entries, pinned)
@@ -470,30 +580,46 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     spk_id = synth.speaker_id(speaker)
     pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
     est = [len(_RAW_SENTENCE_END.split(t.strip(), maxsplit=1)[0]) for t in texts]
-    pending = None
-    for group in length_groups(est, sv.buckets, sv.min_bucket):
+    pending, rows, groups, encoded = None, [], [], []
+    first_groups = length_groups(est, sv.buckets, sv.min_bucket)
+    jobs = None
+    if sv.frontend_workers:  # every group's frontend at once, in other processes
+        from .text import frontend
+
+        pool = frontend_pool(sv.frontend_workers)
+        jobs = [pool.submit(frontend, [texts[i] for i in group]) for group in first_groups]
+    for j, group in enumerate(first_groups):
         kept = []
-        for i in group:
-            reqs[i]["sentences"] = split_sentences(normalize(reqs[i]["text"]))
-            if reqs[i]["sentences"]:
+        done = jobs[j].result() if jobs else [split_sentences(normalize(reqs[i]["text"])) for i in group]
+        for i, sentences in zip(group, done):
+            reqs[i]["sentences"] = sentences
+            if sentences:
                 kept.append(i)
         if not kept:
             continue
-        gens = [reqs[i]["g"] for i in kept]
-        encoded = _encode(synth.model, [text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept], spk_id,
-                          length_scale * tempo, gens, synth.prosody, 1.0 if pt is None else pt,
-                          synth.prosody_durations, sv)
+        gens = keys(kept)
+        enc = _encode(synth.model, [text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept], spk_id,
+                      length_scale * tempo, gens, synth.prosody, 1.0 if pt is None else pt, synth.prosody_durations,
+                      sv)
+        if not sv.pipeline:  # one acoustic batch after the groups' text passes
+            groups.append(list(range(len(rows), len(rows) + len(kept))))
+            rows += kept
+            encoded.append(enc)
+            continue
         if pending is not None:
             yield pending.result()
-        add(kept, _finish(synth.model, [list(range(len(kept)))], [encoded], spk_id, cfg_scale, temperature, gens))
+        add(kept, _finish(synth.model, [list(range(len(kept)))], [enc], spk_id, cfg_scale, temperature, gens))
         pending = vocode(kept, pinned=True)
+    if rows:
+        add(rows, _finish(synth.model, groups, encoded, spk_id, cfg_scale, temperature, keys(rows)))
+        pending = vocode(rows)
     if pending is not None:
         yield pending.result()
     while True:
         need = [i for i, r in enumerate(reqs) if not r["windows"] and r["k"] < len(r["sentences"])]
         if need:
             add(need, synth_prepare(synth, [reqs[i]["sentences"][reqs[i]["k"]] for i in need], speaker, cfg_scale,
-                                    temperature, [reqs[i]["g"] for i in need], length_scale, prosody_temperature, sv))
+                                    temperature, keys(need), length_scale, prosody_temperature, sv))
         active = [i for i, r in enumerate(reqs) if r["windows"]]
         if not active:
             return

@@ -63,6 +63,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--chunk-left", type=int, default=32, help="--chunked: left context of the later windows")
     p.add_argument("--chunk-size", type=int, default=256, help="--chunked: frames committed per later window")
     p.add_argument("--crossfade", type=int, default=16, help="--chunked: frames blended at each join")
+    p.add_argument("--noise", choices=["torch", "philox"], default="torch",
+                   help="--chunked: the noise scheme (philox: counter-based, drifting_tts.noise)")
     p.add_argument("--dit-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
                    help="--batch: the DiT's precision (autocast)")
     p.add_argument("--prosody-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
@@ -75,6 +77,11 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="--batch: the batched vocoder's precision (autocast)")
     p.add_argument("--compile-text", action="store_true", help="--batch: torch.compile the text pass")
     p.add_argument("--min-bucket", type=int, default=64, help="--batch: rows per length bucket at least")
+    p.add_argument("--graphs", action="store_true", help="CUDA graphs of the compiled passes (reduce-overhead)")
+    p.add_argument("--pipeline", action="store_true", help="first round group by group, each yielded when ready")
+    p.add_argument("--frontend-workers", type=int, default=0, help="processes for the first round's text frontend")
+    p.add_argument("--compile-vocoder", action="store_true", help="torch.compile the batched vocoder")
+    p.add_argument("--autotune", action="store_true", help="compile the DiT with max-autotune")
     p.add_argument("--batch", type=int, default=0,
                    help="synthesise the sentences N at a time with drifting_tts.batched.stream_batched (the serving "
                         "path; one voice; seed = sentence index as without it; 0: one at a time)")
@@ -152,14 +159,17 @@ def run(args) -> None:
         from .chunked import Chunking
 
         chunked = Chunking(right=args.chunk_right, left=args.chunk_left, chunk=args.chunk_size,
-                           crossfade=args.crossfade)
+                           crossfade=args.crossfade, noise=args.noise)
     serving = None
     if args.batch:
         from .batched import Serving
 
         serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
                           prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
-                          compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype)
+                          compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype,
+                          graphs=args.graphs, pipeline=args.pipeline,
+                          frontend_workers=args.frontend_workers, compile_vocoder=args.compile_vocoder,
+                          autotune=args.autotune)
     elif (args.dit_dtype, args.prosody_dtype, args.text_dtype, args.vocoder_dtype) != ("fp32",) * 4 \
             or args.buckets != 1 or args.compile_dit or args.compile_text:
         raise ValueError("--buckets, --*-dtype and --compile-* apply to --batch")

@@ -118,6 +118,8 @@ def main() -> None:
     p.add_argument("--chunk-left", type=int, default=32, help="--chunked: left context of the later windows")
     p.add_argument("--chunk-size", type=int, default=256, help="--chunked: frames committed per later window")
     p.add_argument("--crossfade", type=int, default=16, help="--chunked: frames blended at each join")
+    p.add_argument("--noise", choices=["torch", "philox"], default="torch",
+                   help="--chunked: the noise scheme (philox: counter-based, drifting_tts.noise)")
     p.add_argument("--out", default=None, help="write the results as JSON")
     args = p.parse_args()
     if args.chunked and args.mode == "sentence":
@@ -149,14 +151,14 @@ def main() -> None:
         from drifting_tts.chunked import Chunking
 
         fn = partial(run_stream, chunked=Chunking(right=args.chunk_right, left=args.chunk_left,
-                                                  chunk=args.chunk_size, crossfade=args.crossfade))
+                                                  chunk=args.chunk_size, crossfade=args.crossfade, noise=args.noise))
 
     cold = fn(synth, TEXTS["long sentence"], 0, **kw)  # first call after loading: CUDA / cuDNN initialisation
     for _ in range(10):
         fn(synth, TEXTS["4-sentence paragraph"], 1, **kw)
     res = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda_kernel": args.cuda_kernel,
            "release": args.release, "mode": args.mode, "compile": args.compile, "tf32": args.tf32,
-           "chunked": {k: getattr(args, k) for k in ("chunk_right", "chunk_left", "chunk_size", "crossfade")}
+           "chunked": {k: getattr(args, k) for k in ("chunk_right", "chunk_left", "chunk_size", "crossfade", "noise")}
            if args.chunked else None,
            "vocoder": args.vocoder, "prosody": args.prosody if args.prosody or not synth.prosody else "release",
            "prosody_durations": args.prosody_durations if synth.prosody else None,

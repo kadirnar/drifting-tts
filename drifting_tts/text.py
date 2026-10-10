@@ -253,3 +253,8 @@ def split_sentences(text: str, max_chars: int = 180) -> list[str]:
         if s:
             out.append(s)
     return out
+
+
+def frontend(texts: list[str]) -> list[list[str]]:
+    """``split_sentences(normalize(text))`` of each text (a picklable job for a pool of frontend processes)."""
+    return [split_sentences(normalize(t)) for t in texts]

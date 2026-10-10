@@ -30,14 +30,19 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class Chunking:
-    """DiT windows of a sentence (frames, 93.75 per second): see the module docstring."""
+    """DiT windows of a sentence (frames, 93.75 per second): see the module docstring. ``noise``: ``"torch"`` (each
+    request's ``torch.Generator``, the draws of the whole-sentence path) or ``"philox"`` (:mod:`drifting_tts.noise`:
+    counter-based, one launch per batch, the same in the single-request and the batched path)."""
 
     right: int = 64
     left: int = 64
     chunk: int = 256
     crossfade: int = 32
+    noise: str = "torch"
 
     def __post_init__(self):
+        if self.noise not in ("torch", "philox"):
+            raise ValueError(f"noise must be 'torch' or 'philox', got {self.noise!r}")
         if self.crossfade > self.right:
             raise ValueError("the crossfade needs the previous window's lookahead: crossfade <= right")
         if min(self.right, self.left, self.crossfade) < 0 or self.chunk <= 0:
@@ -70,6 +75,13 @@ def autocast(dtype: str | None, device: str = "cuda"):
     return torch.autocast(device, dtype=torch.bfloat16 if dtype == "bf16" else torch.float16)
 
 
+def to_device(values, device, dtype=torch.long) -> Tensor:
+    """A small host list on ``device`` without a host synchronisation: ``torch.tensor(values, device=cuda)`` copies
+    from pageable memory, which waits for the GPU's queue; this stages it in page-locked memory instead."""
+    t = torch.tensor(values, dtype=dtype)
+    return t.pin_memory().to(device, non_blocking=True) if torch.device(device).type == "cuda" else t.to(device)
+
+
 def _take(x: Tensor, starts: Tensor, n: int) -> Tensor:
     """``x[b, ..., starts[b]: starts[b] + n]`` for every row (indices past the end repeat the last element)."""
     idx = (starts[:, None] + torch.arange(n, device=x.device)[None]).clamp_max(x.shape[-1] - 1)
@@ -81,9 +93,10 @@ class WindowedMel:
 
     ``generate(z, cond, spk, alpha, mask, labels)`` runs the DiT on a batch of windows (``[B, n_mels, W]`` noise,
     ``[B, C, W]`` condition, ``[B, W]`` valid-frame mask); ``z`` ``[B, n_mels, T]`` is the sentences' noise (already
-    scaled by the temperature), ``cond`` ``[B, C, T]`` their aligned condition, ``lengths`` their frame counts (host
-    ints). :meth:`step` runs the next window of some rows; :attr:`mel` ``[B, n_mels, T]`` holds the output and
-    :attr:`committed` how many frames of each row are final."""
+    scaled by the temperature; or a :class:`~drifting_tts.noise.DiTNoise` that draws each window's), ``cond``
+    ``[B, C, T]`` their aligned condition, ``lengths`` their frame counts (host ints). :meth:`step` runs the next
+    window of some rows; :attr:`mel` ``[B, n_mels, T]`` holds the output and :attr:`committed` how many frames of
+    each row are final."""
 
     def __init__(self, generate: Callable, z: Tensor, cond: Tensor, spk: Tensor, alpha: Tensor, labels: Tensor,
                  lengths: list[int], chunking: Chunking, head: int):
@@ -94,7 +107,7 @@ class WindowedMel:
         self.windows = [dit_windows(t, head, c.chunk, c.left, c.right) for t in self.lengths]
         self.k = [0] * len(self.lengths)
         self.committed = [0] * len(self.lengths)
-        self.mel = torch.zeros(z.shape[0], z.shape[1], z.shape[-1], device=z.device)
+        self.mel = torch.zeros(z.shape[0], z.shape[1], cond.shape[-1], device=cond.device)
         self.dit_frames = 0  # frames the DiT has run over (padding included): the cost of the windows
 
     def pending(self, row: int) -> bool:
@@ -109,13 +122,15 @@ class WindowedMel:
         win = [self.windows[r][self.k[r]] for r in rows]
         if len(rows) == 1:
             return self._step_one(rows[0], *win[0])
-        dev = self.z.device
+        dev = self.cond.device
         W = max(b - a for a, b, _, _ in win)
-        idx = torch.tensor(rows, device=dev)
-        a = torch.tensor([w[0] for w in win], device=dev)
-        n = torch.tensor([w[1] - w[0] for w in win], device=dev)
+        idx, a, n = to_device([rows, [w[0] for w in win], [w[1] - w[0] for w in win]], dev)
         mask = torch.arange(W, device=dev)[None] < n[:, None]
-        z, cond = _take(self.z[idx], a, W), _take(self.cond[idx], a, W)
+        cond = _take(self.cond[idx], a, W)
+        if isinstance(self.z, Tensor):
+            z = _take(self.z[idx], a, W)
+        else:  # counter-based noise (drifting_tts.noise.DiTNoise): drawn for these frames only
+            z = self.z.window(idx, a, W, n)
         if len(rows) > 1 or W != win[0][1] - win[0][0]:  # rows of different lengths: zeros after each one's end
             z, cond = z * mask[:, None], cond * mask[:, None]
         out = self.generate(z, cond, self.spk[idx], self.alpha[idx], mask, self.labels[idx]).float()
@@ -123,9 +138,9 @@ class WindowedMel:
         # blend weights of the new window: 0 before the frames it commits (they are final), a ramp over the first
         # ``crossfade`` of them (the previous window's lookahead), 1 after; the first window has no previous one
         pos = a[:, None] + torch.arange(W, device=dev)[None]
-        c0 = torch.tensor([w[2] for w in win], device=dev)[:, None]
+        c0 = to_device([w[2] for w in win], dev)[:, None]
         X = self.chunking.crossfade
-        first = torch.tensor([self.k[r] == 0 for r in rows], device=dev)[:, None]
+        first = to_device([self.k[r] == 0 for r in rows], dev, torch.bool)[:, None]
         w = ((pos - c0).float() + 0.5) / X if X else (pos >= c0).float()
         w = torch.where(first, torch.ones_like(w), w.clamp(0, 1) * (pos >= c0)) * mask
         T = self.mel.shape[-1]
@@ -140,10 +155,14 @@ class WindowedMel:
 
     def _step_one(self, r: int, a: int, b: int, c0: int, c1: int) -> None:
         """:meth:`step` for one row (one request), with slices instead of gathers: the same values."""
-        s = slice(r, r + 1)
-        mask = torch.ones(1, b - a, dtype=torch.bool, device=self.z.device)
-        out = self.generate(self.z[s, :, a:b], self.cond[s, :, a:b], self.spk[s], self.alpha[s], mask,
-                            self.labels[s]).float()
+        s, dev = slice(r, r + 1), self.cond.device
+        mask = torch.ones(1, b - a, dtype=torch.bool, device=dev)
+        if isinstance(self.z, Tensor):
+            z = self.z[s, :, a:b]
+        else:
+            rr, aa, nn = to_device([[r], [a], [b - a]], dev)
+            z = self.z.window(rr, aa, b - a, nn)
+        out = self.generate(z, self.cond[s, :, a:b], self.spk[s], self.alpha[s], mask, self.labels[s]).float()
         self.dit_frames += b - a
         if self.k[r] == 0:
             self.mel[s, :, a:b] = out

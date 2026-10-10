@@ -136,8 +136,9 @@ def test_chunked_stream_vocodes_the_windowed_mel(tmp_path, prosody):
         torch.testing.assert_close(a, b, rtol=0, atol=1e-5)
 
 
-@pytest.mark.parametrize("prosody,buckets", [(False, 1), (True, 1), (True, 2)])
-def test_chunked_stream_batched_matches_chunked_stream(tmp_path, prosody, buckets):
+@pytest.mark.parametrize("prosody,buckets,pipeline", [(False, 1, False), (True, 1, False), (True, 2, False),
+                                                      (True, 2, True)])
+def test_chunked_stream_batched_matches_chunked_stream(tmp_path, prosody, buckets, pipeline):
     from drifting_tts.batched import Serving
 
     synth = _synth(tmp_path, prosody)
@@ -146,9 +147,9 @@ def test_chunked_stream_batched_matches_chunked_stream(tmp_path, prosody, bucket
     ch = Chunking(right=6, left=4, chunk=12, crossfade=2)
     kw = dict(speaker=2, cfg_scale=1.5, temperature=0.5, pause=0.05, first=4)
     got = {i: [] for i in range(len(texts))}
-    sv = Serving(buckets=buckets, min_bucket=1)
+    sv = Serving(buckets=buckets, min_bucket=1, pipeline=pipeline)
     rounds = list(stream_batched(synth, texts, seeds=[3, 4, 5, 6], chunked=ch, serving=sv, **kw))
-    first = [i for out in rounds[:buckets] for i, _ in out]  # the first round: one yield per length group
+    first = [i for out in rounds[:buckets if pipeline else 1] for i, _ in out]  # pipelined: a yield per group
     assert sorted(first) == list(range(len(texts)))  # every request's first piece before any second piece
     for out in rounds:
         for i, piece in out:

@@ -186,3 +186,20 @@ def _compare_cuda(model, pred, ids):
                                   durations=durations, pitch=pitch)
         t = int(lens[b])
         torch.testing.assert_close(mel[b: b + 1, :, :t], ref, rtol=0, atol=1e-4)
+
+
+def test_expand_by_durations_is_the_alignment_matmul():
+    from drifting_tts.batched import expand_by_durations
+    from drifting_tts.models.text_encoder import frames_to_alignment
+    from drifting_tts.models.tts import DriftingTTS
+
+    torch.manual_seed(0)
+    h, mu = torch.randn(3, 5, 7), torch.randn(3, 4, 7)
+    frames = torch.randint(0, 4, (3, 7)).float()
+    frames[2] = 0  # no frames at all: one zero frame, as frames_to_alignment
+    x_mask = torch.ones(3, 1, 7)
+    x_mask[1, :, 5:] = 0
+    attn, y_len = frames_to_alignment(frames, x_mask)
+    ref = DriftingTTS.frame_condition(h, mu, attn)
+    got = expand_by_durations(torch.cat([mu, h], 1), frames * x_mask[:, 0], int(y_len.max()))
+    assert torch.equal(got, ref)

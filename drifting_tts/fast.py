@@ -214,10 +214,13 @@ class GraphedAcoustic:
     def prepare(self, ids: Tensor, spk: Tensor, cfg_scale: float, temperature: float, length_scale: float,
                 generator: torch.Generator | None = None, prosody_temperature: float = 1.0,
                 duration_temperature: float | None = None, rhythm: Tensor | None = None,
-                edge_scale: float | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+                edge_scale: float | None = None,
+                prosody_noise: tuple[Tensor, Tensor] | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """The DiT's inputs of :meth:`__call__` (the encoder's graph, the alignment and the draws): the noise scaled
         by ``temperature`` ``[1, n_mels, T]``, the aligned condition ``[1, C, T]``, the CFG scale ``[1]`` and the
-        style codes."""
+        style codes. ``prosody_noise``: the prosody predictor's unit noise ``([1, noise_tok, N], [1, noise_glob])``
+        drawn elsewhere (:mod:`drifting_tts.noise`); nothing is drawn from ``generator`` then, and the DiT's noise and
+        style codes are returned as ``None``."""
         if (duration_temperature is not None or rhythm is not None) and self.prosody_durations == "sampled" \
                 and not self.duration_row:
             raise ValueError("a duration temperature or rhythm of its own needs GraphedAcoustic(duration_row=True)")
@@ -234,8 +237,11 @@ class GraphedAcoustic:
             z_tok = torch.zeros(1, net.noise_tok, nb, device=self.device)
             z_glob = torch.zeros(1, net.noise_glob, device=self.device)
             if self.prosody.kind == "drift":
-                z_tok[..., :n] = torch.randn(1, net.noise_tok, n, device=self.device, generator=generator)
-                z_glob = torch.randn(1, net.noise_glob, device=self.device, generator=generator)
+                if prosody_noise is None:
+                    z_tok[..., :n] = torch.randn(1, net.noise_tok, n, device=self.device, generator=generator)
+                    z_glob = torch.randn(1, net.noise_glob, device=self.device, generator=generator)
+                else:
+                    z_tok[..., :n], z_glob = prosody_noise[0][..., :n], prosody_noise[1].clone()
                 if not self.duration_row:  # the two-row graph scales the unit noise per row
                     z_tok *= prosody_temperature
                     z_glob = z_glob * prosody_temperature
@@ -254,10 +260,12 @@ class GraphedAcoustic:
                 attn, y_len = durations_to_alignment(logw, x_mask, length_scale)
         cond = self.model.frame_condition(h, mu, attn)
         t = cond.shape[-1]
+        alpha = torch.full((1,), float(cfg_scale), device=self.device)
+        if prosody_noise is not None:
+            return None, cond, alpha, None
         # the same draws, in the same order, as DriftingTTS.synthesize / rollout
         z = torch.randn(1, self.model.n_mels, t, device=self.device, generator=generator)
         labels = self.model.style_codes(1, self.device, generator)
-        alpha = torch.full((1,), float(cfg_scale), device=self.device)
         return z * temperature, cond, alpha, labels
 
 
