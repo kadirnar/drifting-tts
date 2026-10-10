@@ -63,6 +63,10 @@ VOCODERS: dict[str, VocoderEntry] = {
     "vocos-v2": VocoderEntry("vocos", "Vocos-ft trained further: rebalanced GAN losses, multi-scale mel, "
                              "instantaneous-frequency loss, cosine LR (release v3.2)", VOCOS_REPO, "vocos_v2.pt",
                              context=32),
+    # vocos-v2 trained 20k steps further on speaker-balanced batches (configs/vocoder_vocos_v2_balance.yaml): better on
+    # the male and female voices, the same on the studio voice (docs/VOCODERS.md, "Speaker balance")
+    "vocos-v2-balanced": VocoderEntry("vocos", "Vocos v2 trained further on speaker-balanced batches (male / female "
+                                      "voices)", VOCOS_REPO, "vocos_v2_balanced.pt", context=32),
     "vocos": VocoderEntry("vocos", "charactr/vocos-mel-24khz, for models trained on Vocos mels", VOCOS_REPO,
                           context=32, mel="vocos"),
     "griffin-lim": VocoderEntry("griffin-lim", "mel pseudo-inverse + NNLS, then fast Griffin-Lim (no weights)",

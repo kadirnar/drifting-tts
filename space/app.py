@@ -31,6 +31,9 @@ v31 = v32.variant(vocoder="bigvgan-v2-ft", prosody=None, pause=0.15)  # same aco
 # prosody temperature 0.3 (at 0.5 they cost words: Freya-495 WER 1.89% against 1.33%), the pauses and the pitch at the
 # slider's; studio voice only, since the voices with little data still slip on words (docs/PROSODY_MODEL.md)
 v32_rhythm = v32.variant(prosody=v32.prosody, prosody_durations="sampled", prosody_duration_temperature=0.3)
+# the male and female voices use Vocos v2 trained further on speaker-balanced batches (Freya-495 UTMOSv2 with v3.2:
+# male 2.896 -> 2.944, female 2.722 -> 2.749; the studio voice keeps Vocos v2)
+v32_voices = v32.variant(vocoder="vocos-v2-balanced")
 RHYTHM = "v3.2 + sampled rhythm (experimental, studio voice only)"
 RELEASES = {
     "v3.2 (new): sampled intonation, Vocos v2, punctuation pauses": v32,
@@ -56,13 +59,13 @@ full band; noise temperature 0.3, α = 2). WER / UTMOSv2:
 | voice | v3.2: sampled intonation + Vocos v2 (13.5 M) | v3.1: BigVGAN-v2-ft (112 M) |
 |---|---|---|
 | studio | 1.33% / 3.02 | 1.23% / 2.94 |
-| male | 2.28% / 2.90 | 1.74% / 2.81 |
-| female | 3.99% / 2.72 | 3.02% / 2.75 |
+| male | 2.43% / 2.94 | 1.74% / 2.81 |
+| female | 3.91% / 2.75 | 3.02% / 2.75 |
 
 v3.2 samples only the intonation: the rhythm (durations) stays v3.1's. On 100 held-out sentences of the studio
 voice its pitch spread is 3.53 semitones against 3.68 in the recordings and 3.21 for v3.1, so
-the intonation is less flat; each seed gives another plausible tune. The male and female voices are somewhat less
-intelligible than in v3.1.
+the intonation is less flat; each seed gives another plausible tune. The male and female voices use Vocos v2 trained
+further on speaker-balanced batches (`vocos-v2-balanced`); they are somewhat less intelligible than in v3.1.
 
 **v3.2 + sampled rhythm** (experimental) lets the prosody model sample the durations as well: a livelier rhythm with
 more pauses inside sentences (held-out studio texts: 2.37 pauses per utterance, against 1.39 in the recordings and
@@ -82,8 +85,10 @@ def generate(text, release, voice, temperature, guidance, prosody_temperature, r
     if not normalize(text):
         raise gr.Error("Nothing to read after normalisation.")
     synth, note = RELEASES[release], ""
-    if release == RHYTHM and VOICES[voice] != "studio":
-        synth, note = v32, " Sampled rhythm is for the studio voice only: this voice used v3.2 (sampled intonation)."
+    if synth is not v31 and VOICES[voice] != "studio":  # v3.2 with the vocoder balanced for the other voices
+        if release == RHYTHM:
+            note = " Sampled rhythm is for the studio voice only: this voice used v3.2 (sampled intonation)."
+        synth = v32_voices
     t0 = time.time()
     wav, info = synth(text, speaker=VOICES[voice], cfg_scale=float(guidance), temperature=float(temperature),
                       length_scale=1.0 / float(rate), seed=int(seed),
