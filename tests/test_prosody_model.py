@@ -6,6 +6,7 @@ from drifting_tts.models.prosody_net import (
     ProsodyPredictor,
     ProsodyStats,
     boundary_tokens,
+    edge_tokens,
     prosody_features,
     word_index,
 )
@@ -203,3 +204,9 @@ def test_durations_at_their_own_temperature_and_with_a_borrowed_rhythm():
     borrowed_f, borrowed_p = run(0, duration_speaker=torch.tensor([0]))
     torch.testing.assert_close(borrowed_p, pitch)  # pitch of speaker 1
     torch.testing.assert_close(borrowed_f, run(0, spk=0)[0])  # all durations as speaker 0's
+    edged_f, _ = run(0, duration_speaker=torch.tensor([0]), edge_scale=1.3)  # the sentence's edges: speaker 1's own
+    edges = edge_tokens(lens, ids.shape[1])
+    _, _, logw, _ = tts.encoder(ids, lens, torch.tensor([1]))
+    torch.testing.assert_close(edged_f[edges], torch.ceil(torch.exp(logw[:, 0]) * 1.3)[edges])
+    torch.testing.assert_close(edged_f[~edges], borrowed_f[~edges])
+    assert edges.sum() == 5

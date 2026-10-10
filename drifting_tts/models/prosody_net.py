@@ -69,6 +69,13 @@ def boundary_tokens(ids: Tensor) -> Tensor:
     return mark | ((ids == BLANK_ID) & (left | right))
 
 
+def edge_tokens(lengths: Tensor, n: int, first: int = 3, last: int = 2) -> Tensor:
+    """The sentence's edges ``[B, n]`` bool: its ``first`` tokens (the leading blank, the first character and its blank)
+    and its ``last`` valid ones (the final punctuation and blank)."""
+    pos = torch.arange(n, device=lengths.device)[None]
+    return (pos < first) | ((pos >= lengths[:, None] - last) & (pos < lengths[:, None]))
+
+
 def word_index(ids: Tensor) -> Tensor:
     """Token ids ``[B, N]`` -> word index ``[B, N]`` (words are separated by space tokens)."""
     return torch.cumsum((ids == SPACE_ID).long(), 1)
@@ -352,14 +359,18 @@ class ProsodyPredictor(nn.Module):
     def predict(self, tts, text: Tensor, text_len: Tensor, spk: Tensor, temperature: float = 1.0,
                 length_scale: float | Tensor = 1.0, generator: torch.Generator | None = None,
                 spread: float = 1.0, duration_temperature: float | None = None,
-                duration_speaker: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                duration_speaker: Tensor | None = None,
+                edge_scale: float | Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Sample frames per token ``[B, N]`` and token pitch ``[B, 1, N]`` for ``tts`` (its frozen encoder and
         regressors give the condition); pass them to :meth:`DriftingTTS.synthesize` as ``durations`` / ``pitch``.
         ``temperature`` / ``spread``: see :meth:`sample`. ``duration_temperature``: the noise temperature of the
         letters' durations (a character and the blank after it); the tokens between words (:func:`boundary_tokens`:
         the pauses) keep ``temperature``, like the pitch. ``duration_speaker`` ``[B]``: sample all durations as for
         this speaker (its rhythm, pauses included), the pitch for ``spk``; ``length_scale`` should then carry the
-        factor that brings that rhythm to the voice's rate (:attr:`rhythm`, :attr:`duration_scales`)."""
+        factor that brings that rhythm to the voice's rate (:attr:`rhythm`, :attr:`duration_scales`).
+        ``edge_scale`` (with ``duration_speaker``): the sentence's edges (:func:`edge_tokens`) keep the voice's own
+        regressor durations, ``ceil(exp(logw) * edge_scale)``: a voice's generator learned its own sentence starts
+        and ends (the female recordings, for one, start abruptly)."""
         h, _, logw, x_mask = tts.encoder(text, text_len, spk)
         words = self.word_tokens(text, text_len)
         cond, base = self.condition(tts, h, x_mask, spk, logw, self.stats, words)
@@ -370,7 +381,11 @@ class ProsodyPredictor(nn.Module):
         dmask = ~boundary_tokens(text) if duration_speaker is None else None  # the pauses keep the first row's
         y, vlogit = self.sample(cond, base, x_mask, temperature, generator=generator, spread=spread,
                                 duration_temperature=duration_temperature, duration_cond=dcond, duration_mask=dmask)
-        return self.frames_and_pitch(y, vlogit, x_mask, length_scale)
+        frames, pitch = self.frames_and_pitch(y, vlogit, x_mask, length_scale)
+        if duration_speaker is not None and edge_scale is not None:
+            own = torch.ceil(torch.exp(logw[:, 0]) * edge_scale)
+            frames = torch.where(edge_tokens(text_len, text.shape[1]), own, frames) * x_mask[:, 0]
+        return frames, pitch
 
     @classmethod
     def load(cls, path, device="cpu", tts=None) -> ProsodyPredictor:

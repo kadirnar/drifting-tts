@@ -291,13 +291,18 @@ class Synthesizer:
         return (self.prosody is not None and self.prosody_durations == "sampled"
                 and (self.prosody_duration_temperature is not None or bool(self.prosody.rhythm)))
 
-    def _rhythm(self, speaker: str | int) -> torch.Tensor | None:
-        """The speaker whose rhythm this voice's sampled durations borrow (``ProsodyPredictor.rhythm``), or ``None``."""
+    def _rhythm(self, speaker: str | int) -> tuple[torch.Tensor, float] | None:
+        """The speaker whose rhythm this voice's sampled durations borrow (``ProsodyPredictor.rhythm``) and the ratio of
+        the voice's regressor factor to its sampler factor (the sentence's edges keep its regressor durations), or
+        ``None``."""
         if self.prosody is None or self.prosody_durations != "sampled":
             return None
         spk_id = self.speaker_id(speaker)
         src = self.prosody.rhythm.get(spk_id)
-        return None if src is None or src == spk_id else torch.tensor([src], device=self.device)
+        if src is None or src == spk_id:
+            return None
+        own = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
+        return torch.tensor([src], device=self.device), own / self.prosody.duration_scales.get(spk_id, 1.0)
 
     def speaker_id(self, speaker: str | int) -> int:
         """A voice name (``male`` / ``female``), a training speaker ID, or a dataset speaker name."""
@@ -319,24 +324,25 @@ class Synthesizer:
     def _mel(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
              length_scale: float, attn_window: int | None = None, pitch_shift: float = 0.0,
              steps: int | None = None, prosody_temperature: float | None = None,
-             rhythm: torch.Tensor | None = None) -> torch.Tensor:
+             rhythm: tuple[torch.Tensor, float] | None = None) -> torch.Tensor:
         """One normalised sentence -> normalised mel ``[1, n_mels, T]`` (CUDA graphs when ``fast`` allows it).
-        ``rhythm``: the speaker whose durations are sampled (:meth:`_rhythm`)."""
+        ``rhythm``: the speaker whose durations are sampled and the edge factor (:meth:`_rhythm`)."""
         ids = torch.tensor([text_to_ids(sentence, normalized=True)], device=self.device)
         pt = self.prosody_temperature if prosody_temperature is None else prosody_temperature
         dt = self.prosody_duration_temperature if self.prosody_durations == "sampled" else None
         if dt is None and self._duration_row():  # the same row layout as the CUDA graphs
             dt = pt
+        rs, edge_scale = (None, None) if rhythm is None else (rhythm[0], length_scale * rhythm[1])
         if self.acoustic is not None and attn_window is None and not pitch_shift and steps in (None, 1):
             return self.acoustic(ids, spk, cfg_scale, temperature, length_scale, generator=g,
                                  prosody_temperature=1.0 if pt is None else pt, duration_temperature=dt,
-                                 rhythm=rhythm)
+                                 rhythm=rs, edge_scale=edge_scale)
         ids_len = torch.tensor([ids.shape[1]], device=self.device)
         durations = pitch = None
         if self.prosody is not None:  # sampled first, from the same generator as the DiT's noise
             durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
                                                     spread=self.prosody_spread, duration_temperature=dt,
-                                                    duration_speaker=rhythm)
+                                                    duration_speaker=rs, edge_scale=edge_scale)
             if self.prosody_durations == "regressor":
                 durations = None
         mel, _ = self.model.synthesize(ids, ids_len, spk, cfg_scale=cfg_scale, temperature=temperature,

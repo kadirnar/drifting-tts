@@ -95,8 +95,9 @@ def test_graphed_acoustic_with_a_prosody_predictor_matches_eager(durations):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
-@pytest.mark.parametrize("duration_temperature,rhythm", [(0.3, None), (0.7, 0), (None, 1), (0.0, None)])
-def test_graphed_acoustic_with_a_duration_row_matches_eager(duration_temperature, rhythm):
+@pytest.mark.parametrize("duration_temperature,rhythm,edge_scale", [(0.3, None, None), (0.7, 0, None), (None, 1, 1.2),
+                                                                    (0.0, None, None), (0.3, 0, 0.9)])
+def test_graphed_acoustic_with_a_duration_row_matches_eager(duration_temperature, rhythm, edge_scale):
     """Durations at their own temperature or another speaker's rhythm (two rows) inside the encoder's graph."""
     from drifting_tts.models.prosody_net import ProsodyPredictor
 
@@ -120,11 +121,11 @@ def test_graphed_acoustic_with_a_duration_row_matches_eager(duration_temperature
         for seed in range(2):
             g = torch.Generator(device="cuda").manual_seed(seed)
             frames, pitch = pred.predict(model, ids, n, spk, 0.7, 1.3, generator=g, duration_temperature=dt,
-                                         duration_speaker=rs)
+                                         duration_speaker=rs, edge_scale=edge_scale)
             ref, _ = model.synthesize(ids, n, spk, cfg_scale=1.5, temperature=0.5, length_scale=1.3, generator=g,
                                       durations=frames, pitch=pitch)
             g = torch.Generator(device="cuda").manual_seed(seed)
             mel = fast(ids, spk, 1.5, 0.5, 1.3, generator=g, prosody_temperature=0.7, duration_temperature=dt,
-                       rhythm=rs)
+                       rhythm=rs, edge_scale=edge_scale)
             assert mel.shape == ref.shape
             torch.testing.assert_close(mel, ref, rtol=0, atol=1e-4)

@@ -426,8 +426,10 @@ def calibrate(pred: ProsodyPredictor, tts, cache: dict, device, temperature: flo
               rhythm: dict[int, int] | None = None) -> dict[int, float]:
     """Per-voice duration factors of the sampler: the median recorded / sampled length over ``num`` *training*
     utterances of each voice (never the evaluation splits), as ``calibrate-durations`` does for the regressors.
-    ``duration_temperature`` / ``rhythm``: the operating point of the sampled durations (a voice in ``rhythm``
-    samples another speaker's rhythm, and its factor brings that rhythm to its own recordings' length)."""
+    ``duration_temperature`` / ``rhythm``: the operating point of the sampled durations. A voice in ``rhythm``
+    samples another speaker's rhythm, and its factor brings that rhythm to the length of the voice's own regressor
+    durations (the release's speaking rate; its recordings' length would slow the articulation of a voice whose
+    recordings have long pauses)."""
     rng = np.random.default_rng(seed)
     scales = {}
     for spk in speakers:
@@ -437,9 +439,13 @@ def calibrate(pred: ProsodyPredictor, tts, cache: dict, device, temperature: flo
         sub = data.subset(rng.choice(len(data), min(num, len(data)), replace=False))
         samples = sample_split(pred, tts, sub, [seed], temperature, device, spread=spread,
                                duration_temperature=duration_temperature, rhythm=rhythm)
-        r = [it["dur"].sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
+        if rhythm and spk in rhythm:  # the voice's regressor durations (ceil, its factor), as at inference
+            f = tts.duration_scales.get(int(spk), tts.duration_scale)
+            r = [np.ceil(np.exp(it["logw_det"]) * f).sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
+        else:
+            r = [it["dur"].sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
         scales[int(spk)] = float(np.median(r))
-        src = f", rhythm of {rhythm[spk]}" if rhythm and spk in rhythm else ""
+        src = f", rhythm of {rhythm[spk]} against its regressors' length" if rhythm and spk in rhythm else ""
         td = "" if duration_temperature is None else f", durations T={duration_temperature:g}"
         print(f"speaker {spk}: recorded / sampled length median {scales[spk]:.3f} (p10 {np.percentile(r, 10):.3f}, "
               f"p90 {np.percentile(r, 90):.3f}) over {len(sub)} training utterances, T={temperature:g}{td}{src}",

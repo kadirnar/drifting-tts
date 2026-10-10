@@ -254,7 +254,9 @@ def test_duration_temperature_and_rhythm_table_of_the_prosody_checkpoint(tmp_pat
     torch.save(out, tmp_path / "prosody.pt")
     synth = _synth(tmp_path, prosody=str(tmp_path / "prosody.pt"))
     assert synth.prosody_duration_temperature == 0.0 and synth.prosody.rhythm == {2: 0}
-    assert synth._rhythm(2).tolist() == [0] and synth._rhythm(1) is None and synth._duration_row()
+    rs, edge = synth._rhythm(2)
+    assert rs.tolist() == [0] and edge == pytest.approx(1.1 / 1.05)  # the model's factor over the sampler's
+    assert synth._rhythm(1) is None and synth._duration_row()
     a, b = (synth.mels(TEXT, speaker=2, seed=s) for s in (1, 2))
     assert [m.shape for m in a] == [m.shape for m in b]  # durations at T 0: the same for every seed
     hot = synth.variant(prosody=synth.prosody, prosody_temperature=0.5, prosody_duration_temperature=1.0)
