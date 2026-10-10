@@ -19,6 +19,21 @@ requests arrive together. All numbers below were measured on 10 October 2026 on 
 - **No gaps:** in every configuration, each later piece arrived while the earlier audio was still playing. At 256
   batched requests, at least 249 ms of audio was still buffered when the next piece arrived.
 
+**Streaming the acoustic model** (opt-in, [below](#streaming-the-acoustic-model)). The DiT runs on frame windows, so
+the first piece no longer waits for the whole first sentence. The batched passes also get length buckets, half
+precision and `torch.compile`. On the same mix, with Freya-495 quality unchanged:
+
+| requests at the same instant | first audio, batched, today | streaming DiT, fp32 | streaming DiT, counter-based noise, `Serving.fast()` |
+|---|---|---|---|
+| 1 (fast path, CUDA graphs) | 5.8 / 7.4 / 7.0 ms | **5.8 / 6.3 / 6.1 ms** | – |
+| 64 | 69 ms | 38 ms | **18 ms** |
+| 128 | 147 ms | 69 ms | **29 ms** |
+| 256 | 296 ms | 135 ms | **52 ms** |
+
+The one-request row gives a short sentence / long sentence / paragraph. The N rows give every request's first
+audio, re-measured in the same session as the new rows. With `Serving.fast()`, all audio of 256 requests is done
+after 0.28 s, which is 4,770 s of audio per second (2.4 times the batched baseline).
+
 ## Setup
 
 **System under test:** `Synthesizer.from_pretrained("v3.2", "cuda", fast=True)`. This loads v3.1's acoustic
@@ -228,6 +243,193 @@ call the same output.
   - every row of the masked Vocos batch against vocoding it alone;
   - every request's pieces from `stream_batched` against `Synthesizer.stream`, paragraph pauses included.
 
+## Streaming the acoustic model
+
+`Synthesizer.stream(..., chunked=Chunking())` and `stream_batched(..., chunked=Chunking(), serving=Serving.fast())`
+(`drifting_tts/chunked.py`, `drifting_tts/batched.py`, `drifting_tts/noise.py`). Everything is opt-in; the defaults
+of `stream`, `from_pretrained` and `stream_batched` are unchanged.
+
+### How it works
+
+- **Text side once per sentence.** The text encoder and the prosody predictor run over the whole sentence, as
+  before, so the durations, the token pitch and the aligned condition are known up front. The DiT's noise and style
+  codes are drawn once per sentence, in the single-request order.
+- **First DiT window.** It covers frames [0, 128) and commits [0, 64). The 64 frames are what the vocoder's first
+  piece needs: 32 frames plus 32 of context. The other 64 are lookahead (`right`).
+- **Later windows.** Each one commits the next 256 frames. It sees 64 frames before them (`left`) and 64 after them
+  (`right`). Its first 32 committed frames are blended linearly, in log-mel space, with the previous window's
+  lookahead (`crossfade`).
+- **Joins with the vocoder.** DiT window *k* commits exactly the frames that vocoder window *k* needs, so every
+  streaming round runs one DiT window and one vocoder window per request.
+- **Short sentences.** A sentence of at most 128 frames (1.4 s) is one window, and that window is the whole-sentence
+  generation, bit for bit.
+- **Why windows suit this DiT.** It was trained on 256-frame crops (`drift.crop_frames`), with the condition cropped
+  the same way and a random start. The windows here are 128 and 384 frames long, closer to that than whole
+  sentences of up to about 1,500 frames.
+- **Cost.** On Freya sentences the DiT runs over 1.5 times the frames of the whole-sentence path, because the windows
+  overlap.
+
+### Quality
+
+**Freya-100**, studio voice, the protocol of the v3.2 row. Streaming means `Synthesizer.stream` with `fast=True`;
+the published row uses `__call__`, which vocodes each sentence whole. `R` is the lookahead in frames.
+
+| system | WER | CER | UTMOSv2 | DNSMOS OVRL |
+|---|---|---|---|---|
+| v3.2, published row (`__call__`, reproduced) | 0.44% | 0.11% | 2.998 | 3.356 |
+| v3.2, streaming, whole-sentence DiT | 0.55% | 0.13% | 2.999 | 3.356 |
+| chunked, R = 0, L = 0, no crossfade (hard joins) | 0.55% | 0.13% | 3.005 | 3.351 |
+| chunked, R = 32, L = 32, crossfade 16 | 0.88% | 0.18% | 3.009 | 3.357 |
+| **chunked, R = 64, L = 64, crossfade 32** | 0.66% | 0.14% | 2.995 | 3.353 |
+| chunked, R = 128, L = 64, crossfade 32 | 0.66% | 0.14% | 2.994 | 3.355 |
+
+**Freya-495**, all 495 sentences, studio voice. Δ is the paired bootstrap difference with its 95% interval.
+
+| system | WER | CER | UTMOSv2 | DNSMOS | Δ WER (pp) | Δ UTMOSv2 | against |
+|---|---|---|---|---|---|---|---|
+| streaming, whole-sentence DiT (reference) | 1.36% | 0.27% | 3.021 | 3.346 | | | |
+| chunked R = 32 | 1.43% | 0.29% | 3.012 | 3.347 | +0.08 [−0.15, +0.33] | −0.009 [−0.020, +0.002] | reference |
+| **chunked R = 64** | 1.25% | 0.25% | 3.020 | 3.345 | −0.10 [−0.26, +0.05] | −0.001 [−0.007, +0.005] | reference |
+| chunked R = 128 | 1.38% | 0.27% | 3.019 | 3.346 | +0.03 [−0.13, +0.18] | −0.002 [−0.007, +0.003] | reference |
+| chunked R = 64, counter-based noise | 1.48% | 0.28% | 3.023 | 3.346 | +0.12 [−0.26, +0.52] | +0.002 [−0.020, +0.023] | reference (other draws) |
+| batched (64), chunked R = 64, fp32 | 1.25% | 0.25% | 3.020 | 3.339 | +0.00 [−0.08, +0.08] | +0.000 [−0.002, +0.003] | chunked R = 64 |
+| batched (64), chunked, fp16 DiT | 1.30% | 0.26% | 3.021 | 3.339 | +0.05 [+0.00, +0.13] | +0.001 [−0.001, +0.004] | chunked R = 64 |
+| batched (64), chunked, bf16 DiT | 1.30% | 0.26% | 3.020 | 3.339 | +0.05 [−0.05, +0.16] | −0.000 [−0.004, +0.004] | chunked R = 64 |
+| **batched (256), chunked, counter-based noise, `Serving.fast()`** | 1.46% | 0.28% | 3.024 | 3.338 | −0.03 [−0.08, +0.00] | +0.001 [−0.002, +0.004] | chunked R = 64, counter-based noise |
+| batched (64), whole-sentence DiT, fp32 (the path of main) | 1.38% | 0.27% | 3.022 | 3.339 | +0.03 [+0.00, +0.08] | +0.001 [−0.002, +0.004] | reference |
+
+- **R = 64 is the smallest lookahead within noise.** R = 32 also passes on WER, but its UTMOSv2 leans lower
+  (−0.009). In the seam measures below, its frames near the sentence start are also further from whole-sentence
+  generation. `Chunking()` defaults to R = 64.
+- **The fp16 / bf16 DiT pass.** The DiT was trained under bf16 autocast. On 256 whole sentences, fp16 gives a mel SNR
+  of 70 dB against fp32 and bf16 52.8 dB (the MLX notes report the same figures). `Serving.fast()` uses fp16.
+- **The final configuration has the quality of its single-request counterpart.** Against the same draws, alone and
+  in fp32, it differs by −0.03 pp WER and +0.001 UTMOSv2.
+- **DNSMOS.** Every batched run gives 3.338–3.339, against 3.345–3.346 one request at a time. Main's whole-sentence
+  batched path gives the same 3.339, so batching causes it, not the streaming DiT. The difference is systematic
+  (median per sentence −0.006) and UTMOSv2 does not show it. The batched audio differs from single requests
+  mostly in the near-silent first and last frames, but the cause was not found.
+- **Frame counts.** The final configuration gives 12 of the 495 sentences one frame more or less than its fp32
+  single-request counterpart (12 frames in all). The fp32 batched path gives 4 of 495 (half precision moves a few
+  more durations across a rounding boundary).
+
+**Seams** (Freya-100). Generated mels and their audio are compared with whole-sentence generation from the same draws.
+"At joins" means 2 frames before each join through the end of its crossfade. Spectral flux is the mean |Δ| between
+consecutive frames of the audio's log-mel.
+
+| windows | log-mel distance, all / joins / first 64 frames | audio flux at joins, chunked / whole | DiT frames per frame |
+|---|---|---|---|
+| R = 0, L = 0, no crossfade | 0.92 / 3.24 / 1.72 dB | 3.81 / 3.64 (+4.8%) | 1.00 |
+| R = 32, L = 32, crossfade 16 | 0.68 / 0.66 / 1.29 dB | 3.684 / 3.687 (−0.1%) | 1.27 |
+| R = 64, L = 64, no crossfade | 0.36 / 0.47 / 1.12 dB | 3.670 / 3.652 (+0.5%) | 1.50 |
+| **R = 64, L = 64, crossfade 32** | 0.38 / 0.48 / 1.12 dB | 3.712 / 3.710 (+0.05%) | 1.50 |
+| R = 128, L = 64, crossfade 32 | 0.22 / 0.34 / 0.91 dB | 3.741 / 3.739 (+0.05%) | 1.58 |
+
+- **Hard joins show up as seams.** Without lookahead, flux at the joins rises by 4.8% and the mel there differs by
+  3.2 dB. With 64 frames of context and the crossfade, the joins cannot be told from the rest.
+- **A different sample, not an approximation.** The chunked mel is a sample of the same model under a narrower view,
+  0.4 dB from the whole-sentence one on average. The judges above score it the same.
+- **A/B samples:** `runs/tp_samples/` holds 6 sentences, whole-sentence (A) and chunked R = 64 (B).
+
+### One request
+
+`scripts/bench_ttfa.py --mode fast`: CUDA graphs for the encoder, the DiT windows (their frame buckets) and the
+vocoder windows; fp32; 100 runs per input. Values are p50 / p90 / p99.
+
+| | short sentence | long sentence | 4-sentence paragraph | RTF short / long / paragraph |
+|---|---|---|---|---|
+| whole-sentence DiT (today) | 5.8 / 5.8 / 6.3 ms | 7.4 / 7.4 / 7.4 ms | 7.0 / 7.2 / 7.3 ms | 0.0051 / 0.0017 / 0.0020 |
+| **chunked R = 64** | **5.8 / 5.9 / 5.9 ms** | **6.3 / 6.4 / 6.5 ms** | **6.1 / 6.2 / 6.3 ms** | 0.0051 / 0.0027 / 0.0030 |
+| chunked R = 64, counter-based noise | 6.1 / 6.1 / 6.4 ms | 6.5 / 6.6 / 6.7 ms | 6.4 / 6.4 / 6.5 ms | 0.0053 / 0.0028 / 0.0031 |
+
+- **TTFA no longer grows with the sentence.** It is 5.8–6.3 ms whatever the length. A short sentence is one window,
+  so it costs what it did.
+- **The cost is total GPU time.** Window overlaps and per-window overheads raise it for long inputs. The long
+  sentence takes 16 ms in total instead of 10. So FIFO queues grow faster (below).
+
+### N requests at once
+
+`scripts/bench_concurrency.py`, the same mix and protocol as above. Each step adds to the one before. The columns
+are first audio (p50 / max, ms), all audio done, s of audio per s, the least audio still buffered when a later piece
+arrived (no stalls in any run), and peak GB.
+
+| | N = 64 | N = 128 | N = 256 | all done 64 / 128 / 256 | audio/s at 256 | buffered at 256 | peak GB at 256 |
+|---|---|---|---|---|---|---|---|
+| batched, whole-sentence DiT, fp32 (baseline) | 69 / 69 | 147 / 147 | 296 / 297 | 177 / 361 / 678 ms | 1,976 | 248 ms | 2.72 |
+| + streaming DiT (chunked R = 64) | 38 / 38 | 69 / 69 | 135 / 135 | 236 / 423 / 760 ms | 1,764 | 94 ms | 2.91 |
+| + counter-based noise | 38 / 38 | 68 / 68 | 131 / 131 | 241 / 431 / 766 ms | 1,750 | 92 ms | 2.86 |
+| + 4 length buckets (≥ 64 rows each) | 38 / 38 | 62 / 62 | 115 / 115 | 241 / 426 / 748 ms | 1,793 | 92 ms | 2.85 |
+| + fp16 DiT, compiled | 28 / 28 | 44 / 46 | 79 / 80 | 157 / 279 / 483 ms | 2,774 | 204 ms | 2.85 |
+| + fp16 text encoder and prosody network, compiled | 21 / 22 | 35 / 36 | 63 / 64 | 141 / 256 / 448 ms | 2,994 | 204 ms | 2.85 |
+| + fp16 vocoder, compiled (= `Serving.fast()`) | 19 / 24 | 30 / 32 | 53 / 56 | 105 / 172 / 292 ms | 4,590 | 256 ms | 2.54 |
+| `Serving.fast()`, final run | **18 / 19** | **29 / 30** | **52 / 53** | 100 / 168 / 281 ms | **4,772** | 257 ms | 2.54 |
+| `Serving.fast(pipeline=True)` | 18 / 19 | 27 / 34 | 40 / 59 | 99 / 172 / 292 ms | 4,592 | 220 ms | 2.46 |
+
+- **`pipeline`** runs the first round's DiT window and vocoder length group by length group. Each group's first
+  pieces are yielded as soon as they are ready. That lowers the median (40 ms at 256) and raises the maximum
+  (59 ms), so it is not the default.
+- **FIFO with the streaming DiT** (one request after another, the chunked fast path): 566 / 1,099 ms at N = 64 and
+  2.2 / 4.1 s at N = 256. Each request costs more GPU time (about 16 ms instead of 12.4), so its queue grows
+  faster than with whole sentences. Micro-batches of 32 give 52 / 92 ms at 64 and 287 / 516 ms at 256.
+- **Output check** (`--check 32`, final configuration against the chunked fast path, the same draws). All 32
+  requests have the same durations, and 31 have the same number of samples (one sentence moved by one frame). The
+  log-mel distance is 0.06 dB (median; max 0.15), against 0.01 dB (0.04) between the eager and the fast path.
+- **Compilation** happens once per process. The first batch compiles the DiT, the text pass and the vocoder, about
+  half a minute each. A batch of another size reuses them (dynamic shapes), and a batch of one row compiles once
+  more.
+
+**Where the time goes at N = 256**, with `Serving.fast()`. Host timestamps and CUDA events, first round, one run:
+
+| | host | GPU |
+|---|---|---|
+| text frontend (normalisation, sentence split), 4 groups | 1.2–20.4 ms (10 ms busy) | – |
+| text encoder + prosody predictor, 4 groups | 3.2–23.5 ms | 3.2–27.2 ms |
+| alignment, noise, assembly | 23.5–27.7 ms | 27.2–27.9 ms |
+| DiT first window (256 × 128 frames) | 28.3–32.1 ms | 28.3–45.4 ms |
+| first vocoder window (256 × 64 frames) | 32.3–33.5 ms | 45.4–49.9 ms |
+| first audio on the host | 50.6 ms | |
+
+Each group's frontend overlaps the GPU's work on the groups before it. From then on the GPU is busy: about 20 ms of
+text side, 17 ms of DiT and 4.5 ms of vocoder.
+
+**Each pass, before and after (N = 256):**
+
+| pass | before | after | how |
+|---|---|---|---|
+| per-request noise (prosody, DiT, style codes) | 4.9 ms of host time, 1,024 calls | 0.1 ms, 4 launches | counter-based Philox noise: one Triton kernel per stream (`drifting_tts/noise.py`), only the first window's frames |
+| text encoder + prosody predictor | 55.5 ms (47.2 ms GPU), one padded batch, fp32 | 25.9 ms (18.4 ms GPU) | 4 length buckets, fp16 autocast, `torch.compile` (its Triton kernels fuse norms, masks, activations, RoPE); durations rounded from the fp32 regressor |
+| token → frame expansion | 1.2 ms: a [B, N, T] 0/1 matrix and a batched matmul | 0.38 ms | one gather by the durations' cumulative sum; the same values bit for bit |
+| DiT first window (256 × 128 frames) | 52.8 ms, fp32 | 16.5 ms | fp16 autocast (26.5 ms), then `torch.compile` (fused RMSNorm / adaLN modulation / SwiGLU / QK-norm + RoPE) |
+| first vocoder window (256 × 64 frames) | 14.1 ms, fp32 | 4.5 ms | fp16 autocast with the inverse STFT in fp32 (6.8 ms), then `torch.compile` |
+| host waits | the DiT step held the host 17 ms | 3.9 ms | small index tensors copied through page-locked memory: `torch.tensor(list, device="cuda")` waits for the GPU's queue |
+
+- **Attention.** SDPA uses PyTorch's memory-efficient (CUTLASS) kernel in fp32 and in fp16. The boolean key mask
+  rules out the flash kernel. In the fp16 DiT window, attention takes about 1.5 ms of the 17 ms; the matrix
+  multiplies take most of the rest.
+- **Tried without a gain, so not kept:**
+  - a channels-last text pass with each convolution as one matrix multiply (20.8 → 22.4 ms GPU);
+  - CUDA graphs of the compiled passes (`reduce-overhead`) once the host waits were gone (the GPU is the bottleneck);
+  - `max-autotune` (−1 ms);
+  - frontend worker processes (−2 ms median, with occasional +8 ms outliers);
+  - TF32 for the text encoder (it moves a duration in 1 of 256 rows).
+- **Vocoder precision.** fp16 Vocos differs from fp32 by 0.015 dB of log-mel (median, 256 first windows; max
+  0.11 dB). The fp32 batched and single-request vocoders differ by 0.007 dB. The Freya-495 run above includes it.
+
+### Counter-based noise
+
+`Chunking(noise="philox")`. Each element of a request's noise is a function of the request's seed, the sentence
+index, the stream and the element's index.
+
+- **Generator:** Philox4x32-10, the generator of cuRAND and Triton. The key is the seed; the counter is
+  (element // 4, 0, stream, sentence).
+- **Normals and integers:** pairs of output words become normals by Box–Muller. The style codes are words mod 64.
+- **Layout:** the DiT's noise is frame-major, so a window's frames are drawn without the rest of the sentence.
+- **Same audio alone or in a batch.** A request sounds the same alone or in any batch, as tests/test_noise.py
+  checks, on the CUDA graphs too.
+- **Not the default draws.** The audio differs from the default `torch.Generator` draws of the same seed: it is
+  another sample, scored the same on Freya-495.
+- **Implementations:** the Triton kernel matches the PyTorch implementation (CPU, CI) to 2e-6.
+
 ## Memory
 
 `torch.cuda.max_memory_allocated()`. `nvidia-smi` shows more, because it also counts the CUDA context and the
@@ -250,12 +452,14 @@ later.
 - **Same-instant arrival.** It is the worst case for FIFO and the best case for batching. Requests that arrive over
   time need continuous batching (new requests join the next round), which is not implemented. Their latency would
   lie between the two.
-- **Sentence-level streaming.** The first piece waits for the acoustic model over the whole first sentence, so in a
-  batch TTFA grows with the longest first sentence. Paragraphs only need their first sentence for the first piece.
-- **Eager batched passes.** The batched passes run without CUDA graphs. At N = 1 that costs 13 ms against the fast
-  path's 7 ms; in large batches the computation dominates (about 1.1 ms per request).
-- **fp32 as shipped.** TF32 matmuls gain 20% in batches. Lower precision was not tried, and it would need a quality
-  check.
+- **Sentence-level streaming.** By default the first piece waits for the acoustic model over the whole first
+  sentence, so in a batch TTFA grows with the longest first sentence. `chunked=Chunking()` removes this
+  ([Streaming the acoustic model](#streaming-the-acoustic-model)).
+- **Batched passes without CUDA graphs.** At N = 1 the batched path costs 13 ms against the fast path's 7 ms, so a
+  lone request should take the fast path. `Serving.fast()` compiles the passes; compilation costs about half a
+  minute per pass on the first batch of a process.
+- **fp32 as shipped.** The fp16 options of `Serving` passed Freya-495 here (studio voice). The male and female
+  voices were not checked.
 - **One voice per batch.** `stream_batched` takes one voice. Mixing voices needs per-row speaker IDs and duration
   factors, which is not implemented.
 - **This mix only.** Throughput depends on it (5.2 s of audio per request). With v3.2's punctuation pauses
@@ -280,6 +484,28 @@ python scripts/bench_concurrency.py --release v3.1 --cuda-kernel --requests 1 64
     --strategy fifo --check 0 --out runs/lat_concurrency_v31_fifo.json
 ```
 
+Streaming the acoustic model:
+
+```bash
+C="--chunked --chunk-right 64 --chunk-left 64 --chunk-size 256 --crossfade 32"
+# one request, CUDA graphs (add --noise philox for the counter-based noise)
+python scripts/bench_ttfa.py --release v3.2 --mode fast $C --out runs/tp_latency/ttfa_chunked.json
+# N requests: the steps of the table (each adds options), then the final configuration with every strategy
+python scripts/bench_concurrency.py --release v3.2 --requests 64 128 256 --strategy batched --check 0 $C
+python scripts/bench_concurrency.py --release v3.2 --requests 64 128 256 --strategy batched --check 0 $C \
+    --noise philox --buckets 4 --dit-dtype fp16 --compile-dit
+python scripts/bench_concurrency.py --release v3.2 --requests 1 64 128 256 --strategy fifo batched microbatch \
+    --micro-batch 32 --check 32 $C --noise philox --fast-serving --out runs/tp_latency/concurrency_fast.json
+# quality: Freya-495 studio (NUM=0: all 495), single-request streaming and the batched serving path
+drifting-tts benchmark --model drifting_tts_v3.2.pt --vocoder vocos-v2 --prosody drift --prosody-durations regressor \
+    --pause punct --speaker studio --temperature 0.3 --cfg 2.0 --fast $C --out runs/tp_quality/chunk_r64
+drifting-tts benchmark ... --fast $C --noise philox --batch 256 --fast-serving --out runs/tp_quality/batch256_fast
+```
+
+`drifting-tts benchmark --batch N` synthesises the sentences N at a time through `stream_batched` (seed = sentence
+index, as without it). The seam measures come from comparing `WindowedMel` with whole-sentence generation from the
+same draws.
+
 `--texts` takes another text set (a HF dataset id, `.jsonl` or `.txt`). `--paragraph-every` and
 `--paragraph-sentences` change the mix. The JSON output records the environment, the GPU processes seen at the
 start, and each request's TTFA from the first timed run. In Python:
@@ -292,4 +518,15 @@ tts = Synthesizer.from_pretrained("v3.2", "cuda", fast=True)
 for pieces in stream_batched(tts, texts, speaker="studio", cfg_scale=2.0, temperature=0.3):
     for i, audio in pieces:   # request index, float32 CPU tensor at 24 kHz
         send(i, audio)
+
+# streaming the acoustic model too, with the measured serving options
+from drifting_tts.batched import Serving
+from drifting_tts.chunked import Chunking
+
+chunked = Chunking(noise="philox")  # R = 64, L = 64, 256-frame chunks, crossfade 32
+for pieces in stream_batched(tts, texts, speaker="studio", cfg_scale=2.0, temperature=0.3, chunked=chunked,
+                             serving=Serving.fast()):
+    ...
+for piece in tts.stream(text, speaker="studio", cfg_scale=2.0, temperature=0.3, chunked=chunked):  # one request
+    ...
 ```

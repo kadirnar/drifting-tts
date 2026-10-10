@@ -13,9 +13,10 @@ windows of the aligned condition and of that noise:
 * a window that reaches the sentence's end commits it all, so a sentence of at most ``head + right`` frames is one
   window: the whole-sentence generation, bit for bit.
 
-The DiT was trained on 256-frame crops (``drift.crop_frames``) with the condition cropped alike, so windows of up to
-256 frames are what it saw in training. With ``chunk`` equal to the streaming vocoder's chunk, every vocoder window
-(:func:`drifting_tts.batched.stream_windows`) ends where a DiT window's committed frames end.
+The DiT was trained on 256-frame crops (``drift.crop_frames``) with the condition cropped alike: windows of a few
+hundred frames (128 and 384 with the defaults) are closer to that than whole sentences of up to about 1,500 frames.
+With ``chunk`` equal to the streaming vocoder's chunk, DiT window ``k`` commits the frames vocoder window ``k``
+(:func:`drifting_tts.batched.stream_windows`) needs.
 """
 
 from __future__ import annotations
