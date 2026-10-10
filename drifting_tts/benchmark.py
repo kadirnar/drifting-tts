@@ -69,6 +69,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="--batch: the DiT's precision (autocast)")
     p.add_argument("--prosody-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
                    help="--batch: the prosody predictor network's precision (autocast)")
+    p.add_argument("--fast-serving", action="store_true",
+                   help="Serving.fast(): buckets, fp16 text encoder / prosody network / DiT / vocoder, all compiled")
     p.add_argument("--buckets", type=int, default=1, help="--batch: length buckets of the batched passes")
     p.add_argument("--compile-dit", action="store_true", help="--batch: torch.compile the batched DiT")
     p.add_argument("--text-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
@@ -77,11 +79,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="--batch: the batched vocoder's precision (autocast)")
     p.add_argument("--compile-text", action="store_true", help="--batch: torch.compile the text pass")
     p.add_argument("--min-bucket", type=int, default=64, help="--batch: rows per length bucket at least")
-    p.add_argument("--graphs", action="store_true", help="CUDA graphs of the compiled passes (reduce-overhead)")
     p.add_argument("--pipeline", action="store_true", help="first round group by group, each yielded when ready")
-    p.add_argument("--frontend-workers", type=int, default=0, help="processes for the first round's text frontend")
     p.add_argument("--compile-vocoder", action="store_true", help="torch.compile the batched vocoder")
-    p.add_argument("--autotune", action="store_true", help="compile the DiT with max-autotune")
     p.add_argument("--batch", type=int, default=0,
                    help="synthesise the sentences N at a time with drifting_tts.batched.stream_batched (the serving "
                         "path; one voice; seed = sentence index as without it; 0: one at a time)")
@@ -167,12 +166,13 @@ def run(args) -> None:
         serving = Serving(buckets=args.buckets, min_bucket=args.min_bucket, dit_dtype=args.dit_dtype,
                           prosody_dtype=args.prosody_dtype, compile=args.compile_dit, text_dtype=args.text_dtype,
                           compile_text=args.compile_text, vocoder_dtype=args.vocoder_dtype,
-                          graphs=args.graphs, pipeline=args.pipeline,
-                          frontend_workers=args.frontend_workers, compile_vocoder=args.compile_vocoder,
-                          autotune=args.autotune)
+                          compile_vocoder=args.compile_vocoder, pipeline=args.pipeline)
+        if args.fast_serving:
+            serving = Serving.fast(pipeline=args.pipeline)
     elif (args.dit_dtype, args.prosody_dtype, args.text_dtype, args.vocoder_dtype) != ("fp32",) * 4 \
-            or args.buckets != 1 or args.compile_dit or args.compile_text:
-        raise ValueError("--buckets, --*-dtype and --compile-* apply to --batch")
+            or args.buckets != 1 or args.compile_dit or args.compile_text or args.compile_vocoder \
+            or args.fast_serving or args.pipeline:
+        raise ValueError("--fast-serving, --buckets, --*-dtype, --compile-* and --pipeline apply to --batch")
 
     def generate(text: str, speaker: str, seed: int) -> tuple[torch.Tensor, dict]:
         if not (args.stream or args.fast or chunked):

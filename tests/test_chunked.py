@@ -191,3 +191,32 @@ def test_graphed_windows_match_eager_windows():
     assert len(wm.windows[0]) > 2
     torch.testing.assert_close(mels[0], mels[1], rtol=0, atol=1e-4)
     assert HOP_LENGTH == 256
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="half precision on a GPU")
+def test_half_precision_serving_stays_close(tmp_path):
+    """Serving's fp16 passes (no compile) on a tiny model: finite audio, as many pieces as fp32, a duration may round
+    to another frame (a random tiny model has durations near the rounding boundaries)."""
+    from drifting_tts.batched import Serving
+
+    synth = _synth(tmp_path, prosody=True)
+    synth.model.cuda()
+    synth.prosody.cuda()
+    synth.vocoder.model.cuda()
+    synth.device = synth.vocoder.device = "cuda"
+    texts = ["Merhaba! Bugün hava çok güzel.", "Bu bir deneme.", "Yapay zekâ modelleri her geçen gün daha hızlı."]
+    ch = Chunking(right=6, left=4, chunk=12, crossfade=2, noise="philox")
+    kw = dict(speaker=2, cfg_scale=1.5, temperature=0.5, pause=0.05, first=4, seeds=[1, 2, 3], chunked=ch)
+    out = {}
+    for name, sv in (("fp32", Serving()), ("fp16", Serving(buckets=2, min_bucket=1, dit_dtype="fp16",
+                                                            text_dtype="fp16", prosody_dtype="fp16",
+                                                            vocoder_dtype="fp16"))):
+        got = {i: [] for i in range(len(texts))}
+        for rnd in stream_batched(synth, texts, serving=sv, **kw):
+            for i, p in rnd:
+                got[i].append(p)
+        out[name] = got
+    for i in range(len(texts)):
+        a, b = torch.cat(out["fp32"][i]), torch.cat(out["fp16"][i])
+        assert len(out["fp32"][i]) == len(out["fp16"][i]) and torch.isfinite(b).all()
+        assert abs(a.numel() - b.numel()) <= 4 * HOP_LENGTH and b.abs().max() <= 1

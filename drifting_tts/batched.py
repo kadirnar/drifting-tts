@@ -8,13 +8,15 @@
   padding is zeroed before every convolution and left out of the inverse STFT); other vocoders run row by row.
 * :func:`stream_batched`: the streaming windows of :func:`drifting_tts.fast.stream_vocoder` for many requests,
   one batch per round: every request gets its first piece after the first round, then one more piece per round.
+  With ``chunked`` (:mod:`drifting_tts.chunked`) the DiT streams too: a round runs one DiT window per request.
+* :class:`Serving`: speed options of the batched passes (length buckets, half precision, ``torch.compile``); they
+  are off by default, and :meth:`Serving.fast` is the configuration measured in docs/LATENCY.md.
 
-The batched passes run eagerly (no CUDA graphs: the shapes change with every batch).
+The batched passes run without CUDA graphs (the shapes change with every batch).
 """
 
 from __future__ import annotations
 
-import atexit
 import logging
 import random
 import re
@@ -47,12 +49,7 @@ class Serving:
     ``vocoder_dtype``: the batched Vocos under autocast (``"fp16"``: log-mel distance 0.014 dB against fp32).
     ``compile`` / ``compile_text``: ``torch.compile`` the DiT / the text pass (dynamic shapes; compiled on the first
     batch, about half a minute each); float rounding changes, so a duration can round to another frame.
-    ``graphs`` (with them): CUDA graphs of the compiled passes (mode ``reduce-overhead``), the shapes padded to a few
-    sizes; it saves most of the host's time per pass.
-    ``compile_vocoder``: ``torch.compile`` the batched Vocos (float rounding only). ``autotune``: compile the DiT with
-    ``max-autotune`` (its matrix multiplies tuned for the GPU; minutes of compilation the first time).
-    ``frontend_workers``: processes that run the first round's text frontend (normalisation, sentence split) for
-    the length groups in parallel (0: in this process, group by group).
+    ``compile_vocoder``: ``torch.compile`` the batched Vocos (float rounding only).
     ``pipeline`` (with buckets): the first round's DiT window and vocoder run group by group too, and each group's
     first pieces are yielded as soon as they are ready (lower median, higher maximum first-audio time); else one
     acoustic batch follows the groups' text passes."""
@@ -65,11 +62,16 @@ class Serving:
     text_dtype: str | None = None
     compile_text: bool = False
     vocoder_dtype: str | None = None
-    graphs: bool = False
     pipeline: bool = False
-    frontend_workers: int = 0
     compile_vocoder: bool = False
-    autotune: bool = False
+
+    @classmethod
+    def fast(cls, **kw) -> Serving:
+        """The configuration of docs/LATENCY.md ("Streaming the acoustic model"), quality-checked on Freya-495 with
+        ``Chunking(noise="philox")``: four length buckets, fp16 text encoder, prosody network, DiT and vocoder, all
+        compiled. ``kw`` overrides fields."""
+        return cls(**{**dict(buckets=4, dit_dtype="fp16", text_dtype="fp16", prosody_dtype="fp16",
+                             vocoder_dtype="fp16", compile=True, compile_text=True, compile_vocoder=True), **kw})
 
 
 def length_groups(lengths: list[int], buckets: int, min_rows: int = 1) -> list[list[int]]:
@@ -149,17 +151,9 @@ def _encode(model, ids: list[list[int]], spk: int, length_scale: float, generato
     if not sv.compile_text:
         return base(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature),
                     float(length_scale), prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
-    fn = _compiled(model, "text_pass", base, sv.graphs)
-    if sv.graphs:  # a few shapes: rows to a multiple of 16 (one-token dummies), tokens to a multiple of 32
-        Bp, Np = _round_up(B, 16), _round_up(n, 32)
-        text, text_len, spk = _pad(text, (Bp, Np)), _pad(text_len, (Bp,), 1), _repeat_first(spk, Bp)
-        if z_tok is not None:
-            z_tok, z_glob = _pad(z_tok, (Bp, z_tok.shape[1], Np)), _pad(z_glob, (Bp, z_glob.shape[1]))
+    fn = _compiled(model, "text_pass", base)
     h, mu, x_mask, frames = fn(model, prosody, text, text_len, spk, z_tok, z_glob, float(prosody_temperature),
                                float(length_scale), prosody_durations == "regressor", sv.text_dtype, sv.prosody_dtype)
-    if sv.graphs:  # out of the graphs' memory, unpadded
-        h, mu, x_mask, frames = (h[:B, :, :n].clone(), mu[:B, :, :n].clone(), x_mask[:B, :, :n].clone(),
-                                 frames[:B, :n].clone())
     return h, mu, x_mask, frames
 
 
@@ -235,57 +229,27 @@ def prepare_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, tempe
     return _finish(model, groups, encoded, spk, cfg_scale, temperature, generators)
 
 
-def _round_up(n: int, k: int) -> int:
-    return -(-n // k) * k
-
-
-def _pad(x: Tensor, sizes: tuple[int, ...], value=0) -> Tensor:
-    """``x`` padded at the end of each dimension to ``sizes`` with ``value``."""
-    if tuple(x.shape) == tuple(sizes):
-        return x
-    out = torch.full(sizes, value, dtype=x.dtype, device=x.device)
-    out[tuple(slice(0, n) for n in x.shape)] = x
-    return out
-
-
-def _repeat_first(x: Tensor, rows: int) -> Tensor:
-    """``x`` with its first row repeated up to ``rows`` rows (no host synchronisation)."""
-    return x if x.shape[0] == rows else torch.cat([x, x[:1].expand(rows - x.shape[0], *x.shape[1:])])
-
-
-def _compiled(model, name: str, fn, graphs: bool = False, autotune: bool = False):
-    """``torch.compile(fn)`` with dynamic shapes, cached on ``model``; ``graphs``: mode ``reduce-overhead`` (CUDA
-    graphs, one per input shape: the callers pad the shapes to a few sizes); ``autotune``: ``max-autotune``."""
-    mode = ("max-autotune" if graphs else "max-autotune-no-cudagraphs") if autotune else \
-        ("reduce-overhead" if graphs else None)
-    attr = f"_compiled_{name}_{mode}"
+def _compiled(model, name: str, fn):
+    """``torch.compile(fn)`` with dynamic shapes, cached on ``model``."""
+    attr = f"_compiled_{name}"
     if getattr(model, attr, None) is None:
         logging.getLogger("torch.utils._sympy.interp").setLevel(logging.ERROR)  # harmless dynamic-shape noise
-        setattr(model, attr, torch.compile(fn, dynamic=True, mode=mode))
+        setattr(model, attr, torch.compile(fn, dynamic=True))
     return getattr(model, attr)
 
 
-def batched_generator(model, dtype: str | None = None, compile: bool = False, graphs: bool = False,
-                      autotune: bool = False):
+def batched_generator(model, dtype: str | None = None, compile: bool = False):
     """``generate(z, cond, spk, alpha, mask, labels)`` for a padded batch: the DiT's rollout with the valid-frame
     mask (the interface of :class:`~drifting_tts.chunked.WindowedMel`), under autocast in ``dtype`` and
-    ``torch.compile``-d (dynamic shapes, compiled once per model) if asked. ``graphs`` (with ``compile``): CUDA graphs
-    of the compiled DiT; the batch is padded to a multiple of 16 rows and 32 frames (masked), so that a few graphs
-    serve every batch."""
-    gen = _compiled(model, "generate", model.generate, graphs, autotune) if compile else model.generate
+    ``torch.compile``-d (dynamic shapes, compiled once per model) if asked."""
+    gen = _compiled(model, "generate", model.generate) if compile else model.generate
 
     def generate(z, cond, spk, alpha, mask, labels):
-        B, W = z.shape[0], z.shape[-1]
-        if compile and graphs:
-            Bp, Wp = _round_up(B, 16), _round_up(W, 32)
-            z, cond = _pad(z, (Bp, z.shape[1], Wp)), _pad(cond, (Bp, cond.shape[1], Wp))
-            spk, alpha = _repeat_first(spk, Bp), _pad(alpha, (Bp,), 1.0)
-            mask, labels = _pad(mask, (Bp, Wp), False), _pad(labels, (Bp, labels.shape[1]))
         with autocast(dtype, z.device.type):
             x = z
             for k in range(model.generator.num_steps):  # DriftingTTS.rollout
                 x = gen(x, cond, spk, alpha, mask=mask, noise_labels=labels, step=k)
-        return x[:B, :, :W].float().clone() if compile and graphs else x.float()
+        return x.float()
 
     return generate
 
@@ -303,7 +267,7 @@ def acoustic_batch(model, ids: list[list[int]], spk: int, cfg_scale: float, temp
     z, cond, spk, alpha, labels, y_len = prepare_batch(model, ids, spk, cfg_scale, temperature, length_scale,
                                                        generators, prosody, prosody_temperature, prosody_durations,
                                                        sv)
-    generate = batched_generator(model, sv.dit_dtype, sv.compile, sv.graphs, sv.autotune)
+    generate = batched_generator(model, sv.dit_dtype, sv.compile)
     return _dit_whole(generate, z, cond, spk, alpha, labels, y_len, sv), y_len
 
 
@@ -422,23 +386,6 @@ def stream_windows(t: int, first: int = 32, chunk: int = 256, context: int | Non
 
 
 _RAW_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
-_POOLS: dict = {}
-
-
-def frontend_pool(workers: int):
-    """A persistent pool of ``workers`` processes for :func:`drifting_tts.text.frontend` (spawned once; they import
-    only the text frontend)."""
-    if workers not in _POOLS:
-        import multiprocessing
-        from concurrent.futures import ProcessPoolExecutor
-
-        from .text import frontend
-
-        pool = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn"))
-        list(pool.map(frontend, [["Merhaba."]] * workers))  # start the processes now
-        atexit.register(pool.shutdown, wait=False, cancel_futures=True)
-        _POOLS[workers] = pool
-    return _POOLS[workers]
 
 
 class _WholeMels:
@@ -514,7 +461,7 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
             for t, s in zip(texts, seeds)]
     batches: list = []  # one per acoustic batch: _WholeMels or WindowedMel (normalised mels)
     sv = serving or Serving()
-    generate = batched_generator(synth.model, sv.dit_dtype, sv.compile, sv.graphs, sv.autotune)
+    generate = batched_generator(synth.model, sv.dit_dtype, sv.compile)
     head = first + (voc.context or 0)
 
     def keys(rows: list[int]):
@@ -581,19 +528,11 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
     est = [len(_RAW_SENTENCE_END.split(t.strip(), maxsplit=1)[0]) for t in texts]
     pending, rows, groups, encoded = None, [], [], []
-    first_groups = length_groups(est, sv.buckets, sv.min_bucket)
-    jobs = None
-    if sv.frontend_workers:  # every group's frontend at once, in other processes
-        from .text import frontend
-
-        pool = frontend_pool(sv.frontend_workers)
-        jobs = [pool.submit(frontend, [texts[i] for i in group]) for group in first_groups]
-    for j, group in enumerate(first_groups):
+    for group in length_groups(est, sv.buckets, sv.min_bucket):
         kept = []
-        done = jobs[j].result() if jobs else [split_sentences(normalize(reqs[i]["text"])) for i in group]
-        for i, sentences in zip(group, done):
-            reqs[i]["sentences"] = sentences
-            if sentences:
+        for i in group:
+            reqs[i]["sentences"] = split_sentences(normalize(reqs[i]["text"]))
+            if reqs[i]["sentences"]:
                 kept.append(i)
         if not kept:
             continue

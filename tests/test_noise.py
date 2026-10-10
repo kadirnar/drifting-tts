@@ -74,3 +74,37 @@ def test_a_request_sounds_the_same_alone_and_in_a_batch(tmp_path, prosody):
         for i, p in out:
             alone[i].append(p)
     torch.testing.assert_close(torch.cat(alone[0]), torch.cat(got[1]), rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
+def test_graphed_single_request_matches_the_batch_on_cuda(tmp_path):
+    """The single-request fast path (CUDA graphs) with counter-based noise against the batched path."""
+    from drifting_tts.synthesize import Synthesizer
+
+    from .test_batched import MODEL, NET, _models, _tiny_vocos
+
+    model, pred = _models()
+    torch.save({"ema": model.state_dict(), "config": {"data": {"root": str(tmp_path)}, "model": MODEL},
+                "num_speakers": 3, "stats": {"mean": -5.0, "std": 2.0, "backend": "bigvgan"}}, tmp_path / "tts.pt")
+    torch.save({"ema": pred.net.state_dict(), "stats": pred.stats.state_dict(), "net_cfg": NET, "cond_dim": 26,
+                "temperature": 0.5}, tmp_path / "prosody.pt")
+    tf32, torch.backends.cudnn.allow_tf32 = torch.backends.cudnn.allow_tf32, False
+    try:
+        synth = Synthesizer(tmp_path / "tts.pt", "cuda", vocoder="griffin-lim", fast=True,
+                            prosody=str(tmp_path / "prosody.pt"), prosody_durations="regressor")
+        voc = _tiny_vocos()
+        voc.model, voc.device = voc.model.cuda(), "cuda"
+        synth.vocoder, synth.vocoder_graphs = voc, None
+        texts = ["Merhaba! Bugün hava çok güzel.", "Yapay zekâ modelleri her geçen gün daha hızlı."]
+        ch = Chunking(right=6, left=4, chunk=12, crossfade=2, noise="philox")
+        kw = dict(speaker=2, cfg_scale=1.5, temperature=0.5, pause=0.05, first=4)
+        got = {i: [] for i in range(len(texts))}
+        for out in stream_batched(synth, texts, seeds=[5, 6], chunked=ch, **kw):
+            for i, p in out:
+                got[i].append(p)
+        for i, text in enumerate(texts):
+            ref = list(synth.stream(text, seed=5 + i, chunked=ch, **kw))
+            assert synth.acoustic is not None and [p.numel() for p in got[i]] == [p.numel() for p in ref]
+            torch.testing.assert_close(torch.cat(got[i]), torch.cat(ref), rtol=0, atol=1e-4)
+    finally:
+        torch.backends.cudnn.allow_tf32 = tf32
