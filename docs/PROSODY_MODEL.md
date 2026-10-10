@@ -309,7 +309,8 @@ pitch at 0.5.**
 ### Where the slips come from
 
 Freya-495 for each voice, the renditions reproduced exactly (same seeds and draws) to read the durations behind every
-word error (`scripts` in `runs/agents/rhythm`; the WERs below come from the same Whisper transcripts).
+word error (the analysis scripts are in `runs/agents/rhythm/scripts`, outside the repository; the WERs come from
+the same Whisper transcripts).
 
 - **Not the speaking rate.** The sampled renditions are as long as the pitch-only ones (total length 0.99 / 1.00 /
   1.04 of them for studio / male / female); both sets of per-voice factors come from the same kind of calibration on
@@ -348,8 +349,8 @@ word error (`scripts` in `runs/agents/rhythm`; the WERs below come from the same
 | female: recordings / sampled | 16.5% / 14.8% | 0.76 / 0.77 | 46% / 57% | 100% / 100% |
 | regressors (any voice) | ≤ 0.05% | 0.34–0.35 | 0% | 0–100% |
 
-  The female recordings start abruptly: the leading blank has one frame in all of them, and the first letter is cut
-  to ≤ 2 frames in 46%. The sampler reproduces that, and the generator renders it as a dropped or changed first
+  The female recordings start abruptly: the leading blank has at most two frames in all of them (one in most), and
+  the first letter is cut to ≤ 2 frames in 46%. The sampler reproduces that, and the generator renders it as a dropped or changed first
   sound: 26% of the female first words fail with sampled durations (pitch only: 13.5%; studio: 4–5%), and the words
   inside the sentence fail 3× as often as with the regressors (7.9% against 2.4%). The temperature hardly changes
   these distributions (female, T 0 / 0.3 / 0.5: 13.4 / 13.9 / 14.8% short letters), so lowering it does not fix
@@ -367,30 +368,49 @@ Inference-only remedies, Freya-495, one seed set, paired with the pitch-only rel
 | its own, T 0.5, leading blank ≥ 5 and first letter ≥ 4 frames | | | 9.72% | +5.73 [+4.53, +6.94] |
 | regressors for the letters, its own pauses at T 0.5 | 3.22% | +0.95 [+0.38, +1.54] | 5.40% | +1.41 [+0.69, +2.16] |
 | the studio voice's rhythm at its rate, T 0.5 | 3.48% | +1.20 [+0.57, +1.86] | 5.19% | +1.20 [+0.31, +2.10] |
-| the same, the first letter and leading blank from its regressor | 3.30% | +1.02 [+0.38, +1.68] | 4.81% | +0.82 [−0.08, +1.73] |
+| the same, its leading blank from its regressor | 3.30% | +1.02 [+0.38, +1.68] | 5.29% | +1.30 [+0.36, +2.24] |
+| the same, its leading blank and first letter from its regressor | | | 4.81% | +0.82 [−0.08, +1.73] |
 | **the studio voice's rhythm at its rate, T 0.3** | 2.76% | +0.49 [−0.08, +1.05] | 4.70% | +0.72 [−0.13, +1.49] |
+| the same, its leading blank and first letter from its regressor | 3.09% | +0.82 [+0.23, +1.43] | 4.55% | +0.56 [−0.26, +1.32] |
+| the same, also the sentence end (final punctuation and blank) | 2.86% | +0.59 [−0.03, +1.25] | 4.32% | +0.33 [−0.47, +1.16] |
 | regressors with a leading blank ≥ 5 frames (pitch only) | | | 3.94% | −0.05 [−0.60, +0.53] |
 
+Three seed sets (as for the studio voice below) for the remedy that works, borrowing the studio voice's rhythm at
+T 0.3:
+
+| voice | durations | WER [95% CI] | ΔWER vs v3.2 [95% CI] | UTMOSv2 | ΔUTMOSv2 [95% CI] |
+|---|---|---|---|---:|---|
+| male | v3.2 (regressors) | 2.52% [2.17, 2.88] | – | 2.895 | – |
+| male | studio rhythm, factor from his recordings' length (1.50) | 3.06% [2.71, 3.43] | +0.54 [+0.18, +0.91] | 2.831 | −0.064 [−0.078, −0.049] |
+| male | the same with his own sentence edges, factor from his regressors' length (1.46; the checkpoint) | 3.13% [2.75, 3.51] | +0.61 [+0.26, +0.97] | 2.843 | −0.052 [−0.066, −0.038] |
+| female | v3.2 (regressors) | 4.15% [3.72, 4.57] | – | 2.718 | – |
+| female | studio rhythm, factor from her recordings' length (1.33) | 4.92% [4.46, 5.39] | +0.77 [+0.26, +1.28] | 2.751 | +0.033 [+0.018, +0.048] |
+| female | the same with her own sentence edges | 4.41% [3.97, 4.84] | +0.26 [−0.22, +0.74] | 2.734 | +0.016 [+0.003, +0.031] |
+| female | own edges, factor from her regressors' length (1.30; the checkpoint) | 4.55% [4.13, 5.02] | +0.40 [−0.07, +0.87] | 2.767 | +0.049 [+0.034, +0.062] |
+
 - **Borrowing the studio voice's rhythm** (its sampler conditioned on speaker 722, scaled to the voice's length on
-  its training utterances; the pitch stays the voice's own) is the only remedy that roughly halves the cost, and
-  at T 0.3 it leaves +0.5 (male) and +0.7 pp (female). UTMOSv2 of the male voice drops with it (2.831 against
-  2.896): the factor that matches his recordings' length (1.50; their pauses are long) slows his articulation from
-  4.90 to 4.46 syllables/s on these sentences.
+  its training utterances; the pitch stays the voice's own) is the only remedy that removes most of the cost. It
+  leaves +0.5–0.6 pp for the male voice and +0.3–0.4 pp for the female voice (with her own sentence edges), above
+  the 0.2–0.3 pp the studio voice reaches. The male voice also loses UTMOSv2 (−0.05 to −0.06): the studio rhythm
+  stretched to his length slows his articulation (4.60 against 4.90 syllables/s on Freya with the checkpoint's
+  factor, 4.46 with the recordings' one).
+- **Sentence edges matter for the female voice.** Her recordings start abruptly; with the studio rhythm her
+  generator renders a full-length first consonant as an extra syllable (`geçen → ilçen`, `bahar → kulahar`; first
+  words fail in 18–19% of the sentences against 13.9% with the regressors). Taking her leading blank, first letter
+  and sentence end from her own regressor brings the cost from +0.77 to +0.26–0.40 pp. For the male voice it
+  changes nothing measurable. Floors alone (leading blank ≥ 5, first letter ≥ 4 frames) on her own sampled
+  durations recover only 1.6 of 7.3 pp, and a longer leading blank leaves the pitch-only voice unchanged (3.94%).
 - **The voices' own pauses also cost words** (regressor letters, own pauses: +0.95 / +1.41 pp), unlike the studio
-  voice's (+0.00 pp): their boundary tokens include the blank after a word's last letter, and their sampled values
-  are as irregular as their letters.
-- **Edges are not the fix.** A longer leading blank changes nothing for the pitch-only female voice (3.94% against
-  3.99%), and floors on the leading blank and first letter recover only 1.6 of the 7.3 pp of her sampled
-  durations. With the studio rhythm, her first words still fail more often (18–19% against 13.9%), because her
-  generator renders a full-length first consonant as an extra syllable (`geçen → ilçen`, `bahar → kulahar`).
-- **Retraining was not tried** (option 3 of the brief): even the best-modelled rhythm of the corpus, the studio
-  voice's at T 0.3, costs these two voices half a point, which points at how their generator renders varied
-  durations rather than at their duration model. A speaker-pooled duration sampler would sit between their own
-  rhythm and the studio's.
+  voice's (+0.00 pp): their tokens between words include the blank after a word's last letter, and their sampled
+  values are as irregular as their letters.
+- **Retraining was not tried** (a speaker-pooled duration model, a penalty on short letters): even the best-modelled
+  rhythm of the corpus, the studio voice's at T 0.3 with their own edges, costs these voices 0.4–0.6 pp, which
+  points at how their generator renders varied durations rather than at their duration model. A speaker-pooled
+  sampler would sit between their own rhythm and the studio's.
 
 So **sampled rhythm stays a studio-voice option**; for the male and female voices the demo keeps falling back to
-v3.2 (pitch only). The borrowed studio rhythm is available for them (`rhythm` below) if half a point of WER is
-acceptable after listening.
+v3.2 (pitch only). The borrowed studio rhythm is in the recommended checkpoint for them (`rhythm` below): the
+female voice is close (+0.40 pp [−0.07, +0.87]) and could be offered after listening; the male voice is not.
 
 ### Recommendation: letters at T 0.3, pauses and pitch at T 0.5
 
@@ -429,8 +449,10 @@ sentence by sentence, as in [RESULTS.md](RESULTS.md#v32-sampled-intonation-vocos
 The checkpoint `runs/rh_final/prosody_drift_v3.2_rhythm.pt` (local, not published) is the release's
 `prosody_drift_v3.2.pt` with this operating point stored: preferred duration temperature 0.3, the per-voice factors
 calibrated for it (studio 1.053, the release file's 1.0445 were calibrated with every duration at T 0.5), the male
-and female voices borrowing the studio rhythm (factors 1.499 / 1.332) and the edge silence of its sentences for
-`pause="punct"` (studio 0.199 s, male 0.293 s, female 0.154 s).
+and female voices borrowing the studio rhythm with their own sentence edges (factors 1.460 / 1.300, see below) and
+the edge silence of its sentences for `pause="punct"` (studio 0.199 s, male 0.220 s, female 0.108 s). Through
+`drifting-tts benchmark` (the package path, seed set 0) it gives studio WER 1.38%, CER 0.25%, UTMOSv2 3.032, as the
+exploratory runner (1.36% / 3.040).
 
 ### Usage
 
@@ -455,13 +477,16 @@ drifting-tts train-prosody --workdir runs/pm_drift --calibrate-only tts=... cach
   them) keep the prosody temperature of the call, like the pitch. The same unit noise runs as a second row of the
   sampler's batch (as on the phase-2 branch), so a seed still fixes the rendition and the cost is one more row.
 - **`rhythm`** (checkpoint key, `calibrate.rhythm`): voice → speaker whose durations it samples (all of them, its
-  pauses included, at the duration temperature); the voice keeps its own pitch, and its `duration_scales` entry is
-  calibrated for the borrowed rhythm.
+  pauses included, at the duration temperature). The voice keeps its own pitch and its own sentence edges (the
+  leading blank, the first letter and the final punctuation with its blank take its regressor durations:
+  `edge_tokens`), and its `duration_scales` entry brings the borrowed rhythm to the length of its own regressor
+  durations on its training utterances (the release's speaking rate; matching its recordings' length instead slows
+  the male voice's articulation, since his recordings have long pauses).
 - **`fast=True`** runs the second row inside the encoder's CUDA graph (one encoder pass per speaker, as the eager
   path). Against the eager path on 366 sentences (3 voices × 61 texts × 2 prosody temperatures), the frame counts
-  agree on 365 and the mels within 71 dB SNR; the one-row graph of the release with sampled durations agrees on 357
-  (that difference predates this change: the rounding of a few durations flips on float noise of the padded
-  buckets).
+  agree on 364 with the recommended checkpoint (one sentence, at both temperatures, is one frame longer) and the mels
+  within 72 dB SNR; the one-row graph of the release with sampled durations agrees on 357 (that predates this
+  change: the rounding of a few durations flips on float noise of the padded buckets).
 
 ## Word-level context (#40)
 

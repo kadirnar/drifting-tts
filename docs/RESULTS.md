@@ -56,8 +56,8 @@ audio, UTMOSv2 and DNSMOS P.835 on the full band). "Sampled durations" is the pr
   (`prosody_duration_temperature=0.3`) gives WER 1.40% against 1.36% for v3.2 over three seed sets (+0.04 pp
   [−0.15, +0.24]; sampled durations at T 0.5: +0.32 pp) with the pauses, speaking rate and intonation of the T 0.5
   setting (held-out studio texts: 2.37 pauses per utterance, F0 std 3.56) and UTMOSv2 3.032 (3.016). The male and
-  female voices stay +0.5 to +0.7 pp above v3.2 even with the studio voice's rhythm, so the demo keeps v3.2 for them
-  ([PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips)).
+  female voices stay +0.61 / +0.40 pp above v3.2 even with the studio voice's rhythm and their own sentence edges,
+  so the demo keeps v3.2 for them ([PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips)).
 
 **Freya-100** (the first 100 sentences, studio voice; the protocol of [EXPERIMENTS.md](EXPERIMENTS.md#protocols-and-judges)):
 
