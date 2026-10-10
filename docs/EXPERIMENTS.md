@@ -56,6 +56,7 @@ is the index and the place to start before planning new work.
 | latents | VoxCPM2 / DAC-VAE latent TTS (10k pilots) | speaks earlier than mels, but noisy with the released decoders | partly | [LATENTS.md](LATENTS.md#tts-pilots-17) |
 | latents | longer latent training (10k → 50k) | worse (WER 4.94% → 7.57%) | ❌ | [LATENTS.md](LATENTS.md#longer-training-and-the-released-model) |
 | latents | fine-tuning the VAE decoder on generated latents | **the fix for the noise**: DAC-VAE WER 9.55% → 1.32%, UTMOSv2 1.84 → 2.71 | ✅ on the Hub | [LATENTS.md](LATENTS.md#fine-tuning-the-dac-vae-decoder-on-generated-latents-32) |
+| acoustic model | SLM (WavLM) adversarial term on the acoustic model, fine-tuned from v3.1 against a control without it (#41) | no measurable gain at the tested strength (Freya-100 UTMOSv2 SLM − control −0.007 / +0.065 / −0.000 at 2k / 6k / 12k); real recordings as positives let the discriminator win on Vocos artefacts | opt-in (`slm.enabled`), not used | [TRAINING.md](TRAINING.md#ssl-adversarial-fine-tuning-experimental-41) |
 | prosody | temperature / CFG as prosody knobs | no effect on intonation or rhythm | – | [§5](#5-robotic-prosody-diagnosis-and-research) |
 | prosody | oracle prosody A/B: ground-truth token pitch / MAS durations into the frozen DiT | **the token pitch predictor is the bottleneck**: DTW F0 r 0.61 → 0.79 (copy-synthesis ceiling 0.83); predicted pitch is 26% flatter than its targets, durations 41% | – (diagnosis) | [PROSODY.md](PROSODY.md#oracle-prosody-ab-studio-voice) |
 | prosody | pitch-deviation gain ×1.2–1.6 | restores the F0 spread (×1.4: 3.78 vs 3.68 st in the recordings), not the contour (r 0.61 → 0.63); CER unchanged, UTMOSv2 2.67 → 2.72 | probe (`drifting-tts prosody`) | [PROSODY.md](PROSODY.md#inference-time-fixes) |
@@ -65,6 +66,7 @@ is the index and the place to start before planning new work.
 | prosody | sampled durations made safe: the letters' durations at prosody T 0.3, pauses and pitch at T 0.5 (inference only; a second row of the sampler's batch, also in the CUDA graphs) | studio Freya-495, 3 seed sets: WER 1.40% vs 1.36% for v3.2 (+0.04 pp; sampled at T 0.5: +0.32 pp), pauses / rate / F0 of the T 0.5 setting, UTMOSv2 +0.015; male / female: their own sampled rhythm reproduces irregular recordings, the studio voice's rhythm borrowed at T 0.3 with their own sentence edges still costs +0.61 / +0.40 pp | ✅ opt-in (`prosody_duration_temperature=0.3`), the demo's sampled rhythm (studio only) | [PROSODY_MODEL.md](PROSODY_MODEL.md#sampled-rhythm-without-the-slips) |
 | latency | the prosody predictor inside the acoustic model's CUDA graphs; graphs captured under `no_grad` | `fast=True` works with the predictor (v3.2 TTFA 5.8–7.4 ms on an idle RTX 5090, v3.1 + BigVGAN-v2-ft 12.3–13.8 ms); `fast=True` memory ~6 GB → 0.65 GB | ✅ | [§9](#9-release-v32) |
 | prosody | stochastic prosody predictor (drifting, 8 M) replacing the duration / pitch regressors, DiT frozen (#39) | studio F0 std 3.20 → 3.63 st (recordings 3.68); Freya-100 WER 1.10% → 0.99%, CER 0.22% → 0.22%, UTMOSv2 2.627 → 2.712 at T 0.5 | opt-in (`--prosody`), pending a listening test | [PROSODY_MODEL.md](PROSODY_MODEL.md) |
+| #42 | a community Turkish Pocket TTS (autoregressive 24-layer teacher over Mimi latents, 336 M) on Freya-100, and the Mimi codec gate | WER on par (1.54% vs 1.10%); UTMOSv2 2.96 vs 2.63, explained by its decoder (Mimi resynthesis 3.26 vs `vocos-ft` copy 2.74); pitch spread equal to v3.1's with our voice as prompt; phrase breaks; 8 kHz output; 14× slower on CPU. Mimi: transparent on the studio voice, +2 pp WER and SIM 0.84 on the base corpus | – (no training) | [POCKET_TTS_GATE.md](POCKET_TTS_GATE.md) |
 
 **Best systems on one protocol** (Freya-100):
 
@@ -76,8 +78,10 @@ is the index and the place to start before planning new work.
 | v3.1 (mels) | Revox (4.5 M, non-commercial) | 0.77% | 0.16% | 2.244 | 3.10 |
 | DAC-VAE latents | DAC-VAE decoder, fine-tuned | 1.32% | 0.30% | 2.710 | 3.26 |
 | VoxCPM2 latents | VoxCPM2 decoder, fine-tuned | 1.87% | 0.43% | 2.530 | 3.25 |
+| *pocket-tts-tr (external, autoregressive, studio-voice prompt)* | *Mimi* | *1.54%* | *0.32%* | *2.964* | *3.38* |
 
-v3.1 with BigVGAN-v2-ft remains the reference. The comparison Space plays all six systems from one click.
+v3.1 with BigVGAN-v2-ft remains the reference. The comparison Space plays all six systems from one click. The
+external pocket-tts-tr row is a community model with a 5 s voice prompt and 8 kHz output ([POCKET_TTS_GATE.md](POCKET_TTS_GATE.md)).
 
 ## 1. Acoustic model recipe (before v3.1)
 

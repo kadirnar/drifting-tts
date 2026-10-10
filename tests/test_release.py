@@ -265,3 +265,60 @@ def test_duration_temperature_and_rhythm_table_of_the_prosody_checkpoint(tmp_pat
     assert pitch_only._rhythm(2) is None and not pitch_only._duration_row()
     args = argparse.Namespace(release=None, model=None, prosody=None, pause=None, vocoder=None)
     assert "prosody_durations" in pipeline_args(args)
+
+
+def test_second_pitch_predictor_and_sentence_features_run_eagerly(tmp_path, monkeypatch):
+    """Phase 2 (#40) on set_prosody: a second predictor gives only the token pitch (the durations stay the first one's
+    draws), and what the CUDA graphs cannot run (sentence features, a second pitch predictor) falls back to eager
+    synthesis; a plain predictor is still captured."""
+    import drifting_tts.fast as fast
+    from drifting_tts.sentence_features import DIM
+    from drifting_tts.text import normalize, text_to_ids
+
+    torch.save(_prosody_ck(), tmp_path / "prosody.pt")
+    path = str(tmp_path / "prosody.pt")
+    synth = _synth(tmp_path, prosody=path)
+    assert synth.prosody_pitch is None
+    torch.manual_seed(2)
+    sent = ProsodyPredictor({**NET, "sent_dim": DIM, "ctx_pitch_only": True, "pitch_layers": 1}, cond_dim=26).eval()
+    two = synth.variant(prosody=path, prosody_pitch=sent)
+    fed, synthesize = [], synth.model.synthesize  # what the acoustic model is given (shared by the variant)
+
+    def spy(*a, **kw):
+        fed.append((kw["durations"], kw["pitch"]))
+        return synthesize(*a, **kw)
+
+    monkeypatch.setattr(synth.model, "synthesize", spy)
+    one = "merhaba dünya, nasılsın?"  # one sentence: the next one's draws would follow the second predictor's
+    synth.mels(one, speaker=2, seed=3)
+    two.mels(one, speaker=2, seed=3)
+    (d1, p1), (d2, p2) = fed
+    assert torch.equal(d2, d1) and not torch.equal(p2, p1)  # the first predictor's durations, another pitch
+    ids = torch.tensor([text_to_ids(normalize(one), normalized=True)])
+    n, spk, g = torch.tensor([ids.shape[1]]), torch.tensor([2]), torch.Generator().manual_seed(3)
+    two.prosody.predict(two.model, ids, n, spk, two.prosody_temperature, generator=g)
+    assert torch.equal(sent.predict(two.model, ids, n, spk, two.prosody_temperature, generator=g)[1], p2)  # drawn next
+    assert two.prosody is not sent and two.prosody_pitch is sent and synth.prosody_pitch is None
+    assert len(synth.variant(prosody=sent).mels(TEXT, speaker=2)) == 2  # sentence features, eagerly
+    with pytest.raises(ValueError, match="pitch predictor"):
+        synth.variant(prosody=None, prosody_pitch=sent)
+
+    built = []
+
+    class Graphs:  # stands in for the CUDA graphs on the CPU: records what would be captured
+        def __init__(self, model, prosody=None, **kw):
+            built.append(prosody)
+
+        def warmup(self):
+            pass
+
+    monkeypatch.setattr(fast, "GraphedAcoustic", Graphs)
+    synth.fast = True
+    synth.set_prosody(path)
+    assert isinstance(synth.acoustic, Graphs) and len(built) == 1
+    assert fast.graphable(synth.prosody) and not fast.graphable(sent)
+    for kw in ({"prosody": sent}, {"prosody": path, "pitch": sent}):
+        with pytest.warns(UserWarning, match="eagerly"):
+            synth.set_prosody(**kw)
+        assert synth.acoustic is None
+    assert len(built) == 1

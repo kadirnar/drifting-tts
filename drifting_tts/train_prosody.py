@@ -21,7 +21,15 @@ import torch.nn.functional as F
 
 from .config import load_config, save_config
 from .drift import key_weight, kyutai_drift_loss
-from .models.prosody_net import ProsodyPredictor, boundary_tokens, prosody_features, summary_features, word_index
+from .models.prosody_net import (
+    ProsodyPredictor,
+    boundary_tokens,
+    floor_letters,
+    prosody_features,
+    sentence_tokens,
+    summary_features,
+    word_index,
+)
 from .text import PAD_ID
 from .utils import EMA, count_params, lr_lambda, save_checkpoint, seed_everything
 
@@ -48,6 +56,8 @@ class ProsodyData:
     """The utterances of one or more splits of a prosody cache, as padded batches."""
 
     def __init__(self, cache: dict, splits: tuple[str, ...], speakers: list[int] | None = None):
+        self.sent = False  # batches carry the sentence features (set by train-prosody when the net uses them)
+        self.sent_boundary = False  # ... with the boundary channel (ProsodyNet ctx_boundaries)
         t = cache["tokens"]
         self.utts = [u for u in cache["utts"] if u["split"] in splits and (speakers is None or u["spk"] in speakers)]
         ids, dur, pitch, voiced = (t[k].numpy() for k in ("ids", "dur", "pitch", "voiced"))
@@ -70,7 +80,8 @@ class ProsodyData:
 
     def subset(self, idx) -> ProsodyData:
         out = object.__new__(ProsodyData)
-        out.utts, out.items = [self.utts[i] for i in idx], [self.items[i] for i in idx]
+        out.utts, out.items, out.sent = [self.utts[i] for i in idx], [self.items[i] for i in idx], self.sent
+        out.sent_boundary = self.sent_boundary
         return out
 
     def batch(self, idx: list[int], device) -> dict:
@@ -88,6 +99,8 @@ class ProsodyData:
             out["ids"][i, : len(it["ids"])] = torch.from_numpy(it["ids"])
         out["word"] = word_index(out["ids"])
         out["mask"] = torch.arange(N)[None] < out["len"][:, None]
+        if self.sent:
+            out["sent_tok"] = sentence_tokens(out["ids"], out["len"], self.sent_boundary)
         n_words = int(out["word"].max()) + 1
         pin = torch.cuda.is_available() and str(device).startswith("cuda")
         out = {k: (v.pin_memory() if pin else v).to(device, non_blocking=True) for k, v in out.items()}
@@ -122,7 +135,11 @@ def encode(tts, pred: ProsodyPredictor, b: dict) -> tuple[torch.Tensor, torch.Te
     """Frozen encoder -> condition ``[B, C, N]``, standardised regressor predictions ``[B, 2, N]``, mask."""
     h, _, logw, x_mask = tts.encoder(b["ids"], b["len"], b["spk"])
     word_tok = b.get("word_tok") if pred.net.word_dim else None
-    cond, base = ProsodyPredictor.condition(tts, h, x_mask, b["spk"], logw, pred.stats, word_tok)
+    if pred.net.word_dim and word_tok is None:  # a cache without word features: run the word encoder (as inference)
+        word_tok = b["word_tok"] = pred.word_tokens(b["ids"], b["len"])
+    if pred.net.sent_dim and "sent_tok" not in b:
+        b["sent_tok"] = pred.sent_tokens(b["ids"], b["len"])
+    cond, base = ProsodyPredictor.condition(tts, h, x_mask, b["spk"], logw, pred.stats, word_tok, b.get("sent_tok"))
     return cond, base, x_mask
 
 
@@ -204,11 +221,14 @@ def training_loss(pred: ProsodyPredictor, tts, b: dict, cfg, tau: torch.Tensor |
         l_v = (F.binary_cross_entropy_with_logits(logit, rep(vt), reduction="none") * rep(mask)).sum() / (
             rep(mask).sum())
         loss = l_main + l_tau + cfg.loss.voiced * l_v
+        yg = y_gen.view(B, G, 2, N)
+        mf = mask[:, None].float()
+        l_c = (((yg.mean(1) - y) ** 2) * mf).sum() / mf.sum() / 2  # the samples' centroid against the recording
+        if cfg.loss.get("centroid", 0.0):
+            loss = loss + cfg.loss.centroid * l_c
         with torch.no_grad():
-            yg = y_gen.view(B, G, 2, N)
-            mf = mask[:, None].float()
             metrics["spread"] = (yg.std(1) * mf).sum() / mf.sum() / 2
-            metrics["centroid_mse"] = (((yg.mean(1) - y) ** 2) * mf).sum() / mf.sum() / 2
+            metrics["centroid_mse"] = l_c.detach()
             metrics["tau"], metrics["tau_loss"] = tau.detach(), l_tau.detach()
             metrics["p_data"] = torch.stack(list(info.values())).mean()
             for k in ("tok", "utt"):
@@ -243,12 +263,14 @@ def training_loss(pred: ProsodyPredictor, tts, b: dict, cfg, tau: torch.Tensor |
 @torch.no_grad()
 def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: list[int], temperature: float,
                  device, batch_size: int = 50, apply_scales: bool = False, spread: float = 1.0,
-                 duration_temperature: float | None = None, rhythm: dict[int, int] | None = None) -> list[dict]:
+                 duration_temperature: float | None = None, rhythm: dict[int, int] | None = None,
+                 min_letter_frames: float = 0.0, rel_letter_floor: float = 0.0) -> list[dict]:
     """Per utterance: ``frames`` ``[K, n]`` (integer), ``pitch`` (token pitch as fed to the generator, 0 unvoiced),
     ``pcont`` (the continuous contour) and ``voiced``, for ``K`` seeds. ``pred=None``: the TTS model's own
     regressors (ceil of ``exp(logw)`` times its per-voice ``duration_scales``, as at inference).
     ``duration_temperature`` / ``rhythm`` (speaker -> the speaker whose durations it samples): as at inference
-    (``ProsodyPredictor.sample``)."""
+    (``ProsodyPredictor.sample``); ``min_letter_frames`` / ``rel_letter_floor``:
+    :func:`~drifting_tts.models.prosody_net.floor_letters` (relative to the regressors)."""
     out = [None] * len(data)
     if spread != 1.0:  # every utterance is sampled 16 times in one batch
         batch_size = max(1, batch_size // 16)
@@ -278,6 +300,9 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
                 if apply_scales:
                     sc = torch.tensor([pred.duration_scales.get(int(k), 1.0) for k in b["spk"]], device=device)[:, None]
                 fr, pitch = pred.frames_and_pitch(y, vlogit, x_mask, sc)
+                if min_letter_frames or rel_letter_floor:
+                    fr = floor_letters(fr, b["ids"], min_letter_frames, rel_letter_floor,
+                                       torch.exp(b["logw_det"]) * sc) * mask
                 _, pc = pred.stats.denorm(y)
                 res.append((fr, pitch[:, 0], pc, vlogit > 0))
         for j, i in enumerate(idx):
@@ -474,6 +499,9 @@ def run(args) -> None:
     seed_everything(tc.seed)
     device = "cuda" if torch.cuda.is_available() and not tc.get("cpu", False) else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
+    if device == "cuda" and tc.get("max_gpu_gb"):  # a shared GPU: the caching allocator stays under this budget
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(min(1.0, float(tc.max_gpu_gb) / total))
     tts = load_frozen_tts(cfg.tts, device)
     cache = torch.load(cfg.cache, map_location="cpu", weights_only=False)
     cal = cfg.get("calibrate", {})
@@ -499,7 +527,13 @@ def run(args) -> None:
         if "word_feats" not in cache:
             raise SystemExit(f"net.word_dim > 0 needs word features in {cfg.cache} (prosody-cache --word-model)")
         cfg.net.word_dim, cfg.net.word_model = int(cache["word_feats"].shape[1]), cache["word_model"]
+    if cfg.net.get("sent_dim", 0):
+        from .sentence_features import DIM
+
+        cfg.net.sent_dim = DIM + int(bool(cfg.net.get("ctx_boundaries", False)))
     pred = ProsodyPredictor(cfg.net.to_dict(), cond_dim).to(device)
+    train.sent = dev.sent = pred.net.sent_dim > 0
+    train.sent_boundary = dev.sent_boundary = pred.net.ctx_boundaries
     pred.flow_steps = int(cfg.get("flow", {}).get("steps", 8))
     set_stats(pred, train, device)
     print(f"ProsodyNet ({pred.kind}) {count_params(pred.net):.2f}M params; {len(train)} training utterances; "
@@ -538,11 +572,13 @@ def run(args) -> None:
             state.update(net=pred.net.state_dict(), opt=opt.state_dict(), sched=sched.state_dict())
         save_checkpoint(path, **state)
 
+    accum = int(tc.get("accum", 1))
     while step < tc.steps:
-        b = train.batch(next(stream), device)
-        loss, metrics = training_loss(pred, tts, b, cfg, tau)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        for _ in range(accum):  # gradient accumulation: accum x batch_size utterances per step
+            b = train.batch(next(stream), device)
+            loss, metrics = training_loss(pred, tts, b, cfg, tau)
+            (loss / accum).backward()
         gn = torch.nn.utils.clip_grad_norm_(pred.net.parameters(), tc.grad_clip)
         if tau is not None:
             torch.nn.utils.clip_grad_norm_([tau], tc.grad_clip)
@@ -560,8 +596,9 @@ def run(args) -> None:
             agg = {k: float(v) / tc.log_every for k, v in agg.items()}
             for k, v in agg.items():
                 writer.add_scalar(f"train/{k}", v, step)
+            mem = f", peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB" if device == "cuda" else ""
             print(f"step {step} " + " ".join(f"{k}={v:.4g}" for k, v in agg.items())
-                  + f" ({tc.log_every / (time.time() - t0):.2f} it/s)", flush=True)
+                  + f" ({tc.log_every / (time.time() - t0):.2f} it/s{mem})", flush=True)
             agg, t0 = {}, time.time()
         if len(dev) and (step % tc.eval_every == 0 or step == tc.steps):
             live = pred.net

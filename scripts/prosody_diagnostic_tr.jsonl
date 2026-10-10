@@ -1,0 +1,153 @@
+{"id": "000", "type": "stmt", "group": "pair00", "text": "Ali dün akşam yemek yaptı."}
+{"id": "001", "type": "ynq", "group": "pair00", "text": "Ali dün akşam yemek yaptı mı?"}
+{"id": "002", "type": "stmt", "group": "pair01", "text": "Annem bu sabah pazara gitti."}
+{"id": "003", "type": "ynq", "group": "pair01", "text": "Annem bu sabah pazara gitti mi?"}
+{"id": "004", "type": "stmt", "group": "pair02", "text": "Toplantı saat ikide başlayacak."}
+{"id": "005", "type": "ynq", "group": "pair02", "text": "Toplantı saat ikide başlayacak mı?"}
+{"id": "006", "type": "stmt", "group": "pair03", "text": "Kardeşin yeni bir araba almış."}
+{"id": "007", "type": "ynq", "group": "pair03", "text": "Kardeşin yeni bir araba almış mı?"}
+{"id": "008", "type": "stmt", "group": "pair04", "text": "Bu kitabı geçen hafta okudun."}
+{"id": "009", "type": "ynq", "group": "pair04", "text": "Bu kitabı geçen hafta okudun mu?"}
+{"id": "010", "type": "stmt", "group": "pair05", "text": "Otobüs durağa zamanında geldi."}
+{"id": "011", "type": "ynq", "group": "pair05", "text": "Otobüs durağa zamanında geldi mi?"}
+{"id": "012", "type": "stmt", "group": "pair06", "text": "Çocuklar bahçede top oynuyorlar."}
+{"id": "013", "type": "ynq", "group": "pair06", "text": "Çocuklar bahçede top oynuyorlar mı?"}
+{"id": "014", "type": "stmt", "group": "pair07", "text": "Yarın hava yağmurlu olacak."}
+{"id": "015", "type": "ynq", "group": "pair07", "text": "Yarın hava yağmurlu olacak mı?"}
+{"id": "016", "type": "stmt", "group": "pair08", "text": "Elif sınavdan yüksek not aldı."}
+{"id": "017", "type": "ynq", "group": "pair08", "text": "Elif sınavdan yüksek not aldı mı?"}
+{"id": "018", "type": "stmt", "group": "pair09", "text": "Kapıyı arkandan kilitledin."}
+{"id": "019", "type": "ynq", "group": "pair09", "text": "Kapıyı arkandan kilitledin mi?"}
+{"id": "020", "type": "stmt", "group": "pair10", "text": "Mehmet Bey ofise erken geldi."}
+{"id": "021", "type": "ynq", "group": "pair10", "text": "Mehmet Bey ofise erken geldi mi?"}
+{"id": "022", "type": "stmt", "group": "pair11", "text": "Siparişimiz bugün kargoya verildi."}
+{"id": "023", "type": "ynq", "group": "pair11", "text": "Siparişimiz bugün kargoya verildi mi?"}
+{"id": "024", "type": "stmt", "group": "pair12", "text": "Doktor ilaçları değiştirmek istedi."}
+{"id": "025", "type": "ynq", "group": "pair12", "text": "Doktor ilaçları değiştirmek istedi mi?"}
+{"id": "026", "type": "stmt", "group": "pair13", "text": "Komşular bu akşam bize gelecekler."}
+{"id": "027", "type": "ynq", "group": "pair13", "text": "Komşular bu akşam bize gelecekler mi?"}
+{"id": "028", "type": "stmt", "group": "pair14", "text": "Film beklediğimizden daha uzun sürdü."}
+{"id": "029", "type": "ynq", "group": "pair14", "text": "Film beklediğimizden daha uzun sürdü mü?"}
+{"id": "030", "type": "stmt", "group": "pair15", "text": "Babam arabayı tamirciye götürdü."}
+{"id": "031", "type": "ynq", "group": "pair15", "text": "Babam arabayı tamirciye götürdü mü?"}
+{"id": "032", "type": "stmt", "group": "pair16", "text": "Öğrenciler ödevlerini teslim ettiler."}
+{"id": "033", "type": "ynq", "group": "pair16", "text": "Öğrenciler ödevlerini teslim ettiler mi?"}
+{"id": "034", "type": "stmt", "group": "pair17", "text": "Bu yaz tatile deniz kenarına gideceğiz."}
+{"id": "035", "type": "ynq", "group": "pair17", "text": "Bu yaz tatile deniz kenarına gidecek miyiz?"}
+{"id": "036", "type": "stmt", "group": "pair18", "text": "Sen bu konuda haklısın."}
+{"id": "037", "type": "ynq", "group": "pair18", "text": "Sen bu konuda haklı mısın?"}
+{"id": "038", "type": "stmt", "group": "pair19", "text": "Restoran pazartesi günleri açık."}
+{"id": "039", "type": "ynq", "group": "pair19", "text": "Restoran pazartesi günleri açık mı?"}
+{"id": "040", "type": "stmt", "group": "series0", "text": "Ayşe dün sinemaya gitti."}
+{"id": "041", "type": "ynq_mid", "group": "series0", "text": "Ayşe mi dün sinemaya gitti?"}
+{"id": "042", "type": "ynq_mid", "group": "series0", "text": "Ayşe dün mü sinemaya gitti?"}
+{"id": "043", "type": "ynq_mid", "group": "series0", "text": "Ayşe dün sinemaya mı gitti?"}
+{"id": "044", "type": "ynq", "group": "series0", "text": "Ayşe dün sinemaya gitti mi?"}
+{"id": "045", "type": "stmt", "group": "series1", "text": "Murat bu kitabı kütüphaneden aldı."}
+{"id": "046", "type": "ynq_mid", "group": "series1", "text": "Murat mı bu kitabı kütüphaneden aldı?"}
+{"id": "047", "type": "ynq_mid", "group": "series1", "text": "Murat bu kitabı mı kütüphaneden aldı?"}
+{"id": "048", "type": "ynq_mid", "group": "series1", "text": "Murat bu kitabı kütüphaneden mi aldı?"}
+{"id": "049", "type": "ynq", "group": "series1", "text": "Murat bu kitabı kütüphaneden aldı mı?"}
+{"id": "050", "type": "stmt", "group": "series2", "text": "Kemal sabah işe otobüsle gitti."}
+{"id": "051", "type": "ynq_mid", "group": "series2", "text": "Kemal mi sabah işe otobüsle gitti?"}
+{"id": "052", "type": "ynq_mid", "group": "series2", "text": "Kemal sabah mı işe otobüsle gitti?"}
+{"id": "053", "type": "ynq_mid", "group": "series2", "text": "Kemal sabah işe otobüsle mi gitti?"}
+{"id": "054", "type": "ynq", "group": "series2", "text": "Kemal sabah işe otobüsle gitti mi?"}
+{"id": "055", "type": "stmt", "group": "series3", "text": "Zeynep annesine çiçek gönderdi."}
+{"id": "056", "type": "ynq_mid", "group": "series3", "text": "Zeynep mi annesine çiçek gönderdi?"}
+{"id": "057", "type": "ynq_mid", "group": "series3", "text": "Zeynep annesine mi çiçek gönderdi?"}
+{"id": "058", "type": "ynq_mid", "group": "series3", "text": "Zeynep annesine çiçek mi gönderdi?"}
+{"id": "059", "type": "ynq", "group": "series3", "text": "Zeynep annesine çiçek gönderdi mi?"}
+{"id": "060", "type": "stmt", "group": "series4", "text": "Çocuklar akşam parkta oynadı."}
+{"id": "061", "type": "ynq_mid", "group": "series4", "text": "Çocuklar mı akşam parkta oynadı?"}
+{"id": "062", "type": "ynq_mid", "group": "series4", "text": "Çocuklar akşam mı parkta oynadı?"}
+{"id": "063", "type": "ynq_mid", "group": "series4", "text": "Çocuklar akşam parkta mı oynadı?"}
+{"id": "064", "type": "ynq", "group": "series4", "text": "Çocuklar akşam parkta oynadı mı?"}
+{"id": "065", "type": "whq", "group": null, "text": "Ali dün akşam ne yaptı?"}
+{"id": "066", "type": "whq", "group": null, "text": "Toplantı saat kaçta başlıyor?"}
+{"id": "067", "type": "whq", "group": null, "text": "Bu kitabı neden bu kadar çok sevdin?"}
+{"id": "068", "type": "whq", "group": null, "text": "Tatile kiminle gitmeyi düşünüyorsun?"}
+{"id": "069", "type": "whq", "group": null, "text": "Annen bu sabah nereye gitti?"}
+{"id": "070", "type": "whq", "group": null, "text": "Bu güzel resmi kim yaptı?"}
+{"id": "071", "type": "whq", "group": null, "text": "Yeni evinize ne zaman taşınıyorsunuz?"}
+{"id": "072", "type": "whq", "group": null, "text": "İstasyona en kolay nasıl gidebilirim?"}
+{"id": "073", "type": "whq", "group": null, "text": "Pazardan kaç kilo elma aldın?"}
+{"id": "074", "type": "whq", "group": null, "text": "Hangi filmi izlemek istiyorsun?"}
+{"id": "075", "type": "whq", "group": null, "text": "Bu çantanın fiyatı ne kadar?"}
+{"id": "076", "type": "whq", "group": null, "text": "Neden bana daha önce haber vermedin?"}
+{"id": "077", "type": "whq", "group": null, "text": "Doktor sana hangi ilacı yazdı?"}
+{"id": "078", "type": "whq", "group": null, "text": "Kardeşin üniversitede hangi bölümü okuyor?"}
+{"id": "079", "type": "whq", "group": null, "text": "Sabahları kahvaltıda genellikle ne yersin?"}
+{"id": "080", "type": "whq", "group": null, "text": "Bu sorunu nasıl çözmeyi planlıyorsunuz?"}
+{"id": "081", "type": "whq", "group": null, "text": "Mektubu kime göndermek istiyorsun?"}
+{"id": "082", "type": "whq", "group": null, "text": "Bu yol bizi nereye çıkarıyor?"}
+{"id": "083", "type": "whq", "group": null, "text": "Kim bu kadar geç saatte kapıyı çalıyor?"}
+{"id": "084", "type": "whq", "group": null, "text": "Arabanı nereye park ettin?"}
+{"id": "085", "type": "tag", "group": null, "text": "Yarın sabah erkenden yola çıkacağız, değil mi?"}
+{"id": "086", "type": "tag", "group": null, "text": "Bu akşam yemeğe geliyorsun, değil mi?"}
+{"id": "087", "type": "tag", "group": null, "text": "Toplantı saat üçte başlıyor, değil mi?"}
+{"id": "088", "type": "tag", "group": null, "text": "Kapıyı kilitledin, değil mi?"}
+{"id": "089", "type": "tag", "group": null, "text": "Sen de bu filmi izledin, değil mi?"}
+{"id": "090", "type": "tag", "group": null, "text": "Hava bugün çok güzel, değil mi?"}
+{"id": "091", "type": "tag", "group": null, "text": "Ödevini çoktan bitirdin, değil mi?"}
+{"id": "092", "type": "tag", "group": null, "text": "Bu kitap senin, değil mi?"}
+{"id": "093", "type": "alt", "group": null, "text": "Çay mı istersin yoksa kahve mi?"}
+{"id": "094", "type": "alt", "group": null, "text": "Bu akşam evde mi kalalım yoksa dışarı mı çıkalım?"}
+{"id": "095", "type": "alt", "group": null, "text": "Otobüsle mi gideceksin yoksa trenle mi?"}
+{"id": "096", "type": "alt", "group": null, "text": "Bu elbise mavi mi yoksa yeşil mi?"}
+{"id": "097", "type": "alt", "group": null, "text": "Toplantı bugün mü yoksa yarın mı?"}
+{"id": "098", "type": "alt", "group": null, "text": "Kırmızı kalemi mi alayım yoksa siyahı mı?"}
+{"id": "099", "type": "alt", "group": null, "text": "Deniz kenarına mı gidelim yoksa dağa mı?"}
+{"id": "100", "type": "alt", "group": null, "text": "Sen mi arayacaksın yoksa ben mi arayayım?"}
+{"id": "101", "type": "excl", "group": null, "text": "Ne kadar güzel bir gün!"}
+{"id": "102", "type": "excl", "group": null, "text": "Hemen buraya gel!"}
+{"id": "103", "type": "excl", "group": null, "text": "Bu harika bir haber!"}
+{"id": "104", "type": "excl", "group": null, "text": "Aman dikkat et, yere düşeceksin!"}
+{"id": "105", "type": "excl", "group": null, "text": "Ne güzel bir manzara bu!"}
+{"id": "106", "type": "excl", "group": null, "text": "Lütfen kapıyı kapat!"}
+{"id": "107", "type": "excl", "group": null, "text": "Bravo, çok iyi iş çıkardın!"}
+{"id": "108", "type": "excl", "group": null, "text": "Eyvah, otobüsü kaçırdık!"}
+{"id": "109", "type": "excl", "group": null, "text": "Çabuk ol, geç kalıyoruz!"}
+{"id": "110", "type": "excl", "group": null, "text": "Bu yemek gerçekten çok lezzetli olmuş!"}
+{"id": "111", "type": "excl", "group": null, "text": "Sessiz olun, bebek uyuyor!"}
+{"id": "112", "type": "excl", "group": null, "text": "Yaşasın, tatil başladı!"}
+{"id": "113", "type": "excl", "group": null, "text": "Ne kadar da büyümüşsün!"}
+{"id": "114", "type": "excl", "group": null, "text": "Hadi, hep birlikte şarkı söyleyelim!"}
+{"id": "115", "type": "excl", "group": null, "text": "İnanılmaz, takımımız kazandı!"}
+{"id": "116", "type": "list", "group": null, "text": "Pazardan elma, armut, portakal ve muz aldık."}
+{"id": "117", "type": "list", "group": null, "text": "Bavuluma gömlek, pantolon, çorap ve bir kitap koydum."}
+{"id": "118", "type": "list", "group": null, "text": "Toplantıya Ahmet, Elif, Burak ve Selin katıldı."}
+{"id": "119", "type": "list", "group": null, "text": "Kahvaltıda peynir, zeytin, domates, salatalık ve yumurta vardı."}
+{"id": "120", "type": "list", "group": null, "text": "Bu dönem matematik, fizik, kimya ve biyoloji derslerini alacağım."}
+{"id": "121", "type": "list", "group": null, "text": "Haftaya pazartesi, çarşamba ve cuma günleri çalışacağım."}
+{"id": "122", "type": "list", "group": null, "text": "Bahçede güller, laleler, papatyalar ve menekşeler açmış."}
+{"id": "123", "type": "list", "group": null, "text": "Yolculuk sırasında Ankara, Konya, Antalya ve İzmir'e uğradık."}
+{"id": "124", "type": "list", "group": null, "text": "Mutfakta tencere, tava, tabak ve bardak eksikti."}
+{"id": "125", "type": "list", "group": null, "text": "Kırmızı, mavi, yeşil ve sarı kalemlerini masaya bıraktı."}
+{"id": "126", "type": "list", "group": null, "text": "Sabah kalktım, yüzümü yıkadım, kahvaltı yaptım ve evden çıktım."}
+{"id": "127", "type": "list", "group": null, "text": "Çocuklar koştular, güldüler, oynadılar ve sonunda yoruldular."}
+{"id": "128", "type": "long", "group": null, "text": "Geçen yaz ailemle birlikte gittiğimiz küçük sahil kasabasındaki eski balıkçı lokantasının sahibi bizi her akşam güler yüzle karşılıyordu."}
+{"id": "129", "type": "long", "group": null, "text": "Belediyenin geçen ay başlattığı yeni toplu taşıma projesi şehrin dış mahallelerinde yaşayan insanların merkeze ulaşımını önemli ölçüde kolaylaştırdı."}
+{"id": "130", "type": "long", "group": null, "text": "Üniversiteden mezun olduktan sonra uzun süre iş arayan kuzenim sonunda büyük bir yazılım şirketinde çalışmaya başladı."}
+{"id": "131", "type": "long", "group": null, "text": "Dün akşam televizyonda izlediğimiz belgesel kutup bölgelerindeki buzulların her yıl giderek daha hızlı eridiğini gösteriyordu."}
+{"id": "132", "type": "long", "group": null, "text": "Köyümüzün hemen yanındaki ormanda yaşayan yaşlı adam her sabah erkenden kalkıp kuşlara yem bırakırdı."}
+{"id": "133", "type": "long", "group": null, "text": "Annemin yıllar önce el yazısıyla tuttuğu tarif defteri mutfağın en üst rafındaki eski bir kutunun içinde duruyordu."}
+{"id": "134", "type": "long", "group": null, "text": "Şirketin yönetim kurulu önümüzdeki yıl için hazırlanan bütçe planını uzun bir toplantının ardından oy birliğiyle onayladı."}
+{"id": "135", "type": "long", "group": null, "text": "Kütüphanenin ikinci katındaki sessiz çalışma salonu sınav dönemlerinde sabahın erken saatlerinden itibaren tamamen doluyor."}
+{"id": "136", "type": "long", "group": null, "text": "Babamın gençliğinde çalıştığı eski matbaanın binası bugün şehrin en çok ziyaret edilen sanat galerilerinden birine dönüştürülmüş."}
+{"id": "137", "type": "long", "group": null, "text": "Bu sabah işe giderken trafikte uzun süre bekleyen sürücülerin sabırsızlıkla korna çaldığını duydum."}
+{"id": "138", "type": "long", "group": null, "text": "Okulun bahçesine geçen bahar öğrencilerin diktiği küçük fidanlar şimdiden boylarını aşmaya başladı."}
+{"id": "139", "type": "long", "group": null, "text": "Yarın sabah yapılacak olan önemli sınav için gece geç saatlere kadar çalışan öğrenciler oldukça yorgun görünüyordu."}
+{"id": "140", "type": "long", "group": null, "text": "Dedemin köydeki evinin arkasında bulunan geniş elma bahçesi her sonbaharda bütün aileyi bir araya getirirdi."}
+{"id": "141", "type": "long", "group": null, "text": "Hafta sonu düzenlenen uluslararası müzik festivaline dünyanın dört bir yanından binlerce kişi katıldı."}
+{"id": "142", "type": "long", "group": null, "text": "Yeni açılan bilim müzesinde çocukların dokunarak öğrenebileceği pek çok etkileşimli deney düzeneği bulunuyor."}
+{"id": "143", "type": "focus", "group": null, "text": "Kitabı Ali okudu, Ayşe değil."}
+{"id": "144", "type": "focus", "group": null, "text": "Bu işi ben yapacağım."}
+{"id": "145", "type": "focus", "group": null, "text": "Ali kitabı dün okudu."}
+{"id": "146", "type": "focus", "group": null, "text": "Dün kitabı Ali okudu."}
+{"id": "147", "type": "focus", "group": null, "text": "Ben de sizinle gelmek istiyorum."}
+{"id": "148", "type": "focus", "group": null, "text": "Sadece Elif toplantıya geç kaldı."}
+{"id": "149", "type": "focus", "group": null, "text": "Ancak yarın cevap verebilirim."}
+{"id": "150", "type": "focus", "group": null, "text": "Asıl sorun paranın yetmemesi."}
+{"id": "151", "type": "focus", "group": null, "text": "Bu kararı müdür değil yönetim kurulu verdi."}
+{"id": "152", "type": "focus", "group": null, "text": "Pastayı annem değil ablam yaptı."}

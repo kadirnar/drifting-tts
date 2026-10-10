@@ -14,6 +14,10 @@ net:
   noise_glob: 32         # utterance-level noise vector (drift)
   out_init: 0.1          # output layer scale at init: starts close to the regressors' predictions
   word_dim: 0            # > 0: contextual word features from the cache (prosody-cache --word-model; set from it)
+  sent_dim: 0            # > 0: sentence-type / position features (drifting_tts.sentence_features; set to its DIM)
+  ctx_pitch_only: false  # true: word / sentence features feed only a pitch branch (pitch_layers on top of the
+  pitch_layers: 2        #   trunk), so the sampled durations do not depend on them
+  ctx_boundaries: false  # with ctx_pitch_only: that branch also predicts the durations between words (phrase breaks)
 
 drift:
   gen_per_cond: 16       # G samples per utterance; the recording's prosody is the one positive
@@ -24,6 +28,7 @@ drift:
 
 loss:
   voiced: 0.1            # voicing BCE (unvoiced tokens get pitch 0, as in training the generator)
+  centroid: 0.0          # drift: MSE of the G samples' mean against the recording (anchors the conditional mean)
 
 flow:
   steps: 8               # Euler steps at inference (kind flow)
@@ -36,6 +41,8 @@ train:
   seed: 0
   steps: 20000
   batch_size: 16
+  accum: 1               # gradient accumulation (utterances per step: accum x batch_size)
+  max_gpu_gb: 0          # > 0: cap this process's GPU memory (shared GPU; an over-budget step fails instead)
   lr: 0.0003
   weight_decay: 0.0
   warmup: 500

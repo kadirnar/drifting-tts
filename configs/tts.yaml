@@ -64,6 +64,29 @@ drift:
   detach_cond: false
   reduce: mean             # average the drift loss over feature maps
 
+slm:                       # SSL adversary for fine-tuning (drifting_tts/slm.py, StyleTTS 2's WavLM discriminator)
+  enabled: false
+  weight: 1.0              # LSGAN generator term
+  fm_weight: 0.0           # L1 between the WavLM hidden states of generated and real segments
+  crops_per_cond: 1        # generated crops per condition that are vocoded and judged
+  alpha: null              # null: a random subset of the G drift samples (their sampled CFG scales); a number:
+                           # crops_per_cond extra samples per condition at this CFG scale, in the same generator call
+  temperature: 1.0         # noise temperature of those extra samples
+  real: audio              # audio: the recorded segment of each crop (prepare --save-audio); vocoded: the real mel
+                           # crop through the same vocoder (judges the mels only, not the vocoder's artefacts)
+  vocoder: vocos-ft        # frozen, differentiable: a Vocos on BigVGAN mels (registry name or checkpoint)
+  wavlm: microsoft/wavlm-base-plus   # frozen; all 13 hidden states go to the discriminator
+  trim_frames: 16          # frames dropped at both crop ends before WavLM (the vocoder's crop-edge artefacts)
+  chunk: 8                 # crops per WavLM pass when computing the generator gradient (bounds memory)
+  grad_clip: null          # max norm of the weighted generator gradient w.r.t. the judged crops (null: none)
+  disc_channels: 64        # StyleTTS 2's initial_channel
+  disc_lr: 1.0e-4
+  disc_betas: [0.0, 0.99]  # StyleTTS 2
+  disc_weight_decay: 1.0e-4
+  disc_grad_clip: 10.0
+  disc_warmup: 1000        # steps in which only the discriminator trains
+  dtype: bf16              # autocast of WavLM and the discriminator (fp32: none); the vocoder runs in fp32
+
 loss:
   drift: 1.0
   prior: 1.0

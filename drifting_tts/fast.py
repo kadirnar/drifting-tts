@@ -68,8 +68,10 @@ def _round_up(n: int, k: int) -> int:
 
 def graphable(prosody, spread: float = 1.0) -> bool:
     """Whether :class:`GraphedAcoustic` can run a prosody predictor: one network pass (``drift`` / ``mse``), no
-    word features (BERT runs on the host), no output-space spread (a batch of samples)."""
-    return prosody is None or (prosody.kind in ("drift", "mse") and not prosody.net.word_dim and spread == 1.0)
+    word or sentence features (BERT and the sentence rules run on the host), no output-space spread (a batch of
+    samples)."""
+    return prosody is None or (prosody.kind in ("drift", "mse") and not prosody.net.word_dim
+                               and not prosody.net.sent_dim and spread == 1.0)
 
 
 class GraphedAcoustic:
@@ -83,7 +85,8 @@ class GraphedAcoustic:
     def __init__(self, model, token_bucket: int = 32, frame_bucket: int = 64, compile: bool = False,
                  tf32: bool = False, prosody=None, prosody_durations: str = "sampled", duration_row: bool = False):
         if not graphable(prosody):
-            raise ValueError("this prosody predictor cannot run in a CUDA graph (flow matching, word features)")
+            raise ValueError("this prosody predictor cannot run in a CUDA graph (flow matching, word or sentence "
+                             "features)")
         self.prosody, self.prosody_durations = prosody, prosody_durations
         self.duration_row = bool(duration_row and prosody is not None and prosody_durations == "sampled")
         self.model, self.token_bucket, self.frame_bucket, self.tf32 = model, token_bucket, frame_bucket, tf32
