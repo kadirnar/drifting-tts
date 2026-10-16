@@ -36,6 +36,8 @@ eval = ["faster-whisper", "transformers", "safetensors",
 bigvgan = ["librosa", "scipy", "matplotlib", "nnAudio"]   # BigVGAN-v2 backend (its code imports these; nnAudio: CQT-D)
 # data scoring (`drifting-tts score`): Whisper large-v3, DNSMOS (Microsoft's ONNX models run in torch), ECAPA
 score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", "librosa", "speechbrain>=1.0"]
+# speech restoration (`drifting-tts restore-audio`, #71): Sidon's TorchScript networks and w2v-BERT 2.0's filterbanks
+restore = ["transformers", "huggingface_hub"]
 # audio-VAE latent spaces (`drifting_tts.latents`): the model code is vendored (upstream packages pin protobuf or pull
 # in a whole TTS stack), so only the Hub client is needed to fetch facebook/dacvae-watermarked, openbmb/VoxCPM2 / 1.5
 dacvae = ["huggingface_hub"]
