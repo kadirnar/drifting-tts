@@ -114,7 +114,8 @@ with gr.Blocks(title="Drifting TTS: yeni sesler (test)") as demo:
                                info="Yeni seslerin hangi kayıtlarından öğrenildiği", visible=bool(MODELS))
             extend = gr.Checkbox(value=True, label="Bant genişletme (16 kHz sesler için)")
             durations = gr.Radio(list(DURATIONS) or ["-"], value=next(iter(DURATIONS), "-"), label="Duraklamalar",
-                                 info="Yeni: virgül ve kelime aralarında kayıtlardaki kadar durur",
+                                 info="Yeni: virgül ve kelime aralarında kayıtlardaki kadar durur"
+                                 + (" (onarılmış kayıtlarla eğitilen model hep yenileri kullanır)" if MODELS else ""),
                                  visible=bool(DURATIONS))
             with gr.Accordion("Ayarlar", open=False):
                 temperature = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Gürültü sıcaklığı",
