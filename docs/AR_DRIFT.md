@@ -210,8 +210,8 @@ durations, Vocos v2):
   errors on. The worst voice drops from +17.7 to +12.2 dB. UTMOSv2 and WER do not move at 5k steps.
 - **Longer does not help.** Continued to 20k steps, C reaches +6.0 dB at 10k and +6.5 dB at 20k, with UTMOSv2 2.246 /
   2.247 and WER 4.10% / 4.26%: it levels off 2-3 dB below the control, and naturalness does not follow. No new voices
-  model was deployed. The recordings' own noise (DNSMOS OVRL ~3.0) is the likelier source, which is what #71 (speech
-  restoration of the six voices' recordings) is about.
+  model was deployed. The recordings' own noise (DNSMOS OVRL ~3.0) is the likelier source: restoring the
+  recordings (#71, [below](#the-podcast-voices-recordings-restored-71)) lifts UTMOSv2 by +0.35 to +0.66.
 
 ## Durations re-fitted to the mean
 
@@ -261,6 +261,47 @@ UTMOSv2 2.258 -> **2.305**, WER 4.39% -> **4.21%**, CER 1.43% -> **1.30%**.
   predictors (`durations_ardrift.pt`, `durations_tr.pt`, 2.2 MB each); `scripts/deploy_test_space.sh` takes them
   through `ARDRIFT_DURATIONS=` and `DURATIONS=`.
 
+## The podcast voices' recordings restored (#71)
+
+The six podcast voices are capped by their recordings: 16 kHz, DNSMOS OVRL ~3.0, and a murmur in the pauses that the
+model carries on (#73, above). `drifting-tts restore-audio` (`drifting_tts/restore.py`) restores them with Sidon
+([sarulab-speech/sidon-v0.1](https://huggingface.co/sarulab-speech/sidon-v0.1), MIT). Sidon predicts clean w2v-BERT
+2.0 features from degraded speech and decodes them at 48 kHz; it was trained on FLEURS-R, Turkish among its 102
+languages. Every clip of the voices' shards is restored (FLAC, 24 kHz); the rest of the pipeline is unchanged:
+`prepare`, `score`, the re-cut at the words, the merge in place of the original voices (speaker IDs 723-728 kept),
+10k steps from the voices model (from its learned temperature, 0.0537), then `train-durations`.
+
+**The recordings.** A pilot of 200 clips per voice: UTMOSv2 2.11-2.95 -> 2.92-3.16, DNSMOS OVRL -> ~3.4, Whisper CER
+the same or lower, each restored clip to its original (WavLM-ECAPA) median 0.87-0.94. The whole corpus (~126 h, 44,900
+clips) took ~45 min on an RTX 5090: DNSMOS OVRL 2.95-3.30 -> 3.36-3.46 per voice, CER the same or lower. The
+fine-tune's filters (DNSMOS OVRL >= 3 among them) now keep 17.1-19.1 h per voice instead of 9.5-18.1 h.
+
+**Results** (Freya-100, T 0.5, no guidance, both models with re-fitted durations; SIM: WavLM-ECAPA to the centroid of
+50 original recordings of the voice; "higher on": sentences whose UTMOSv2 rose):
+
+| voice | UTMOSv2 | higher on | WER | CER | SIM |
+|---|---|---|---|---|---|
+| new 1 (723) | 2.210 -> **2.731** | 92 / 100 | 2.41% -> 1.21% | 0.69% -> 0.29% | 0.682 -> 0.736 |
+| new 2 (724) | 2.229 -> **2.686** | 88 / 100 | 3.18% -> 1.76% | 0.90% -> 0.37% | 0.726 -> 0.739 |
+| new 3 (725) | 2.150 -> **2.807** | 99 / 100 | 4.06% -> 0.88% | 0.98% -> 0.22% | 0.691 -> 0.704 |
+| new 4 (726) | 2.268 -> **2.706** | 91 / 100 | 3.07% -> 2.41% | 0.69% -> 0.48% | 0.690 -> 0.712 |
+| new 5 (727) | 2.534 -> **2.883** | 80 / 100 | 3.51% -> 2.20% | 0.94% -> 0.48% | 0.721 -> 0.759 |
+| new 6 (728) | 2.248 -> **2.726** | 92 / 100 | 1.76% -> 2.09% | 0.37% -> 0.48% | 0.792 -> 0.811 |
+| studio (722) | 2.973 -> 2.969 | 47 / 100 | 0.44% -> 0.33% | 0.11% -> 0.10% | – |
+
+- **UTMOSv2 +0.35 to +0.66 on every voice** (mean 2.27 -> 2.76; Wilcoxon p < 1e-11 for each), DNSMOS OVRL 3.12 ->
+  3.31. #71's bar was +0.3.
+- **Fewer reading errors:** CER 0.76% -> 0.39% on average, lower on five voices. New 6 goes from 23 to 30 character
+  errors (8 sentences better, 10 worse: not significant).
+- **The voices stay themselves.** Similarity to the original recordings rises on all six (0.717 -> 0.743), to the
+  restored ones more (0.691 -> 0.768): restoration changes the channel, not the speaker.
+- **Not the extra steps.** #73's control (5k more steps on the original recordings) left UTMOSv2 at 2.256 (2.258).
+  Part of the gain is more data: the filters keep 7-9 h more for new 1-3, 0.5-4 h more for new 4-6.
+- **No bandwidth extension needed:** the restored voices are full band.
+- **Where:** a private Space of its own (the test Space is full) plays both models side by side:
+  `scripts/deploy_restored_space.sh` stages `space_test/voices_app.py`, which offers `ardrift_voices_restored.pt`
+  next to the model trained on the original recordings.
+
 ## Commands
 
 ```bash
@@ -282,6 +323,10 @@ scripts/deploy_test_space.sh <private space> <exported ARDrift> <exported voices
 
 # durations re-fitted to the mean; the sentence's edges keep the log loss (the default --edges log)
 drifting-tts train-durations --model runs/ar_ft/model_ema.pt --out runs/ar_ft/durations.pt --data data/tr12_eleven_podfa
+
+# recordings restored with Sidon (#71; pip install -e .[restore]): shards rewritten, then prepare / score / re-cut as above
+drifting-tts restore-audio --parquet-glob 'raw/voice1/data/*.parquet' --out restored/voice1/data
+scripts/deploy_restored_space.sh <private space> <voices model> <restored voices model> runs/bwe/bwe.pt voices.json
 ```
 
 ```python
