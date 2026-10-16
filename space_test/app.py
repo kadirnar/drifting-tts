@@ -45,8 +45,9 @@ guidance yok. v3.2: Vocos v2, sıcaklık 0.3, α 2. WER / UTMOSv2:
 with gr.Blocks(title="Drifting TTS: özel test") as demo:
     gr.Markdown(
         "# Drifting TTS: özel test\n"
-        "Test edilen bütün modeller tek yerde. **Yeni sesler:** ARDrift'in altı yeni sesle eğitilmiş hali. "
-        "**ARDrift ve v3.2:** kendi otoregresif modelimiz ARDrift, herkese açık demodaki v3.2 ve v3.1 ile yan yana. "
+        "Test edilen bütün modeller tek yerde. **Yeni sesler:** ARDrift'in altı yeni sesle eğitilmiş hali"
+        + (", kayıtları onarılarak eğitilen yeni modeliyle yan yana. " if voices_app.MODELS else ". ")
+        + "**ARDrift ve v3.2:** kendi otoregresif modelimiz ARDrift, herkese açık demodaki v3.2 ve v3.1 ile yan yana. "
         + ("**English:** ARDrift'in 10.000 saatlik İngilizce veriyle eğitilmiş hali. " if ENGLISH else "")
         + "**Sonuçlar:** ölçümler."
     )

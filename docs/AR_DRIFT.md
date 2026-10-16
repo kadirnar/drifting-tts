@@ -298,9 +298,10 @@ fine-tune's filters (DNSMOS OVRL >= 3 among them) now keep 17.1-19.1 h per voice
 - **Not the extra steps.** #73's control (5k more steps on the original recordings) left UTMOSv2 at 2.256 (2.258).
   Part of the gain is more data: the filters keep 7-9 h more for new 1-3, 0.5-4 h more for new 4-6.
 - **No bandwidth extension needed:** the restored voices are full band.
-- **Where:** a private Space of its own (the test Space is full) plays both models side by side:
-  `scripts/deploy_restored_space.sh` stages `space_test/voices_app.py`, which offers `ardrift_voices_restored.pt`
-  next to the model trained on the original recordings.
+- **Where:** the voices tab of the private test Space plays both models side by side (`space_test/voices_app.py`
+  offers `ardrift_voices_restored.pt` next to the model trained on the original recordings;
+  `RESTORED=<checkpoint> scripts/deploy_test_space.sh ...`, both voices models in fp16 to stay under the Space's 1 GB).
+  `scripts/deploy_restored_space.sh` deploys the same tab as a private Space of its own.
 
 ## Commands
 
