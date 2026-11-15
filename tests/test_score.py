@@ -34,6 +34,22 @@ def test_error_rates(monkeypatch):
     cer, wer = score.error_rates("merhaba dünya", "merhaba dunya")
     assert cer == pytest.approx(1 / 13) and wer == pytest.approx(1 / 2)
     assert score.error_rates("merhaba dünya", "") == (1.0, 1.0)
+
+
+def test_error_rates_and_whisper_follow_the_dataset_language(tmp_path, monkeypatch):
+    """#86: an English dataset is transcribed in English and both texts go through the English normaliser."""
+    assert score.error_rates("It's 7:45.", "it's seven forty five", "en") == (0.0, 0.0)
+    assert score.error_rates("It's 7:45.", "it's seven forty five")[1] > 0  # the Turkish frontend reads it otherwise
+    assert score.dataset_language(tmp_path) == "tr"  # no stats.json: Turkish, as before
+    (tmp_path / "stats.json").write_text(json.dumps({"language": "en"}))
+    assert score.dataset_language(tmp_path) == "en"
+    asr = score.AsrScorer.__new__(score.AsrScorer)
+    assert asr.language == "tr"
+    asr.language = "en"
+    monkeypatch.setattr(asr, "transcribe", lambda wavs: ["It's 7:45."], raising=False)
+    index = [{"norm_text": "it's seven forty five."}]
+    (i, rec), = asr([(0, None, torch.zeros(16_000))], index)
+    assert rec == {"hyp": "it's seven forty five", "cer": 0.0, "wer": 0.0}
     pairs = [("kitap okudum", "kitabı okudum"), ("", "abc"), ("bir iki üç", "iki üç dört beş")]
     dists = lambda: [score.edit_distance(a, b) for a, b in pairs] + [score.edit_distance(a.split(), b.split())
                                                                       for a, b in pairs]

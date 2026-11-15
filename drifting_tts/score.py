@@ -4,9 +4,11 @@ Reads ``audio.bin`` (``prepare --save-audio``) and ``index.jsonl`` and appends t
 per utterance keyed by its ``index.jsonl`` line number ``i``. Runs are resumable per scorer, and the file is
 compacted to one line per utterance at the end (so do not run two ``score`` processes on one dataset at once).
 
-    asr        ``hyp``, ``cer``, ``wer``: Whisper large-v3 (faster-whisper, Turkish, beam 5, batched across clips)
-               against ``norm_text``, both normalised and stripped of punctuation as in ``evaluate``
-    rate       ``cps``: letters of ``norm_text`` per second of audio
+    asr        ``hyp``, ``cer``, ``wer``: Whisper large-v3 (faster-whisper, beam 5, batched across clips) in the
+               dataset's language (``stats.json``, ``prepare --language``) against ``norm_text``, both normalised
+               with that language's frontend and stripped of punctuation as in ``evaluate``
+    rate       ``cps``: letters of ``norm_text`` per second of audio (language-specific: the English frontend
+               spells numbers and acronyms out, so set ``filters.rate`` per language)
     mos        ``mos_sig``, ``mos_bak``, ``mos_ovrl`` (DNSMOS P.835) and ``mos_p808``: Microsoft's ONNX models from
                ``speechmos``, run on the GPU via ``onnx2torch`` (16 kHz, 9.01 s windows with 1 s hop)
     bandwidth  ``bw_hz``: highest frequency whose long-term spectrum is within ``--bw-db`` dB of its peak (24 kHz)
@@ -36,6 +38,7 @@ from .audio import FRAME_RATE, SAMPLE_RATE
 from .config import Config, apply_overrides, load_config
 from .data import load_scores, parse_filters, passes
 from .evaluate import _plain
+from .text import LANGUAGES
 
 try:
     from rapidfuzz.distance.Levenshtein import distance as _levenshtein
@@ -56,6 +59,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="summary: filter rule on top of --config, e.g. max_cer=0.1, min_mos=3, rate=[8,20]")
     p.add_argument("--speakers-tsv", default=None, help="summary: also write the full per-speaker table here")
     p.add_argument("--asr-model", default="large-v3", help="faster-whisper model")
+    p.add_argument("--language", choices=LANGUAGES, default=None,
+                   help="asr: language of Whisper and of the text normaliser (default: the dataset's, stats.json)")
     p.add_argument("--beam-size", type=int, default=5)
     p.add_argument("--spk-model", default="speechbrain/spkrec-ecapa-voxceleb", help="SpeechBrain speaker encoder")
     p.add_argument("--bw-db", type=float, default=50.0, help="bandwidth: level below the spectral peak, dB")
@@ -82,9 +87,16 @@ def edit_distance(a, b) -> int:
     return prev[-1]
 
 
-def error_rates(ref: str, hyp: str) -> tuple[float, float]:
-    """CER and WER of ``hyp`` against ``ref``, both normalised without punctuation (as in ``evaluate``)."""
-    r, h = _plain(ref), _plain(hyp)
+def dataset_language(root: Path) -> str:
+    """The text language of a prepared dataset (``stats.json``, ``prepare --language``; Turkish if not recorded)."""
+    stats = Path(root) / "stats.json"
+    return json.loads(stats.read_text()).get("language", "tr") if stats.exists() else "tr"
+
+
+def error_rates(ref: str, hyp: str, language: str = "tr") -> tuple[float, float]:
+    """CER and WER of ``hyp`` against ``ref``, both normalised by ``language``'s frontend without punctuation (as in
+    ``evaluate``)."""
+    r, h = _plain(ref, language), _plain(hyp, language)
     return edit_distance(r, h) / max(len(r), 1), edit_distance(r.split(), h.split()) / max(len(r.split()), 1)
 
 
@@ -176,8 +188,10 @@ class AsrScorer:
     VAD-chunked."""
 
     name, key = "asr", "cer"
+    language = "tr"  # set per dataset in __init__
 
-    def __init__(self, model: str, device: str, beam_size: int, batch_size: int):
+    def __init__(self, model: str, device: str, beam_size: int, batch_size: int, language: str = "tr"):
+        """``language``: what Whisper transcribes and the frontend that normalises both texts (the dataset's)."""
         import faster_whisper
 
         dev, _, idx = device.partition(":")
@@ -185,7 +199,8 @@ class AsrScorer:
                                                  compute_type="float16" if dev == "cuda" else "int8")
         self.batched = (faster_whisper.BatchedInferencePipeline(self.model)
                         if hasattr(faster_whisper, "BatchedInferencePipeline") else None)
-        self.opts = dict(language="tr", beam_size=beam_size, without_timestamps=True)
+        self.language = language
+        self.opts = dict(language=language, beam_size=beam_size, without_timestamps=True)
         self.batch_size = batch_size
         if dev == "cuda":  # the numpy log-mel took ~0.3 s per 10 s clip on a busy CPU, 2 ms in torch
             self.model.feature_extractor = _torch_whisper_features(self.model.feature_extractor, device)
@@ -234,8 +249,8 @@ class AsrScorer:
         hyps = self.transcribe([w16.numpy() for _, _, w16 in batch])
         out = []
         for (i, _, _), hyp in zip(batch, hyps):
-            cer, wer = error_rates(index[i]["norm_text"], hyp)
-            out.append((i, {"hyp": _plain(hyp), "cer": _r(cer), "wer": _r(wer)}))
+            cer, wer = error_rates(index[i]["norm_text"], hyp, self.language)
+            out.append((i, {"hyp": _plain(hyp, self.language), "cer": _r(cer), "wer": _r(wer)}))
         return out
 
 
@@ -418,7 +433,9 @@ def score(root: Path, names: list[str], args) -> None:
         scorers = []
         for name in audio_names:
             if name == "asr":
-                scorers.append(AsrScorer(args.asr_model, args.device, args.beam_size, args.asr_batch_size))
+                language = getattr(args, "language", None) or dataset_language(root)
+                print(f"asr: Whisper {args.asr_model} in {language!r}")
+                scorers.append(AsrScorer(args.asr_model, args.device, args.beam_size, args.asr_batch_size, language))
             elif name == "mos":
                 scorers.append(DnsMos(args.device))
             elif name == "bandwidth":

@@ -118,6 +118,26 @@ def test_token_masks():
                                            False, False, False]
 
 
+def test_text_helpers_follow_the_language():
+    """#86: token ids index the symbol table of the model's language, and the speaking rate counts its syllables."""
+    from drifting_tts import text_en
+    from drifting_tts.prosody import char_durations, syllables
+
+    assert syllables("merhaba dünya") == 5 and syllables("merhaba dünya", None) == 5
+    assert syllables("hello world", "en") == 3 and syllables("make a table", "en") == 4
+    assert syllables("the quick brown fox, it's here", "en") == 6 and syllables("", "en") == 0
+    f = prosody_features(tone(np.full(100, 120.0)), text="hello world", language="en")
+    assert f["rate_sps"] == pytest.approx(3 / f["speech_s"])
+    ids = torch.tensor(text_en.text_to_ids("as da. it's", normalized=True))
+    chars, _ = char_durations(ids, torch.ones(len(ids)), "en")
+    assert chars == list("as da. it's")
+    assert char_durations(ids, torch.ones(len(ids)))[0] != chars  # the Turkish table misreads English ids
+    letters = letter_tokens(ids, "en")[1::2].tolist()
+    assert letters == [c.isalpha() for c in "as da. it's"]  # the apostrophe is not a letter
+    v = voiced_tokens(ids, "en")[1::2].tolist()
+    assert v[0] and not v[1] and v[3] and v[4] and not v[5] and v[7] and not v[8]  # a, d, i voiced; s, t, "." not
+
+
 def test_scale_deviations():
     x = torch.tensor([[1.0, 2.0, 3.0, 10.0]])
     mask = torch.tensor([[True, True, True, False]])

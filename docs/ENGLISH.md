@@ -36,7 +36,11 @@ ones many short ones (median 5.6 s in shard 3,000).
   English spelling is far from phonemic; with this much data the text encoder learns the letters' sounds (no G2P).
 - **A language switch**: `model.text.language` sets the text encoder's vocabulary and a prepared dataset's
   `stats.json` records its language (`prepare --language`); the Synthesizer, `evaluate` and Whisper follow them. A
-  model or dataset without a language is Turkish, as before.
+  model or dataset without a language is Turkish, as before. `benchmark` and `prosody` take the language from the
+  checkpoint (Whisper, the normaliser of both texts, the syllable count of the speaking rate, the symbol table of the
+  token controls) and `score` from the dataset's `stats.json` (`--language` overrides it), so the English data can be
+  scored and filtered (#86). `benchmark` has no English default text set: pass `--texts` (a `.txt` / `.jsonl` file,
+  or `<HF dataset id>:<file>`).
 - **`prepare`**: `--speaker-column`, `--val-glob` (held-out files form the val split, the rest of them dev), and
   `hf://` paths read without a local copy.
 - **Streaming** (`drifting_tts/stream.py`, `data.stream`): 10,000 h of log-mels would take ~675 GB. Each DataLoader
@@ -255,6 +259,9 @@ drifting-tts evaluate --model runs/ar_en_10k/model_ema.pt --split val --num 100 
 drifting-tts finetune-vocoder --config configs/vocoder_bigvgan_en_gta.yaml --workdir runs/en_bigvgan_gta
 drifting-tts evaluate --model runs/ar_en_10k/model_ema.pt --split val --num 100 --temperature 0.5 \
     --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt
+# an external text set (one sentence per line), band-matched as the Turkish benchmark; data scores in English
+drifting-tts benchmark --model runs/ar_en_10k/model_ema.pt --vocoder vocos-v2 --texts texts_en.txt --speaker 42
+drifting-tts score --data data/en_pilot --scorers asr,rate,mos
 # pauses (#72): the duration predictor re-fitted to the mean duration, the rest of the model unchanged
 drifting-tts train-durations --model runs/ar_en_10k/model_ema.pt --out runs/en_dur/model_poisson.pt
 # release: stage, verify and scan, then upload; the public demo downloads from the model repo

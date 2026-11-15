@@ -30,10 +30,101 @@ CASES = [
     ("café naïve “quoted” & more", "cafe naive quoted and more"),
 ]
 
+DOTS = [  # only a sentence end keeps its dot: dotted acronyms and initials are read by their letter names
+    ("The U.S. economy grew.", "the you ess economy grew."),
+    ("He works in the U.S. The economy grew.", "he works in the you ess. the economy grew."),  # an opener follows
+    ("the U.S.'s policy in Washington D.C.", "the you ess's policy in washington dee see."),
+    ("J. K. Rowling wrote it.", "jay kay rowling wrote it."),
+    ("J.K. Rowling and John F. Kennedy", "jay kay rowling and john eff kennedy"),
+    ("I. M. Pei designed it.", "eye em pei designed it."),
+    ("So did I. Mary left.", "so did i. mary left."),  # the pronoun
+    ("Plan B. Then we left.", "plan b. then we left."),  # not an initial: an opener follows
+    ("Take vitamin C. Take it daily.", "take vitamin c. take it daily."),  # a letter that names a thing
+    ("He got a B. His sister got an A. Mom was happy.", "he got a b. his sister got an a. mom was happy."),
+    ("hello. how are you.", "hello. how are you."),  # plain sentences keep their dots
+    ("She has a Ph.D. in physics. He has a Ph.D. Then he left.",
+     "she has a pee aitch dee in physics. he has a pee aitch dee. then he left."),
+    ("Apple Inc. CEO Tim Cook spoke.", "apple incorporated see ee oh tim cook spoke."),
+    ("Martin Luther King Jr. He spoke too.", "martin luther king junior. he spoke too."),
+    ("Smith & Co. Ltd. and Acme Corp. merged.", "smith and company limited and acme corporation merged."),
+    ("Gen. Patton and Sen. Smith met Capt. Kirk at Mt. Everest.",
+     "general patton and senator smith met captain kirk at mount everest."),
+    ("I live on Main St. near St. Louis.", "i live on main street near saint louis."),
+    ("He lives on Elm St. She lives on 5th St. NW.",
+     "he lives on elm street. she lives on fifth street en double you."),
+    ("On Jan. 5 and Sept. 2020, but I met Jan. He left.",
+     "on january five and september twenty twenty, but i met jan. he left."),
+    ("See Fig. 3 and pp. 12-15, vol. 2, p. 5.", "see figure three and pages twelve to fifteen, volume two, page five."),
+]
+
+NUMBERS = [
+    ("Call 555-1234 on 3/4/2021, it is 10km away at 20°C.",
+     "call five five five, one two three four on march fourth, twenty twenty one, it is ten kilometers away at twenty "
+     "degrees celsius."),
+    ("Call (555) 123-4567 or 1-800-555-1234.",
+     "call five five five, one two three, four five six seven or one, eight oh oh, five five five, one two three "
+     "four."),
+    ("+1 555 123 4567", "plus one, five five five, one two three, four five six seven"),
+    ("pages 100-2000", "pages one hundred to two thousand"),  # a range, not a phone number
+    ("On 2021-03-04, 25/12/2020 and 3/4/21.",
+     "on march fourth, twenty twenty one, december twenty fifth, twenty twenty and march fourth, twenty one."),
+    ("13/13/2020", "thirteen thirteen twenty twenty"),  # not a date
+    ("Add 1/2 cup, 3/4 of it, 2/3, 5/8 inch and 1 1/2 hours.",
+     "add one half cup, three quarters of it, two thirds, five eighths inch and one and a half hours."),
+    ("9/11, 24/7 and 50/50", "nine eleven, twenty four seven and fifty fifty"),  # not fractions
+    ("5 kg, 1 lb, 3.5 oz, 60 mph, 100 km/h, 1 km, 6 ft.",
+     "five kilograms, one pound, three point five ounces, sixty miles per hour, one hundred kilometers per hour, one "
+     "kilometer, six feet."),
+    ("-5°C, 72 °F, 20-30 km, 1999 km, 5 min, 36 ms, 24 kHz, 16 GB.",
+     "minus five degrees celsius, seventy two degrees fahrenheit, twenty to thirty kilometers, one thousand nine "
+     "hundred ninety nine kilometers, five minutes, thirty six milliseconds, twenty four kilohertz, sixteen "
+     "gigabytes."),
+    ("It is 10 m away, with 5m users and $5m.", "it is ten meters away, with five m users and five million dollars."),
+    ("World War II, Chapter IV, Type I error, Super Bowl XLII.",
+     "world war two, chapter four, type one error, super bowl forty two."),
+    ("Henry VIII, Elizabeth II, Louis XIV and Elizabeth I.",
+     "henry the eighth, elizabeth the second, louis the fourteenth and elizabeth the first."),
+    ("Rocky II, the IV drip, John I think, Malcolm X.", "rocky two, the iv drip, john i think, malcolm x."),
+]
+
+ADDRESSES = [
+    ("Email john.doe@example.com or visit https://www.example.com/about-us?x=1.",
+     "email john dot doe at example dot com or visit double you double you double you dot example dot com slash about "
+     "dash us."),
+    ("See example.org/docs, okay.", "see example dot org slash docs, okay."),
+    ("It ended.Then we left.", "it ended. then we left."),  # a missing space is not an address
+]
+
+CASES += DOTS + NUMBERS + ADDRESSES
+
 
 @pytest.mark.parametrize("raw,expected", CASES)
 def test_normalize(raw, expected):
     assert text_en.normalize(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [raw for raw, _ in CASES])
+def test_normalize_is_idempotent_and_in_vocabulary(raw):
+    norm = text_en.normalize(raw)
+    assert set(norm) <= set(text_en.SYMBOL_TO_ID)
+    assert text_en.normalize(norm) == norm
+
+
+@pytest.mark.parametrize(
+    "raw, sentences",
+    [
+        ("The U.S. economy grew. J. K. Rowling wrote it.", ["the you ess economy grew.", "jay kay rowling wrote it."]),
+        ("Dr. Smith met Mr. Jones at 5 p.m. Then they left!",
+         ["doctor smith met mister jones at five pee em.", "then they left!"]),
+        ("hello. how are you? fine.", ["hello.", "how are you?", "fine."]),
+        ("Plan B. Then we left.", ["plan b.", "then we left."]),
+        ("Call (555) 123-4567. Or write to a.b@example.com. Thanks.",
+         ["call five five five, one two three, four five six seven.", "or write to a dot b at example dot com.",
+          "thanks."]),
+    ],
+)
+def test_split_sentences(raw, sentences):  # abbreviations, initials and addresses do not break a sentence
+    assert text_en.split_sentences(text_en.normalize(raw)) == sentences
 
 
 def test_numbers():

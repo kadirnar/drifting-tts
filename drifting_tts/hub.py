@@ -24,12 +24,16 @@ PROSODY_MODELS: dict[str, tuple[str, str | None]] = {
 # v3.2 keeps v3.1's acoustic weights (``drifting_tts_v3.2.pt``: the same weights with a sanitised config). It samples
 # only the token pitch: sampled durations cost intelligibility on new text for the voices with little data (Freya-495
 # WER 1.74% -> 5.78% male, 3.02% -> 11.28% female), so the durations stay v3.1's regressors'.
+# ``temperature`` / ``cfg_scale``: the operating point the releases are measured at (README: T 0.3, guidance 2), the
+# default of the calls that do not give one.
 RELEASES: dict[str, dict] = {
-    "v3.1": {"model": "drifting_tts_v3.1.pt", "vocoder": "bigvgan-v2-ft", "prosody": None, "pause": 0.15},
+    "v3.1": {"model": "drifting_tts_v3.1.pt", "vocoder": "bigvgan-v2-ft", "prosody": None, "pause": 0.15,
+             "temperature": 0.3, "cfg_scale": 2.0},
     # paragraph mode: consecutive sentences in one pass (on Freya read as paragraphs: lower WER for every voice, higher
     # UTMOSv2 for the male and female voices; docs/PROSODY.md); single sentences are synthesised as before
     "v3.2": {"model": "drifting_tts_v3.2.pt", "vocoder": "vocos-v2", "prosody": "drift",
-             "prosody_durations": "regressor", "pause": "punct", "paragraph": True},
+             "prosody_durations": "regressor", "pause": "punct", "paragraph": True,
+             "temperature": 0.3, "cfg_scale": 2.0},
 }
 LATEST = "v3.2"
 

@@ -2,8 +2,10 @@
 (``tr``: this module, ``en``: :mod:`drifting_tts.text_en`).
 
 Turkish orthography is close to phonemic, so characters are used directly as input symbols
-(no G2P). Normalisation lower-cases with Turkish rules, verbalises numbers, clock times, ordinals, units,
-currencies and common abbreviations, and drops symbols that are not pronounced.
+(no G2P). Normalisation lower-cases with Turkish rules, verbalises numbers, clock times, ordinals, fractions, phone
+numbers, units, currencies, common abbreviations, initials, e-mail and web addresses, and drops symbols that are not
+pronounced. It leaves a ``.`` only where a sentence ends (:func:`split_sentences` splits there): the dots of
+abbreviations, dotted acronyms and initials are resolved here.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ _TIME = re.compile(r"(?<![\d.,:])(\d{1,2}):(\d{2})(?![\d:])")
 
 # Titles are expanded only before a capitalised name ("Av. Ali" but not "Av. sezonu")
 _TITLES = {"Dr": "doktor", "Prof": "profesör", "Doç": "doçent", "Yrd": "yardımcı", "Öğr": "öğretim", "Av": "avukat",
-           "Op": "operatör", "Uzm": "uzman", "Sn": "sayın"}
+           "Op": "operatör", "Uzm": "uzman", "Sn": "sayın", "Hz": "hazreti"}
 _TITLE = re.compile(rf"(?<!\w)({'|'.join(_TITLES)})\.(?=\s*[{_UPPER}])")
 _ABBREVIATIONS = {"vb": "ve benzeri", "vs": "vesaire", "vd": "ve diğerleri", "örn": "örneğin", "bkz": "bakınız"}
 _ABBREVIATION = re.compile(rf"(?<!\w)((?i:{'|'.join(_ABBREVIATIONS)}))\.")  # also "Örn.", all-caps "VB."
@@ -77,6 +79,41 @@ _ORDINAL = re.compile(rf"(?<![\d.,])(?:(\d{{1,6}})\.(?=\s+[{_LOWER}])|(\d{{1,3}}
 # Regnal numbers and centuries (II. Abdülhamid, XV. yüzyıl): only I, V, X (1-39), so initials such as "M. Kemal" or
 # "C. Ronaldo" are left alone
 _ROMAN_ORDINAL = re.compile(rf"(?<![\w.])(?=[IVX])(X{{0,3}}(?:IX|IV|V?I{{0,3}}))\.(?=\s+[{_LOWER}]|{_TITLE_WORD})")
+
+# The dot of an abbreviation is not a sentence end ("T.C. Sağlık Bakanlığı", "Gül Sok. No: 5", "M. Kemal"), unless the
+# text ends there or a sentence opener follows ("... A.Ş. Sonra kapandı.")
+_STOP = re.compile(rf"\s*$|\s+(?:{'|'.join(_OPENERS)})(?!\w)")
+# Dotted letter sequences are read letter by letter (T.C., A.B.D., t.c.); a few stand for words
+_DOTTED = re.compile(rf"(?<![\w.])(?:[{_UPPER}{_LOWER}]\.){{2,}}")
+_DOTTED_WORDS = {"A.Ş.": "anonim şirketi"}
+# Initials before a capitalised name (M. Kemal, A. O. Yılmaz) are read by their letter names; before a sentence opener
+# the dot ends the sentence ("Plan B. Sonra gittik."). A lone I, V or X stays a regnal number (_ROMAN_ORDINAL)
+_INITIALS = re.compile(rf"(?<![\w.-])[{_UPPER}]\.(?:\s+[{_UPPER}]\.){{0,5}}(?={_TITLE_WORD})")
+# ... but a lone letter after one of these words names a thing ("Hepatit B. Aşısı var.", "Grup A. Türkiye lider.")
+_LETTERED = re.compile(r"(?<!\w)(?:grup|hepatit|plan|tip|seçenek|şık|blok|kapı|sınıf|şube|kategori|model|madde|bölüm"
+                       r"|vitamin)\s+$")
+# Abbreviations that follow a name, in addresses and company names (Gül Sok., Atatürk Cad., Yılmaz Ltd. Şti.)
+_AFTER_NAME = {"Mah": "mahallesi", "Cad": "caddesi", "Sok": "sokak", "Sk": "sokak", "Apt": "apartmanı",
+               "Bul": "bulvarı", "Blv": "bulvarı", "Ltd": "limited", "Şti": "şirketi", "Tic": "ticaret",
+               "San": "sanayi"}
+_AFTER_NAME_ABBREVIATION = re.compile(rf"(?<=[\w.] )({'|'.join(_AFTER_NAME)})\.")
+_TELEPHONE = re.compile(r"(?<!\w)(?:Tel[.:]|tel:)\s*(?=[+(\d])")  # "ince bir tel. 5 metre" is a wire
+# Phone numbers, read group by group ("0532 123 45 67": sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi):
+# with a country code, a trunk zero or an area code in brackets; or a mobile number in its four spaced groups
+_PHONE = re.compile(r"(?<![\w.,+/-])(?:(?:(?:\+90|0090)[ -]?(?:\([0-9]{3}\)|[0-9]{3})|0 ?(?:\([0-9]{3}\)|[0-9]{3})"
+                    r"|\(0[0-9]{3}\)|\([0-9]{3}\))[ -]?[0-9]{3}[ -]?[0-9]{2}[ -]?[0-9]{2}"
+                    r"|5[0-9]{2}[ -][0-9]{3}[ -][0-9]{2}[ -][0-9]{2})(?![0-9])(?![.,][0-9])")
+# Fractions ("3/4'ü" -> dörtte üçü): a numerator below a denominator of 2-10 or 100; not a date or a door number
+_FRACTION = re.compile(r"(?<![\w/.,-])(?<!numara )(\d{1,2})/(\d{1,3})(?![\w/])(?![.,]\d)(?:'([^\W\d_]+))?")
+# E-mail and web addresses are spelled out ("nokta", "et"); a bare domain needs one of these endings
+_EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_DOMAIN_ENDINGS = "com|net|org|edu|gov|tr|io|info|app|dev"
+_URL = re.compile(r"(?<![\w@./-])(?:https?://[A-Za-z0-9.-]+|www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
+                  rf"|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:{_DOMAIN_ENDINGS})(?![A-Za-z0-9-]))(?:/[^\s]*)?")
+_ADDRESS_WORDS = {"www": "ve ve ve", "com": "kom", "tr": "te re"}
+_ADDRESS_CHARS = {".": " nokta ", "/": " bölü ", "-": " tire ", "_": " alt çizgi ", "@": " et ", ":": " "}
+_TRAILING = ".,!?;:)]}'\""
+_APOSTROPHES = ("'", "’", "ʼ")  # before _CHAR_MAP
 
 
 def _below_thousand(n: int) -> list[str]:
@@ -178,6 +215,72 @@ def _verbalise_number(match: re.Match) -> str:
     return f" {text} "
 
 
+def _stop(match: re.Match) -> str:
+    """"." when the abbreviation that ``match`` covers also ends the sentence (:data:`_STOP`), else ""."""
+    return "." if _STOP.match(match.string, match.end()) else ""
+
+
+def _letter_name(letter: str) -> str:
+    return _LETTER_NAMES.get(letter.replace("i", "İ").upper(), letter)
+
+
+def _glue(match: re.Match) -> str:
+    """"" when a suffix follows ``match`` (``T.C.'nin``: the apostrophe must stay next to a letter), else " "."""
+    return "" if match.string.startswith(_APOSTROPHES, match.end()) else " "
+
+
+def _spell_dotted(match: re.Match) -> str:
+    """``T.C.`` -> "te ce" (a suffix stays attached: ``T.C.'nin`` -> "te cenin")."""
+    word = _DOTTED_WORDS.get(match.group()) or " ".join(_letter_name(c) for c in match.group() if c != ".")
+    return f" {word}{_stop(match)}{_glue(match)}"
+
+
+def _spell_initials(match: re.Match) -> str:
+    letters = re.findall(rf"[{_UPPER}]", match.group())
+    if len(letters) == 1 and (letters[0] in "IVX" or _LETTERED.search(turkish_lower(match.string[:match.start()]))):
+        return match.group()
+    return " ".join(_letter_name(c) for c in letters)
+
+
+def _digit_group(group: str) -> str:
+    """A group of a phone number: ``532`` -> "beş yüz otuz iki", ``05`` -> "sıfır beş"."""
+    rest = group.lstrip("0")
+    return " ".join(["sıfır"] * (len(group) - len(rest)) + ([number_to_words(int(rest))] if rest else []))
+
+
+def _verbalise_phone(match: re.Match) -> str:
+    digits = "".join(c for c in match.group() if c in "0123456789")
+    parts = []
+    if match.group().startswith("+") or digits.startswith("0090"):
+        parts.append("artı doksan")
+        digits = digits[4 if digits.startswith("0090") else 2:]
+    trunk, digits = ("sıfır ", digits[1:]) if len(digits) == 11 else ("", digits)
+    parts += [trunk + _digit_group(digits[:3]), *(_digit_group(digits[a:b]) for a, b in ((3, 6), (6, 8), (8, 10)))]
+    return f" {', '.join(parts)}{_glue(match)}"
+
+
+def _verbalise_fraction(match: re.Match) -> str:
+    numerator, denominator = int(match.group(1)), int(match.group(2))
+    if not (0 < numerator < denominator and (denominator <= 10 or denominator == 100)):
+        return match.group()
+    return f" {_attach(number_to_words(denominator), 'de')} {_attach(number_to_words(numerator), match.group(3))} "
+
+
+def _speak_address(address: str) -> str:
+    """An e-mail or web address without its scheme, query and fragment: dots, slashes and dashes by name."""
+    address = re.split("[?#]", re.sub("^https?://", "", address), maxsplit=1)[0].rstrip("/")
+    host, slash, path = address.partition("/")
+    local, at, domain = host.rpartition("@")
+    domain = ".".join(_ADDRESS_WORDS.get(label, label) for label in domain.split("."))
+    return "".join(_ADDRESS_CHARS.get(c, c) for c in local + at + domain + slash + path)
+
+
+def _verbalise_address(match: re.Match) -> str:
+    address = match.group().rstrip(_TRAILING)  # the punctuation after it belongs to the sentence
+    tail = match.group()[len(address):]
+    return f" {_speak_address(address)}{tail or _glue(match)}{' ' if tail else ''}"
+
+
 def _expand_abbreviation(match: re.Match) -> str:
     abbreviation = match.group(1).lower()
     word = _ABBREVIATIONS[abbreviation]
@@ -194,13 +297,20 @@ def normalize(text: str) -> str:
     """Normalise raw Turkish text to the symbol alphabet (lower-case letters, space and ``.,!?``)."""
     # drop combining marks left after NFC, e.g. the U+0307 in "i̇" that Python's "İ".lower() produces
     text = "".join(c for c in unicodedata.normalize("NFC", text) if not unicodedata.combining(c))
+    text = _EMAIL.sub(_verbalise_address, text)  # before "@" and "+" are mapped
+    text = _URL.sub(_verbalise_address, text)
+    text = _TELEPHONE.sub("telefon ", text)
+    text = _PHONE.sub(_verbalise_phone, text)
     text = "".join(_CHAR_MAP.get(c, c) for c in text)
+    text = _DOTTED.sub(_spell_dotted, text)  # before the apostrophes: a suffix stays on the last letter's name
+    text = _AFTER_NAME_ABBREVIATION.sub(lambda m: f"{_AFTER_NAME[m.group(1)]}{_stop(m)}", text)
     # an apostrophe between a letter/digit/unit and a letter starts a suffix (Anadolu'ya, 2021'de, $'a); others are
     # quote marks ('evet') and become spaces
     text = re.sub(r"(?<![^\W_])(?<![%$₺€£°])'|'(?![^\W\d_])", " ", text)
     text = _TITLE.sub(lambda m: f"{_TITLES[m.group(1)]} ", text)
     text = _ABBREVIATION.sub(_expand_abbreviation, text)
     text = re.sub(r"\b[Nn]o[.:]?\s*(?=\d)", "numara ", text)
+    text = _FRACTION.sub(_verbalise_fraction, text)
     text = _TIME.sub(_verbalise_time, text)  # before ":" becomes ","
     text = re.sub(r"(?<=\d):(?=\d)", " ", text).replace(":", ",")  # 3:1 -> "üç bir"
     text = _SPEED.sub(r"saatte \1 kilometre", text)
@@ -211,6 +321,7 @@ def normalize(text: str) -> str:
     text = re.sub(rf"({_NUMBER})\s*%", r" yüzde \1", text)
     text = re.sub(rf"(?<!\w)[{_UPPER}]{{2,}}(?!\w)", lambda m: _ACRONYMS.get(m.group(), m.group()), text)
     text = re.sub(r"(?<![\w.,])-(?=\d)", " eksi ", text)  # a minus starts a word; 3-5 stays a range
+    text = _INITIALS.sub(_spell_initials, text)
     text = _ROMAN_ORDINAL.sub(lambda m: f" {ordinal_to_words(_roman_to_int(m.group(1)))} ", text)
     text = _ORDINAL.sub(lambda m: f" {ordinal_to_words(int(m.group(1) or m.group(2)))} ", text)
     text = re.sub(_NUMBER, _verbalise_number, text)

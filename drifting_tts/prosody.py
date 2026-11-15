@@ -6,7 +6,8 @@ Measurements (``drifting-tts prosody`` runs them on held-out recordings and the 
   the utterance median: std, 5-95% range, skew, excess kurtosis, movement (mean ``|ΔF0|`` between voiced neighbours)
   and micro-variation (mean ``|F0 - 5-frame moving average|``), with the definitions of the Prosody-40 diagnosis
   (docs/EXPERIMENTS.md §5) so the numbers stay comparable; voiced %, level std, internal pauses (energy based) and the
-  speaking rate (syllables per second of speech; in Turkish every vowel is one syllable);
+  speaking rate (syllables per second of speech, :func:`syllables`: in Turkish every vowel is one syllable, in
+  English every vowel group but a silent final ``e``);
 * **paired** (:func:`paired_metrics`): against a recording of the same text, dynamic time warping on MFCCs, then the
   log-F0 correlation and RMSE along the path, and the ratio of the speech durations;
 * **token level, no audio** (:func:`token_targets`, :func:`token_report`): the duration and pitch predictors against
@@ -17,12 +18,16 @@ Measurements (``drifting-tts prosody`` runs them on held-out recordings and the 
 Controls: :func:`scale_deviations` (a gain on the pitch or log-duration deviations from the utterance mean),
 :func:`voiced_tokens` and :class:`PausePolicy` (silence between sentences by their final punctuation, a ``pause`` of
 :class:`drifting_tts.synthesize.Synthesizer`). Inputs are 24 kHz mono waveforms (numpy or CPU tensors).
+
+The text-dependent ones (:func:`syllables`, :func:`char_durations`, :func:`voiced_tokens`, :func:`letter_tokens`)
+take the model's ``language`` (``model.text.language``): token ids index that language's symbol table.
 """
 
 from __future__ import annotations
 
 import math
 import random
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -30,16 +35,21 @@ import torch
 from torch import Tensor
 
 from .audio import SAMPLE_RATE
-from .text import BLANK_ID, PAD_ID, SYMBOLS
+from .text import BLANK_ID, PAD_ID, frontend
 
 FRAME_MS = 10.0  # analysis frame period
 F0_FLOOR, F0_CEIL = 60.0, 500.0  # harvest search range of the Prosody-40 diagnosis
 SILENCE_DB = 35.0  # a frame is silent this far below the utterance's loud level (95th percentile of frame RMS)
 MIN_PAUSE_S = 0.1  # shorter silences inside speech are stop closures, not pauses
-VOWELS = frozenset("aeıioöuü")
+VOWELS = frozenset("aeıioöuü")  # Turkish
 VOICED_LETTERS = VOWELS | frozenset("bcdgğjlmnrvyzw")
 # tokens with voiced frames in < 80% of the training targets (studio voice, dio F0): docs/PROSODY.md
 UNVOICED_PRONE = frozenset("çpst.!?")
+# per language: the voiced letters and the unvoiced-prone tokens. The English sets are the Turkish ones carried over
+# by letter class (voiced consonants; the stops and sibilant of ç p s t), not measured on English targets.
+_VOICED = {"tr": VOICED_LETTERS, "en": frozenset("aeiouy") | frozenset("bdgjlmnrvwz")}
+_UNVOICED_PRONE = {"tr": UNVOICED_PRONE, "en": frozenset("pst.!?")}
+_EN_VOWEL_GROUP = re.compile(r"[aeiouy]+")
 PUNCTUATION = ".,!?"
 ST_PER_LN = 12 / math.log(2)  # semitones per natural-log unit
 
@@ -104,9 +114,21 @@ def pauses(silent: np.ndarray, min_frames: int) -> tuple[list[tuple[int, int]], 
     return runs, (a, b)
 
 
-def syllables(text: str) -> int:
-    """Syllables of normalised Turkish text: one per vowel."""
-    return sum(c in VOWELS for c in text)
+def syllables(text: str, language: str | None = "tr") -> int:
+    """Syllables of normalised text. Turkish: one per vowel. English (an estimate from the spelling): one per vowel
+    group of a word, less a silent final ``e`` (``make``, ``these``; not ``table``, ``the``), at least one per word."""
+    if language in (None, "tr"):
+        return sum(c in VOWELS for c in text)
+    if language != "en":
+        raise ValueError(f"no syllable count for language {language!r}")
+    total = 0
+    for word in re.findall(r"[a-z']+", text.lower()):
+        word = word.replace("'", "")
+        n = len(_EN_VOWEL_GROUP.findall(word))
+        if n > 1 and word.endswith("e") and not word.endswith("le") and word[-2] not in "aeiouy":
+            n -= 1
+        total += max(n, 1) if word else 0
+    return total
 
 
 def voiced_runs(f0: np.ndarray, min_frames: int = 1) -> list[tuple[int, int]]:
@@ -186,9 +208,10 @@ def token_f0(f0: np.ndarray, frames: np.ndarray, pitch_st: np.ndarray | None = N
 
 
 def prosody_features(wav, sr: int = SAMPLE_RATE, f0: np.ndarray | None = None, text: str | None = None,
-                     min_pause: float = MIN_PAUSE_S) -> dict:
+                     min_pause: float = MIN_PAUSE_S, language: str | None = "tr") -> dict:
     """Audio-level prosody of one utterance (see the module docstring); ``f0`` as :func:`f0_contour` (computed if
-    omitted), ``text`` (normalised) adds the speaking rate. ``pause_lengths`` lists the internal pauses in seconds."""
+    omitted), ``text`` (normalised, in ``language``) adds the speaking rate. ``pause_lengths`` lists the internal
+    pauses in seconds."""
     x = np.asarray(wav, dtype=np.float64)
     f0 = f0_contour(x, sr) if f0 is None else np.asarray(f0, dtype=np.float64)
     out = f0_statistics(f0)
@@ -203,7 +226,7 @@ def prosody_features(wav, sr: int = SAMPLE_RATE, f0: np.ndarray | None = None, t
     out.update(duration_s=len(x) / sr, speech_s=speech, pauses=len(lengths), pause_s=float(sum(lengths)),
                pause_lengths=lengths)
     if text and speech > 0:
-        n = syllables(text)
+        n = syllables(text, language)
         out["rate_sps"] = n / speech
         out["artic_sps"] = n / max(speech - sum(lengths), 1e-3)
     return out
@@ -306,8 +329,9 @@ def frames_from_logw(logw: Tensor, scale: float = 1.0) -> Tensor:
     return torch.ceil(torch.exp(logw) * scale).clamp_min(0)
 
 
-def char_durations(ids: Tensor, frames: Tensor) -> tuple[list[str], np.ndarray]:
+def char_durations(ids: Tensor, frames: Tensor, language: str | None = "tr") -> tuple[list[str], np.ndarray]:
     """Per character of the text: its token plus the blank after it (the leading blank is dropped)."""
+    SYMBOLS = frontend(language).SYMBOLS
     ids, frames = ids.tolist(), frames.float().cpu().numpy()
     chars, dur = [], []
     for k in range(1, len(ids), 2):
@@ -326,8 +350,8 @@ def _agreement(pred: np.ndarray, gt: np.ndarray) -> dict:
 
 
 def token_report(t: dict, frame_rate: float, frames: Tensor | None = None, pitch: Tensor | None = None,
-                 lf0_std: float = 1.0, scale: float = 1.0) -> dict:
-    """Predictors against the ground truth of :func:`token_targets` for one utterance.
+                 lf0_std: float = 1.0, scale: float = 1.0, language: str | None = "tr") -> dict:
+    """Predictors against the ground truth of :func:`token_targets` for one utterance (``language``: the model's).
 
     ``frames`` (default: the predicted durations as synthesised, ``ceil(exp(logw) * scale)``) and ``pitch`` (default:
     the predicted token pitch) may be modified versions, e.g. after a gain. Durations are compared per letter
@@ -339,8 +363,8 @@ def token_report(t: dict, frame_rate: float, frames: Tensor | None = None, pitch
     out: dict = {}
     if "durations_gt" in t:
         frames = frames_from_logw(t["logw"], scale) if frames is None else frames
-        chars, dp = char_durations(t["ids"], frames)
-        _, dg = char_durations(t["ids"], t["durations_gt"])
+        chars, dp = char_durations(t["ids"], frames, language)
+        _, dg = char_durations(t["ids"], t["durations_gt"], language)
         letter = np.array([c not in PUNCTUATION and c != " " for c in chars])
         lp, lg = np.log(np.maximum(dp[letter], 1)), np.log(np.maximum(dg[letter], 1))
         out.update({f"dur_{k}": v for k, v in _agreement(lp, lg).items()})
@@ -407,20 +431,28 @@ def seed_diversity(f0s: list[np.ndarray], lengths: list[float] | None = None,
 # --- controls ----------------------------------------------------------------------------------------------------
 
 
-def voiced_tokens(ids: Tensor) -> Tensor:
+def _language(language: str | None) -> str:
+    return "tr" if language is None else language
+
+
+def voiced_tokens(ids: Tensor, language: str | None = "tr") -> Tensor:
     """Tokens whose training pitch target is almost always voiced (``[..., N]`` bool): all but the voiceless
     consonants ç p s t, sentence-final marks and the blanks between two tokens that are not voiced letters. Unvoiced
-    targets are 0 in training (the global mean), so a pitch gain leaves the excluded tokens alone."""
-    voiced = torch.tensor([s in VOICED_LETTERS for s in SYMBOLS], device=ids.device)[ids]
-    prone = torch.tensor([s in UNVOICED_PRONE for s in SYMBOLS], device=ids.device)[ids]
+    targets are 0 in training (the global mean), so a pitch gain leaves the excluded tokens alone. ``language``: the
+    symbol table of ``ids`` (the English sets are not measured: see ``_VOICED``)."""
+    SYMBOLS = frontend(language).SYMBOLS
+    voiced_set, prone_set = _VOICED[_language(language)], _UNVOICED_PRONE[_language(language)]
+    voiced = torch.tensor([s in voiced_set for s in SYMBOLS], device=ids.device)[ids]
+    prone = torch.tensor([s in prone_set for s in SYMBOLS], device=ids.device)[ids]
     left = torch.nn.functional.pad(voiced, (1, 0))[..., :-1]
     right = torch.nn.functional.pad(voiced, (0, 1))[..., 1:]
     blank = ids == BLANK_ID
     return ~prone & ~(blank & ~left & ~right) & (ids != PAD_ID)
 
 
-def letter_tokens(ids: Tensor) -> Tensor:
-    """Tokens of letters (not blanks, spaces or punctuation): ``[..., N]`` bool."""
+def letter_tokens(ids: Tensor, language: str | None = "tr") -> Tensor:
+    """Tokens of letters (not blanks, spaces, punctuation or the English apostrophe): ``[..., N]`` bool."""
+    SYMBOLS = frontend(language).SYMBOLS
     table = torch.tensor([len(s) == 1 and s.isalpha() for s in SYMBOLS], device=ids.device)
     return table[ids]
 

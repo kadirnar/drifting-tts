@@ -53,7 +53,7 @@ const TIME = re(`(?<![${D}.,:])([${D}]{1,2}):([${D}]{2})(?![${D}:])`);
 // Titles are expanded only before a capitalised name ("Av. Ali" but not "Av. sezonu")
 const TITLES = {
   Dr: "doktor", Prof: "profesör", Doç: "doçent", Yrd: "yardımcı", Öğr: "öğretim", Av: "avukat",
-  Op: "operatör", Uzm: "uzman", Sn: "sayın",
+  Op: "operatör", Uzm: "uzman", Sn: "sayın", Hz: "hazreti",
 };
 const TITLE = re(`(?<![${W}])(${Object.keys(TITLES).join("|")})\\.(?=[${S}]*[${UPPER}])`);
 const ABBREVIATIONS = { vb: "ve benzeri", vs: "vesaire", vd: "ve diğerleri", örn: "örneğin", bkz: "bakınız" };
@@ -85,6 +85,44 @@ const ORDINAL = re(`(?<![${D}.,])(?:([${D}]{1,6})\\.(?=[${S}]+[${LOWER}])|([${D}
 // Regnal numbers and centuries (II. Abdülhamid, XV. yüzyıl): only I, V, X (1-39), so initials such as "M. Kemal" or
 // "C. Ronaldo" are left alone
 const ROMAN_ORDINAL = re(`(?<![${W}.])(?=[IVX])(X{0,3}(?:IX|IV|V?I{0,3}))\\.(?=[${S}]+[${LOWER}]|${TITLE_WORD})`);
+
+// The dot of an abbreviation is not a sentence end ("T.C. Sağlık Bakanlığı", "Gül Sok. No: 5", "M. Kemal"), unless the
+// text ends there or a sentence opener follows ("... A.Ş. Sonra kapandı.")
+const STOP = re(`[${S}]*$|[${S}]+(?:${OPENERS.join("|")})(?![${W}])`, "uy");
+// Dotted letter sequences are read letter by letter (T.C., A.B.D., t.c.); a few stand for words
+const DOTTED = re(`(?<![${W}.])(?:[${UPPER}${LOWER}]\\.){2,}`);
+const DOTTED_WORDS = new Map([["A.Ş.", "anonim şirketi"]]);
+// Initials before a capitalised name (M. Kemal, A. O. Yılmaz) are read by their letter names; before a sentence opener
+// the dot ends the sentence ("Plan B. Sonra gittik."). A lone I, V or X stays a regnal number (ROMAN_ORDINAL)
+const INITIALS = re(`(?<![${W}.-])[${UPPER}]\\.(?:[${S}]+[${UPPER}]\\.){0,5}(?=${TITLE_WORD})`);
+const INITIAL = re(`[${UPPER}]`);
+// ... but a lone letter after one of these words names a thing ("Hepatit B. Aşısı var.", "Grup A. Türkiye lider.")
+const LETTERED = re(`(?<![${W}])(?:grup|hepatit|plan|tip|seçenek|şık|blok|kapı|sınıf|şube|kategori|model|madde|bölüm` +
+  `|vitamin)[${S}]+$`, "u");
+// Abbreviations that follow a name, in addresses and company names (Gül Sok., Atatürk Cad., Yılmaz Ltd. Şti.)
+const AFTER_NAME = {
+  Mah: "mahallesi", Cad: "caddesi", Sok: "sokak", Sk: "sokak", Apt: "apartmanı", Bul: "bulvarı", Blv: "bulvarı",
+  Ltd: "limited", Şti: "şirketi", Tic: "ticaret", San: "sanayi",
+};
+const AFTER_NAME_ABBREVIATION = re(`(?<=[${W}.] )(${Object.keys(AFTER_NAME).join("|")})\\.`);
+const TELEPHONE = re(`(?<![${W}])(?:Tel[.:]|tel:)[${S}]*(?=[+(${D}])`); // "ince bir tel. 5 metre" is a wire
+// Phone numbers, read group by group ("0532 123 45 67": sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi):
+// with a country code, a trunk zero or an area code in brackets; or a mobile number in its four spaced groups
+const PHONE = re(`(?<![${W}.,+/-])(?:(?:(?:\\+90|0090)[ -]?(?:\\([0-9]{3}\\)|[0-9]{3})|0 ?(?:\\([0-9]{3}\\)|[0-9]{3})` +
+  `|\\(0[0-9]{3}\\)|\\([0-9]{3}\\))[ -]?[0-9]{3}[ -]?[0-9]{2}[ -]?[0-9]{2}` +
+  `|5[0-9]{2}[ -][0-9]{3}[ -][0-9]{2}[ -][0-9]{2})(?![0-9])(?![.,][0-9])`);
+// Fractions ("3/4'ü" -> dörtte üçü): a numerator below a denominator of 2-10 or 100; not a date or a door number
+const FRACTION = re(`(?<![${W}/.,-])(?<!numara )([${D}]{1,2})/([${D}]{1,3})(?![${W}/])(?![.,][${D}])(?:'([${LETTER}]+))?`);
+// E-mail and web addresses are spelled out ("nokta", "et"); a bare domain needs one of these endings
+const EMAIL = re("(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+");
+const DOMAIN_ENDINGS = "com|net|org|edu|gov|tr|io|info|app|dev";
+const URL_ = re(`(?<![${W}@./-])(?:https?://[A-Za-z0-9.-]+|www\\.[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+` +
+  `|[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\.(?:${DOMAIN_ENDINGS})(?![A-Za-z0-9-]))(?:/[^${S}]*)?`);
+const ADDRESS_WORDS = new Map([["www", "ve ve ve"], ["com", "kom"], ["tr", "te re"]]);
+const ADDRESS_CHARS = new Map([[".", " nokta "], ["/", " bölü "], ["-", " tire "], ["_", " alt çizgi "], ["@", " et "],
+  [":", " "]]);
+const TRAILING = ".,!?;:)]}'\"";
+const APOSTROPHES = ["'", "’", "ʼ"]; // before CHAR_MAP
 
 // int() of a decimal digit: Unicode encodes every digit set (Nd) as a contiguous run 0-9
 const ND = /\p{Nd}/u;
@@ -196,6 +234,74 @@ function verbaliseNumber(raw) {
   return ` ${text} `;
 }
 
+/** "." when the abbreviation `match` (at `offset` of `string`) also ends the sentence (STOP), else "". */
+function stop(match, offset, string) {
+  STOP.lastIndex = offset + match.length;
+  return STOP.test(string) ? "." : "";
+}
+
+const letterName = (letter) => LETTER_NAMES[letter.replace("i", "İ").toUpperCase()] ?? letter;
+
+/** "" when a suffix follows the match (T.C.'nin: the apostrophe must stay next to a letter), else " ". */
+const glue = (match, offset, string) => (APOSTROPHES.includes(string[offset + match.length]) ? "" : " ");
+
+/** T.C. -> "te ce" (a suffix stays attached: T.C.'nin -> "te cenin"). */
+function spellDotted(match, offset, string) {
+  const word = DOTTED_WORDS.get(match) ?? [...match].filter((c) => c !== ".").map(letterName).join(" ");
+  return ` ${word}${stop(match, offset, string)}${glue(match, offset, string)}`;
+}
+
+function spellInitials(match, offset, string) {
+  const letters = match.match(INITIAL);
+  if (letters.length === 1 && ("IVX".includes(letters[0]) || LETTERED.test(turkishLower(string.slice(0, offset))))) {
+    return match;
+  }
+  return letters.map(letterName).join(" ");
+}
+
+/** A group of a phone number: 532 -> "beş yüz otuz iki", 05 -> "sıfır beş". */
+function digitGroup(group) {
+  const rest = group.replace(/^0+/, "");
+  return [...Array(group.length - rest.length).fill("sıfır"), ...(rest ? [numberToWords(BigInt(rest))] : [])].join(" ");
+}
+
+function verbalisePhone(match, offset, string) {
+  let digits = [...match].filter((c) => c >= "0" && c <= "9").join("");
+  const parts = [];
+  if (match.startsWith("+") || digits.startsWith("0090")) {
+    parts.push("artı doksan");
+    digits = digits.slice(digits.startsWith("0090") ? 4 : 2);
+  }
+  const trunk = digits.length === 11 ? "sıfır " : "";
+  if (trunk) digits = digits.slice(1);
+  parts.push(trunk + digitGroup(digits.slice(0, 3)), digitGroup(digits.slice(3, 6)), digitGroup(digits.slice(6, 8)),
+    digitGroup(digits.slice(8, 10)));
+  return ` ${parts.join(", ")}${glue(match, offset, string)}`;
+}
+
+function verbaliseFraction(match, a, b, suffix) {
+  const numerator = toInt(a), denominator = toInt(b);
+  if (!(0n < numerator && numerator < denominator && (denominator <= 10n || denominator === 100n))) return match;
+  return ` ${attach(numberToWords(denominator), "de")} ${attach(numberToWords(numerator), suffix)} `;
+}
+
+/** An e-mail or web address without its scheme, query and fragment: dots, slashes and dashes by name. */
+function speakAddress(address) {
+  address = address.replace(/^https?:\/\//, "").split(/[?#]/)[0].replace(/\/+$/, "");
+  const slash = address.indexOf("/");
+  const host = slash < 0 ? address : address.slice(0, slash), path = slash < 0 ? "" : address.slice(slash);
+  const at = host.lastIndexOf("@");
+  const domain = host.slice(at + 1).split(".").map((label) => ADDRESS_WORDS.get(label) ?? label).join(".");
+  return [...(host.slice(0, at + 1) + domain + path)].map((c) => ADDRESS_CHARS.get(c) ?? c).join("");
+}
+
+function verbaliseAddress(match, offset, string) {
+  let end = match.length; // the punctuation after it belongs to the sentence
+  while (end > 0 && TRAILING.includes(match[end - 1])) end--;
+  const tail = match.slice(end);
+  return ` ${speakAddress(match.slice(0, end))}${tail || glue(match, offset, string)}${tail ? " " : ""}`;
+}
+
 function expandAbbreviation(match, abbreviation, offset, string) {
   abbreviation = abbreviation.toLowerCase();
   const word = ABBREVIATIONS[abbreviation];
@@ -218,7 +324,14 @@ export const turkishLower = (text) => text.replaceAll("I", "ı").replaceAll("İ"
 /** Normalise raw Turkish text to the symbol alphabet (lower-case letters, space and ".,!?"). */
 export function normalize(text) {
   // drop combining marks left after NFC, e.g. the U+0307 in "i\u0307" that "İ".toLowerCase() produces
-  text = [...text.normalize("NFC")].filter((c) => !isCombining(c)).map((c) => CHAR_MAP[c] ?? c).join("");
+  text = [...text.normalize("NFC")].filter((c) => !isCombining(c)).join("");
+  text = text.replace(EMAIL, verbaliseAddress); // before "@" and "+" are mapped
+  text = text.replace(URL_, verbaliseAddress);
+  text = text.replace(TELEPHONE, "telefon ");
+  text = text.replace(PHONE, verbalisePhone);
+  text = [...text].map((c) => CHAR_MAP[c] ?? c).join("");
+  text = text.replace(DOTTED, spellDotted); // before the apostrophes: a suffix stays on the last letter's name
+  text = text.replace(AFTER_NAME_ABBREVIATION, (m, name, offset, string) => `${AFTER_NAME[name]}${stop(m, offset, string)}`);
   // an apostrophe between a letter/digit/unit and a letter starts a suffix (Anadolu'ya, 2021'de, $'a); others are
   // quote marks ('evet') and become spaces
   text = text.replace(/'/gu, (_, offset, input) =>
@@ -226,6 +339,7 @@ export function normalize(text) {
   text = text.replace(TITLE, (_, title) => `${TITLES[title]} `);
   text = text.replace(ABBREVIATION, expandAbbreviation);
   text = text.replace(re(`(?<![${W}])[Nn]o[.:]?[${S}]*(?=[${D}])`), "numara ");
+  text = text.replace(FRACTION, verbaliseFraction);
   text = text.replace(TIME, verbaliseTime); // before ":" becomes ","
   text = text.replace(/:/gu, (_, offset, input) =>
     ND.test(beforePoint(input, offset)) && ND.test(afterPoint(input, offset)) ? " " : ","); // 3:1 -> "üç bir"
@@ -237,6 +351,7 @@ export function normalize(text) {
   text = text.replace(re(`(${NUMBER})[${S}]*%`), " yüzde $1");
   text = text.replace(re(`(?<![${W}])[${UPPER}]{2,}(?![${W}])`), (m) => ACRONYMS[m] ?? m);
   text = text.replace(re(`(?<![${W}.,])-(?=[${D}])`), " eksi "); // a minus starts a word; 3-5 stays a range
+  text = text.replace(INITIALS, spellInitials);
   text = text.replace(ROMAN_ORDINAL, (_, roman) => ` ${ordinalToWords(romanToInt(roman))} `);
   text = text.replace(ORDINAL, (_, a, b) => ` ${ordinalToWords(toInt(a ?? b))} `);
   text = text.replace(re(NUMBER), verbaliseNumber);

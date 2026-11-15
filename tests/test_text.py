@@ -8,6 +8,7 @@ from drifting_tts.text import (
     normalize,
     number_to_words,
     ordinal_to_words,
+    split_sentences,
     text_to_ids,
 )
 
@@ -101,8 +102,8 @@ ROMAN = [
     ("I. Dünya Savaşı", "birinci dünya savaşı"),
     ("XIX. yüzyılda", "on dokuzuncu yüzyılda"),
     ("IV. Murat", "dördüncü murat"),
-    ("M. Kemal", "m. kemal"),  # initials are not Roman numerals
-    ("C. Ronaldo", "c. ronaldo"),
+    ("M. Kemal", "me kemal"),  # initials are not Roman numerals
+    ("C. Ronaldo", "ce ronaldo"),
     ("Bölüm IV", "bölüm ıv"),  # no dot, no ordinal
 ]
 
@@ -177,7 +178,63 @@ ACRONYMS = [
     ("IŞİD", "ışid"),
 ]
 
-CASES = BASIC + APOSTROPHES + TIMES + COMBINING_DOT + ORDINALS + ROMAN + SIGNS + UNITS + ABBREVIATIONS + ACRONYMS
+DOTS = [  # only a sentence end keeps its dot: dotted acronyms and initials are read by their letter names
+    ("T.C. Sağlık Bakanlığı açıkladı.", "te ce sağlık bakanlığı açıkladı."),
+    ("T.C.'nin kararı", "te cenin kararı"),
+    ("A.B.D. ve T.B.M.M.", "a be de ve te be me me."),
+    ("t.c. kimlik numarası", "te ce kimlik numarası"),
+    ("Yılmaz A.Ş.'nin hissesi", "yılmaz anonim şirketinin hissesi"),
+    ("Şirket A.Ş. Sonra kapandı.", "şirket anonim şirketi. sonra kapandı."),  # a sentence opener follows
+    ("Prof. Dr. A. Yılmaz konuştu.", "profesör doktor a yılmaz konuştu."),
+    ("A. O. Yılmaz geldi.", "a o yılmaz geldi."),
+    ("Yazar J. K. Rowling", "yazar je ka rowling"),
+    ("Plan B. Sonra gittik.", "plan b. sonra gittik."),  # not an initial
+    ("Sınıf 5-A. Ali geldi.", "sınıf beş a. ali geldi."),
+    ("V. Murat", "beşinci murat"),  # a lone I, V or X before a name stays a regnal number
+    ("merhaba. nasılsın.", "merhaba. nasılsın."),  # plain sentences keep their dots
+    ("Hz. Mevlana", "hazreti mevlana"),
+    ("Gül Sok. No: 5 Kadıköy", "gül sokak numara beş kadıköy"),
+    ("Atatürk Cad.'nde oturuyor.", "atatürk caddesinde oturuyor."),
+    ("Çınar Mah. Lale Sk. Güneş Apt. kat 2", "çınar mahallesi lale sokak güneş apartmanı kat iki"),
+    ("Yılmaz San. ve Tic. Ltd. Şti. kuruldu.", "yılmaz sanayi ve ticaret limited şirketi kuruldu."),
+    ("Adresi Gül Sok. Sonra taşındı.", "adresi gül sokak. sonra taşındı."),
+    ("Onu bul. Sonra gel.", "onu bul. sonra gel."),  # the abbreviations are capitalised
+    ("Hepatit B. Aşısı var.", "hepatit b. aşısı var."),  # a letter that names a thing, not an initial
+    ("Grup A. Türkiye lider.", "grup a. türkiye lider."),
+]
+
+PHONES = [  # group by group, a trunk zero is read
+    ("0532 123 45 67", "sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi"),
+    ("05321234567", "sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi"),
+    ("0532-123-45-67'yi ara.", "sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yediyi ara."),
+    ("+90 (212) 555 12 34", "artı doksan, iki yüz on iki, beş yüz elli beş, on iki, otuz dört"),
+    ("(0212) 505 02 04", "sıfır iki yüz on iki, beş yüz beş, sıfır iki, sıfır dört"),
+    ("Tel: 0 (532) 123 45 67.", "telefon sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi."),
+    ("532 123 45 67", "beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yedi"),
+    ("5321234567 kişi", "beş milyar üç yüz yirmi bir milyon iki yüz otuz dört bin beş yüz altmış yedi kişi"),
+    ("ince bir tel. 5 metre", "ince bir tel. beş metre"),
+]
+
+FRACTIONS = [  # the suffix is written for the numerator
+    ("Pastanın 3/4'ü bitti.", "pastanın dörtte üçü bitti."),
+    ("1/2", "ikide bir"),
+    ("2/3'si", "üçte ikisi"),
+    ("1/100'ü", "yüzde biri"),
+    ("5/3", "beş üç"),  # not a fraction
+    ("No: 3/5", "numara üç beş"),
+    ("3/4/2021", "üç dört iki bin yirmi bir"),
+]
+
+ADDRESSES = [
+    ("Bana ali.veli@example.com adresinden yaz.", "bana ali nokta veli et example nokta kom adresinden yaz."),
+    ("https://www.example.com.tr/hakkinda?x=1.", "ve ve ve nokta example nokta kom nokta te re bölü hakkinda."),
+    ("example.com'a gir.", "example nokta koma gir."),
+    ("Siteye (www.trt.net.tr) gir!", "siteye ve ve ve nokta trt nokta net nokta te re gir!"),
+    ("bitti.Sonra geldi", "bitti. sonra geldi"),  # a missing space is not an address
+]
+
+CASES = (BASIC + APOSTROPHES + TIMES + COMBINING_DOT + ORDINALS + ROMAN + SIGNS + UNITS + ABBREVIATIONS + ACRONYMS
+         + DOTS + PHONES + FRACTIONS + ADDRESSES)
 
 
 @pytest.mark.parametrize("raw, norm", CASES)
@@ -190,6 +247,24 @@ def test_normalize_is_idempotent_and_in_vocabulary(raw):
     norm = normalize(raw)
     assert set(norm) <= set(SYMBOL_TO_ID)
     assert normalize(norm) == norm
+
+
+@pytest.mark.parametrize(
+    "raw, sentences",
+    [
+        ("T.C. Sağlık Bakanlığı açıkladı. Prof. Dr. A. Yılmaz konuştu.",
+         ["te ce sağlık bakanlığı açıkladı.", "profesör doktor a yılmaz konuştu."]),
+        ("M. Kemal Atatürk 1881'de doğdu. 1. Dünya Savaşı'nda savaştı!",
+         ["me kemal atatürk bin sekiz yüz seksen birde doğdu.", "birinci dünya savaşında savaştı!"]),
+        ("merhaba. nasılsın? iyiyim.", ["merhaba.", "nasılsın?", "iyiyim."]),
+        ("Plan B. Sonra gittik.", ["plan b.", "sonra gittik."]),
+        ("Beni 0532 123 45 67'den ara. Ya da ali@example.com'a yaz.",
+         ["beni sıfır beş yüz otuz iki, yüz yirmi üç, kırk beş, altmış yediden ara.",
+          "ya da ali et example nokta koma yaz."]),
+    ],
+)
+def test_split_sentences(raw, sentences):  # abbreviations, initials and addresses do not break a sentence
+    assert split_sentences(normalize(raw)) == sentences
 
 
 def test_symbols_are_frozen():  # checkpoints and prepared indices store these ids
