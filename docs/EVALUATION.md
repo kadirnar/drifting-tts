@@ -9,6 +9,11 @@
 | naturalness | **UTMOSv2** (`--mos utmos22` as an alternative) | Trained on English: compare against the vocoded recordings, not as an absolute MOS. `--mos-repetitions N` averages N random crops per sentence. |
 | spectral detail | `--harmonic`: harmonic contrast, global variance and level per band vs. the recordings | Uses the ground-truth alignment and pitch, with no vocoder or judges. Takes seconds. |
 
+- **A panel instead of one MOS predictor** (`scripts/judge_panel.py`, `pip install -e ".[eval,panel]"`): UTMOSv2,
+  UTMOS22, SCOREQ, NISQA, DNSMOS, SQUIM and Audiobox Aesthetics on folders of wavs with the same file names, every
+  system against a baseline sentence by sentence. On the English model UTMOSv2 sees 0.36 between the recordings and
+  the model through an unadapted vocoder, UTMOS22 0.75 and SCOREQ 0.67
+  ([HEAD_REALISM.md](HEAD_REALISM.md#a-panel-of-judges-where-the-audible-gap-is)).
 - **Intervals and reproducibility:** every metric comes with a 95% bootstrap interval over sentences.
   Sentence *i* always uses seed *i*, and per-sentence results go to `utterances_*.jsonl`.
 - **Rows:** `--temperature` and `--cfg` take several values, and `evaluate` writes one row for each

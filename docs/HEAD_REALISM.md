@@ -14,6 +14,7 @@ recordings.
 - [The mechanism: one positive, unequal directions](#the-mechanism-one-positive-unequal-directions)
 - [Fine-tuning the head alone](#fine-tuning-the-head-alone)
 - [What is not settled](#what-is-not-settled)
+- [A panel of judges: where the audible gap is](#a-panel-of-judges-where-the-audible-gap-is)
 - [Commands](#commands)
 
 ## Setup
@@ -226,6 +227,52 @@ copy-synthesis 3.294. WER stays at 2.1–2.6% for every head.)
   short, and the whitening scale was measured once. `train-ar` is unchanged.
 - **English only**: the Turkish corpus was not available on this machine.
 
+## A panel of judges: where the audible gap is
+
+Listening to the two fine-tuned heads against the released one (blind A/B, 14 pairs each): hard to tell apart. So
+the question went to seven published predictors that were trained on different data for different questions
+(`scripts/judge_panel.py`): UTMOSv2, UTMOS22, SCOREQ (synthetic-speech domain), NISQA, DNSMOS P.835, SQUIM and
+Audiobox Aesthetics. The 100 val sentences, the same speaker and seed for every system, each system compared with the
+released head sentence by sentence (`*`: the 95% interval of the difference excludes 0).
+
+| system | UTMOSv2 | UTMOS22 | SCOREQ | NISQA | DNSMOS OVRL | SQUIM | Audiobox PQ |
+|---|---|---|---|---|---|---|---|
+| recording | 3.27 | 4.20 | 4.28 | 4.63 | 3.29 | 4.33 | 7.49 |
+| recording's mel through NVIDIA's BigVGAN-v2 | 3.31 | 4.16 | 4.24 | 4.63 | 3.30 | 4.30 | 7.42 |
+| recording's mel through the released, fine-tuned BigVGAN-v2 | 3.33 | 4.12 | 4.23 | 4.66 | 3.31 | 4.30 | 7.53 |
+| **released head, NVIDIA's BigVGAN-v2, T 0.5** (the baseline) | 2.91 | 3.45 | 3.61 | 4.46 | 3.12 | 4.17 | 6.95 |
+| energy-score head | 2.84* | 3.40 | 3.56* | 4.47 | 3.08* | 4.21* | 6.86* |
+| energy-score head with MAE maps | 2.87 | 3.43 | 3.58 | 4.45 | 3.10 | 4.20 | 6.90* |
+| released head, the recording's durations | 2.80* | 3.36* | 3.52* | 4.45 | 3.12 | 4.13 | 6.90 |
+| released head, T 0 | 2.96 | 3.63* | 3.81* | 4.52 | 3.21* | 4.16 | 7.12* |
+| released head, T 0.3 | 2.96 | 3.55* | 3.73* | 4.51* | 3.16* | 4.15 | 7.05* |
+| released head, T 0.7 | 2.81* | 3.30* | 3.43* | 4.36* | 3.05* | 4.16 | 6.78* |
+| released head, T 1.0 | 2.64* | 2.98* | 3.04* | 4.21* | 2.88* | 4.16 | 6.37* |
+| **released head, the released fine-tuned BigVGAN-v2, T 0.5** | **3.38*** | **4.13*** | **4.25*** | **4.63*** | **3.29*** | **4.32*** | **7.51*** |
+
+- **The panel hears what UTMOSv2 alone barely hears.** Through a vocoder that has never seen the model's mels the
+  model is 0.75 below its recordings on UTMOS22, 0.67 on SCOREQ and 0.55 on Audiobox PQ; all seven judges agree.
+  Copy-synthesis is at the recordings' level, so the mel front end and the vocoder are not the limit: the generated
+  mel is.
+- **The fine-tuned heads are not better.** The energy-score head is lower on four judges, higher on one; with the MAE
+  maps the differences are within their intervals except Audiobox (−0.05). Calibrating the spread of the head moved
+  the distribution tests above, and nothing a judge hears.
+- **The head's noise is heard as damage.** Every judge but SQUIM falls from T 0 to T 1, UTMOS22 by 0.65. T 0.3 and
+  T 0 score above the operating point of 0.5 through this vocoder.
+- **The recording's own durations do not help**: they score slightly lower than the predicted ones. The judges do
+  not find the rhythm lacking.
+- **The vocoder fine-tuned on the model's own mels closes the whole gap.** With it the released model is at the
+  recordings' level on all seven judges (UTMOS22 4.13 against 4.20, SCOREQ 4.25 / 4.28, Audiobox PQ 7.51 / 7.49):
+  +0.68, +0.64 and +0.56 over NVIDIA's generator on the same mels. Nothing tried on the acoustic model comes near.
+- **With that vocoder nothing else moves the judges.** Against the released system (released head, fine-tuned
+  vocoder, T 0.5): the recordings are higher on UTMOS22 (+0.07) and lower on UTMOSv2 (−0.11), the other five within
+  their intervals; T 0 and T 0.3 are the same as T 0.5 (T 0: SCOREQ +0.03), T 0.7 is lower on two judges and T 1 on
+  five; the energy-score head with MAE maps is higher on four of seven, none significantly (Audiobox PQ −0.01).
+- **What it means for the Turkish model.** Its vocoder (Vocos v2) was fine-tuned on another model's mels and has
+  never seen ARDrift's (#89). `configs/vocoder_bigvgan_tr_gta.yaml` is the English recipe for it; it has not been
+  run (the Turkish corpus was not available here), and UTMOSv2, the only judge the Turkish tables use, is the least
+  sensitive of the seven to this gap (0.36 where UTMOS22 sees 0.75).
+
 ## Commands
 
 ```bash
@@ -253,6 +300,11 @@ python scripts/c2st_mel.py --model ardrift_en.pt --head runs/head_energy_mae/hea
 # a blind A/B page from two folders of wavs with the same file names; then the saved answers
 python scripts/listening_test.py --a wavs/released --b wavs/energy --name-a released --name-b energy --out ab.html
 python scripts/listening_test.py --score listening_answers.json
+# seven judges on folders of wavs with the same file names, each system against the baseline sentence by sentence
+python scripts/judge_panel.py --systems recording=wav/recording released=wav/released new=wav/new \
+    --baseline released --out outputs/panel                    # pip install -e ".[eval,panel]"
+# the Turkish vocoder on ARDrift's own mels (#89), then the panel on its snapshots
+drifting-tts finetune-vocoder --config configs/vocoder_bigvgan_tr_gta.yaml --workdir runs/tr_bigvgan_gta
 # audio-level prosody of recording / copy-synthesis / recording's durations / predicted durations
 python scripts/prosody_gap.py --model ardrift_en.pt --vocoder bigvgan_en.pt --data data/en_val --num 60 \
     --temperatures 0.5 1.0 --seeds 2 --out outputs/prosody_gap

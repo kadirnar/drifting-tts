@@ -1,0 +1,33 @@
+# Issue #89: BigVGAN-v2 fine-tuned on the Turkish ARDrift model's own mels (GTA), the counterpart of
+# vocoder_bigvgan_en_gta.yaml. The Turkish ARDrift decodes with Vocos v2, which was fine-tuned on another model's
+# mels (the DiT v3.1) and never saw ARDrift's or the podcast voices'.
+# Why (docs/HEAD_REALISM.md, the judge panel on the English model, 100 held-out sentences, seven judges): through
+# NVIDIA's released generator the model is far below its recordings (UTMOS22 3.45 against 4.20, SCOREQ 3.61 / 4.28,
+# Audiobox PQ 6.95 / 7.49); through the generator fine-tuned on its own mels it is at their level on every judge
+# (4.13, 4.25, 7.51). No change to the acoustic model moved the judges as much.
+# Not run yet: the Turkish corpus was not available where this was written. Score the snapshots with
+# scripts/judge_panel.py (recording, copy-synthesis, Vocos v2, each snapshot) before choosing one.
+base: vocoder_bigvgan.yaml
+
+data:
+  root: data/tr12_eleven_podfa   # every voice ARDrift speaks: tr-dataset-12, the studio voice, the six podcast
+                                 # voices re-cut at their words (the restored corpus of #71 if that model is used)
+  min_quality: 0
+  filters:                       # the filters of the model's own training (configs/ar_tts_ft.yaml)
+    min_mos: 3.0
+    min_spk_sim: 0.5
+    rate: [8, 20]
+    min_bandwidth: 10000
+    max_cer: 0.15
+
+tts:
+  path: runs/ar_voices_fa/model_ema.pt   # the Turkish ARDrift whose mels the vocoder will decode
+
+train:
+  steps: 40000             # the English run: 40k steps, 5.4 h on an RTX 5090; UTMOSv2 rose until the last snapshot
+  gta_cfg: 1.0             # an autoregressive model's GTA mels are drawn without guidance
+  gta_temperature: 0.5     # the temperature the model is used at
+  keep_snapshots: true     # bigvgan_ft_<step>.pt: each snapshot is scored
+  speaker_balance:         # the studio voice is ~39% of the corpus's draws, the male and female voices under 1%
+    shares: {722: 0.20, 389: 0.08, 323: 0.06, 723: 0.06, 724: 0.06, 725: 0.06, 726: 0.06, 727: 0.06, 728: 0.06}
+    temperature: 0.5       # the other speakers split the remaining 30% in proportion to (their audio) ** 0.5
