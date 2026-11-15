@@ -92,7 +92,7 @@ def stress_token(r: random.Random) -> str:
     def scale() -> str:
         return r.choice(["bin", "milyon", "milyar", "trilyon"])
 
-    kind = r.randrange(25)
+    kind = r.randrange(30)
     if kind == 0:
         return num(r.choice([3, 7, 16, 22]))
     if kind == 1:  # decimals with leading / trailing zeros, "," or "."
@@ -180,6 +180,39 @@ def stress_token(r: random.Random) -> str:
                          f"vb.{ws}Sonra", f"vs.{ws}", f"{n}:{n}", f"{n}{ws}bin{ws}TL", f"saat{ws}{n}:{n}", f"-{n}",
                          f"{ws}{n}{ws}", "x²'de", "Ⅻ'de", "5 TL'²", "5 kg'½", "5 m'ǅ", f"{n}'ǅa", "5 TL'²e",
                          "5 m'½i", "$'²e", "€'Ⅻü", f"{n} kg'³ye"])
+    if kind == 24:  # phone numbers: country code, trunk zero, brackets, separators, near misses
+        d = lambda n: "".join(r.choice("0123456789") for _ in range(n))
+        sep = lambda: r.choice([" ", " ", "-", "", "  ", ".", "\u00a0"])
+        area = r.choice([d(3), f"({d(3)})", f"5{d(2)}", f"(0{d(3)})", f"({d(2)})"])
+        head = r.choice(["0", "0 ", "+90", "+90 ", "0090", "0090-", "", "", "90 ", "+", "+1 ", "(", "00"])
+        number = f"{head}{area}{sep()}{d(3)}{sep()}{d(2)}{sep()}{d(r.choice([2, 2, 2, 3]))}"
+        return r.choice(["", "", "Tel: ", "Tel. ", "tel: ", "tel. ", "TEL: ", "x", "5", "1,", "-"]) + number + r.choice(
+            ["", "", suffix(1), "'", "’yi", ".", ",5", "5", " 5", ")"])
+    if kind == 25:  # fractions, door numbers, dates
+        a = r.choice([num(1), num(2), "١", "𝟑", "0", "1", "2", "3"])
+        b = r.choice([num(1), num(2), "100", "10", "4", "٤"])
+        return r.choice(["", "", "No: ", "No ", "numara ", "x", "-", "1,", "("]) + f"{a}/{b}" + r.choice(
+            ["", suffix(1), "'ü", "'si", "/2021", "x", ",5", ".", "'²", " km", "'"])
+    if kind == 26:  # dotted letter sequences and initials
+        letter = lambda: r.choice("ABCÇDEFGĞHIİJKLMNOÖPQRSŞTUÜVWXYZabcçığiöşüqwx")
+        seq = "".join(letter() + r.choice([".", ".", ".", ". ", ".  ", ""]) for _ in range(r.randint(1, 4)))
+        seq = r.choice([seq, seq, "T.C.", "A.Ş.", "A.B.D.", "t.c.", "a.ş.", "A.Ş", "T.C", seq.upper()])
+        nxt = r.choice([r.choice(WORDS), r.choice(OPENERS), "", "Sağlık", "5", "'nin", "’de", ".", "Ş.", "Sonralar"])
+        lead = r.choice(["", "", "x", ".", "-", "'", "5", "Grup ", "HEPATİT  ", "Plan\n", "ŞIK ", "xplan ", "Kapı"])
+        return lead + seq + r.choice([" ", " ", "", "  ", "\n"]) + nxt
+    if kind == 27:  # e-mail and web addresses, missing spaces after a full stop
+        host = r.choice(["example", "trt", "x-y", "a.b", "Ali", "şirket", "www", "abc123", "5", "com"])
+        end = r.choice(["com", "com.tr", "net", "org", "tr", "io", "info", "de", "Sonra", "COM", "comm", "html"])
+        url = r.choice(["", "", "www.", "https://", "http://www.", "https://www.", "ali@", "ali.veli+x@", "@", "x_y%@"])
+        url += f"{host}.{end}" + r.choice(["", "", "/", "/a-b_c/d.html", "/x?y=1&z=2#t", ":8080/x", "/ş", "//"])
+        return r.choice(["", "", "(", "x", ".", "/", "@", "-"]) + url + r.choice(
+            ["", "", ".", ",", ")", "'a", "’dan", "!", "?", "...", ").", "'"])
+    if kind == 28:  # abbreviations after a name
+        abbr = r.choice(["Mah", "Cad", "Sok", "Sk", "Apt", "Bul", "Blv", "Ltd", "Şti", "Tic", "San", "Hz", "sok", "SOK",
+                         "Cadx"])
+        lead = r.choice(["Gül ", "Gül ", "", "x. ", "5 ", "Gül  ", "ve "])
+        nxt = r.choice([r.choice(WORDS), r.choice(OPENERS), "", "No: 5", "Şti."])
+        return lead + abbr + r.choice([".", ".", ".'nde", "", ":"]) + r.choice([" ", " ", "", "  "]) + nxt
     return r.choice(WORDS).upper() + suffix(0.3)
 
 
