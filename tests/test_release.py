@@ -86,6 +86,12 @@ def _synth(tmp_path, **kw) -> Synthesizer:
     return synth
 
 
+def test_mel_vocoders_make_24_khz_audio(tmp_path):
+    assert _synth(tmp_path).sample_rate == _synth(tmp_path, sample_rate=None).sample_rate == 24_000
+    with pytest.raises(ValueError, match="24000 Hz audio, not 48000"):
+        _synth(tmp_path, sample_rate=48_000)
+
+
 def test_synthesizer_pause_option(tmp_path):
     synth = _synth(tmp_path, pause="punct")
     mels = synth.mels(TEXT, speaker=0)

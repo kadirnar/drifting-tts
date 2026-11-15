@@ -486,7 +486,7 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float | Non
             batches.append(WindowedMel(generate, z, cond, spk, alpha, labels, lens, chunking, head))
         for row, (i, t) in enumerate(zip(need, lens)):
             r = reqs[i]
-            gap = silence(pause, r["sentences"][r["k"] - 1], r["rng"]) if r["k"] else None
+            gap = silence(pause, r["sentences"][r["k"] - 1], r["rng"], synth.sample_rate) if r["k"] else None
             r["windows"].extend((len(batches) - 1, row, *w, k == 0)
                                 for k, w in enumerate(stream_windows(t, first, chunk, voc.context)))
             r["gap"], r["k"] = gap, r["k"] + 1

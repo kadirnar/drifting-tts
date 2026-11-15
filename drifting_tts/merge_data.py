@@ -16,7 +16,8 @@ import shutil
 from pathlib import Path
 
 # binary -> (index key of its offset, bytes per unit); mels and F0 share the frame offset, audio has its own
-BINARIES = {"mels.bin": ("offset", 200), "f0.bin": ("offset", 2), "audio.bin": ("audio_offset", 2)}
+BINARIES = {"mels.bin": ("offset", 200), "f0.bin": ("offset", 2), "audio.bin": ("audio_offset", 2),
+            "audio_hr.bin": ("hr_offset", 2)}  # prepare --hires-rate: kept when every input has it at one rate
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -42,12 +43,17 @@ def run(args) -> None:
             speakers.setdefault(name, len(speakers))
 
     files = [f for f in BINARIES if all((r / f).exists() for r in roots)]
-    base = {"offset": 0, "audio_offset": 0}  # frames / samples already written
+    if "audio_hr.bin" in files and len({s.get("hr_rate") for s in stats}) != 1:
+        files.remove("audio_hr.bin")
+    hires = "audio_hr.bin" in files
+    base = {"offset": 0, "audio_offset": 0, "hr_offset": 0}  # frames / samples already written
     with open(out / "index.jsonl", "w") as index:
         for r, n in zip(roots, repeat):
             entries = [json.loads(line) for line in open(r / "index.jsonl")]
             for e in entries:
                 e["spk_id"] = speakers[e["speaker"]]
+                if not hires:  # no merged audio_hr.bin: its offsets would point nowhere
+                    e.pop("hr_offset", None), e.pop("hr_samples", None)
                 for key, start in base.items():
                     if key in e:
                         e[key] += start
@@ -61,6 +67,8 @@ def run(args) -> None:
                 base[BINARIES[f][0]] = (out / f).stat().st_size // BINARIES[f][1]
     (out / "speakers.json").write_text(json.dumps(speakers, ensure_ascii=False, indent=0))
     merged = {**stats[0], "merged_from": [str(r) for r in roots], "repeat": repeat}
+    if not hires:
+        merged.pop("hr_rate", None)
     (out / "stats.json").write_text(json.dumps(merged, indent=1))
     if (roots[0] / "scores.jsonl").exists():  # line numbers of the base dataset are unchanged
         shutil.copy(roots[0] / "scores.jsonl", out / "scores.jsonl")

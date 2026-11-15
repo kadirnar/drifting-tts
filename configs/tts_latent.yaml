@@ -16,3 +16,4 @@ model:
 drift:
   spectral_detail: false   # harmonic-contrast features are defined on mel bins, not on latent channels
   crop_frames: 256         # 2.56 s at 100 frames per second (64 latent frames)
+  crop_grid: null          # crops start on whole VAE frames (null: the data's latent_repeat; 1: on any frame)

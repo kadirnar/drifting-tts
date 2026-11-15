@@ -64,6 +64,42 @@ for piece in stream_decode(be, z, first=8, chunk=64, context=16):
   | bucket | 0 | 1 | 2 | 3 |
   | output bandwidth | 8.6 kHz | 11.0 kHz | 14.7 kHz | 15.0 kHz |
 
+## The audio path (#94)
+
+What happens to the audio before and after any model. The tables of this document were measured before these
+changes; none has been re-measured.
+
+- **One sharp resampler.** `drifting_tts.audio.resample` (Kaiser-windowed sinc, 64 zero crossings, flat to
+  11.5 kHz between 24 and 48 kHz) is the resampler of `prepare`, of the codecs' inputs and outputs and of `restore`.
+  torchaudio's default, used before, loses about 1.7 dB at 10.5 kHz in each direction and leaves the image of a
+  10.5 kHz tone 15 dB below it when upsampling to 48 kHz (now below −80 dB). The judges keep the default filter, so their
+  numbers stay comparable.
+- **A 48 kHz encoder gets 48 kHz audio.** `prepare --save-audio --hires-rate 48000` also stores the waveforms at
+  that rate, resampled from the source (`audio_hr.bin`; `hr_offset` / `hr_samples` in the index, `hr_rate` in
+  `stats.json`). `extract-latents` gives them to an encoder whose input rate is above 24 kHz (`dacvae`,
+  `voxcpm1.5`); from parquet files it prepares the waveforms at the encoder's rate. `--audio-rate 24000` keeps the
+  band-limited input of the earlier roots. `stats.json` of the latent root records `audio_rate`. The 24 kHz
+  `audio.bin` stays what decoder fine-tuning and the judges read.
+- **The codec's rate at the output.** `Synthesizer(..., sample_rate=None)` (`synthesize --sample-rate 0`) returns
+  the decoder's own rate (`synth.sample_rate`: 48 kHz for DAC-VAE and VoxCPM2) instead of resampling to 24 kHz.
+  The fine-tuned decoders were trained on 24 kHz losses, so the default stays 24 kHz.
+- **Fine-tuned decoders keep their filter.** `finetune-vocoder` puts the resampler inside the training graph, so a
+  decoder fine-tuned before #94 learned to make up for the old filter's roll-off. `decoder_ft.pt` now records the
+  filter (`resample: sharp`); a checkpoint without the key is resampled with the old one, so the published
+  decoders sound as they did.
+- **Crops on the frame grid.** Every VAE frame is stored four times, the generator's patch is 4 and decoding
+  averages groups of four from the first frame. Drift crops started on any frame, so three in four cut through VAE
+  frames. They now start on a multiple of `latent_repeat` (`drift.crop_grid`: `null` the data's `latent_repeat`,
+  `1` any frame, for an A/B); the MAE's crops too. Whether this is behind the over-smooth latents (frame-change
+  ratio 0.6) is not measured: `scripts/codec_gate.py --model` reports the spread of the four copies in a model's
+  output.
+- **No dropped tail.** `LatentVocoder` decodes a last group of fewer than four frames as one VAE frame, cut to its
+  share, instead of dropping up to three frames (30 ms; 60 ms for Mimi at 50 Hz).
+- **Batched extraction pads like the encoder.** DAC-VAE reflect-pads an utterance to whole frames. The batched
+  parquet path zero-padded instead; it now makes the reflection per row. Rows of one frame count are then encoded
+  exactly as alone. What follows a shorter row is still zeros where the encoder alone would pad its features, so
+  its last frames within the receptive field can differ.
+
 ## Resynthesis benchmark
 
 ```bash
@@ -71,7 +107,8 @@ python scripts/resynthesis_benchmark.py --data data/train --vocoder runs/vocoder
 ```
 
 - **Audio:** 100 held-out recordings (the first 100 of the `val` split). `prepare` stores audio at 24 kHz, so the
-  44.1 / 48 kHz encoders see audio band-limited to 12 kHz, and VoxCPM2's encoder downsamples it to 16 kHz.
+  44.1 / 48 kHz encoders see audio band-limited to 12 kHz, and VoxCPM2's encoder downsamples it to 16 kHz. The
+  [codec gate](#codec-gate-91) adds the round trip from 48 kHz recordings.
 - **Rows:** the recording itself; BigVGAN-v2 (our fine-tuned `bigvgan_ft.pt`) on the recording's mel; each VAE,
   encoding the posterior mean and decoding it at its own output rate.
 - **Intelligibility:** Whisper large-v3 (`score.AsrScorer`, Turkish, beam 5) against the transcripts, with the
@@ -255,7 +292,8 @@ Open directions:
 drifting-tts extract-latents --data data/train --backend voxcpm2 --out data/train_voxcpm2   # --repeat 4
 drifting-tts train-mae --config configs/mae_latent.yaml --workdir runs/mae_voxcpm2 data.root=data/train_voxcpm2
 drifting-tts train --config configs/tts_latent.yaml --workdir runs/tts_voxcpm2 train.steps=10000
-# DAC-VAE: --backend dacvae, and model.n_mels=128 for the MAE
+# DAC-VAE: --backend dacvae, and model.n_mels=128 for the MAE; `prepare --save-audio --hires-rate 48000` first,
+# so that its 48 kHz encoder gets the full band
 ```
 
 ## Fine-tuning the VoxCPM2 decoder on generated latents (#27)

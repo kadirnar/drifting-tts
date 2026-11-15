@@ -172,7 +172,8 @@ def test_export_and_load(tiny_backend, tmp_path):
                 p.mul_(1.5)
     gan.export(tmp_path / "decoder_ft.pt", step=7)
     ck = load_decoder_checkpoint(tmp_path / "decoder_ft.pt")  # weights_only=True
-    assert set(ck) == {"decoder", "backend", "target_rate", "sample_rate", "step"}
+    assert set(ck) == {"decoder", "backend", "target_rate", "sample_rate", "resample", "step"}
+    assert ck["resample"] == "sharp"  # the filter of the training graph: LatentVocoder then uses it too
     assert ck["backend"] == "dacvae" and ck["target_rate"] == 48000 and ck["sample_rate"] == 24000
     assert ck["step"] == 7
     assert not any("parametrizations" in k or k.endswith(("weight_g", "weight_v")) for k in ck["decoder"])

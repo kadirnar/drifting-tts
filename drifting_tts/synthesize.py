@@ -103,6 +103,9 @@ def add_vocoder_args(p: argparse.ArgumentParser, default: str | None = None) -> 
                         "revox[:<F0 source>[:dio|harvest]] is Minori Live - Revox Vocoder 1.0 "
                         "(https://huggingface.co/minori-live/revox-vocoder-1), CC BY-NC-SA 4.0: non-commercial use "
                         f"only; default: {default or stock}")
+    p.add_argument("--sample-rate", type=int, default=SAMPLE_RATE,
+                   help="rate of the audio; 0: the codec's own (48 kHz) for a model trained on DAC-VAE / VoxCPM "
+                        "latents (default: 24000)")
     p.add_argument("--cuda-kernel", action="store_true",
                    help="BigVGAN: fused anti-aliased activation CUDA kernel (~3x faster vocoder, built with nvcc)")
 
@@ -136,10 +139,11 @@ def resolve_pause(pause: Pause, speaker_id: int, edge: float | None = None,
     return PausePolicy.for_voice(speaker_id, jitter=float(jitter or 0.0), edge=edge, context=context)
 
 
-def silence(pause: float | Callable[[str, random.Random], float], sentence: str, rng: random.Random) -> torch.Tensor:
+def silence(pause: float | Callable[[str, random.Random], float], sentence: str, rng: random.Random,
+            sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     """The silence after ``sentence``: ``pause`` seconds, or what a pause policy picks for it (e.g.
     :class:`drifting_tts.prosody.PausePolicy`, by its final punctuation)."""
-    return torch.zeros(int((pause(sentence, rng) if callable(pause) else pause) * SAMPLE_RATE))
+    return torch.zeros(int((pause(sentence, rng) if callable(pause) else pause) * sample_rate))
 
 
 def preferred_temperature(model) -> float:
@@ -197,7 +201,8 @@ class Synthesizer:
                  prosody_spread: float = 1.0, prosody_durations: str = "sampled", pause: Pause = 0.15,
                  prosody_duration_temperature: float | None = None, prosody_pitch: str | Path | None = None,
                  paragraph: bool | int | None = None, context: bool = False, temperature: float | None = None,
-                 cfg_scale: float | None = None, acoustic_context: bool | int | None = None):
+                 cfg_scale: float | None = None, acoustic_context: bool | int | None = None,
+                 sample_rate: int | None = SAMPLE_RATE):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
         checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
         latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
@@ -222,6 +227,10 @@ class Synthesizer:
         ``acoustic_context`` (ARDrift): a unit after the first continues from the last frames generated before it
         (:class:`AcousticContext`), instead of starting from silence: ``None`` / ``True``
         :data:`AR_CONTEXT_FRAMES` frames, a number that many, ``False`` / 0 none. The DiT has none.
+        ``sample_rate``: the rate of the audio (``self.sample_rate``). A model trained on VAE latents can return its
+        decoder's own rate with ``None`` (48 kHz for DAC-VAE and VoxCPM2) instead of that output resampled to
+        24 kHz. The decoders fine-tuned by ``finetune-vocoder`` were trained on 24 kHz losses and are meant for the
+        default; the mel vocoders are 24 kHz.
         ``context``: each sentence (unit) is conditioned on the text before it: the end of the previous one, whole
         words, up to :data:`CONTEXT_CHARS` characters with the current one, runs through the text encoder and the
         prosody predictor with it, and only the current one is generated (:meth:`DriftingTTS.synthesize`).
@@ -241,9 +250,14 @@ class Synthesizer:
             if vocoder is not None and not Path(vocoder).is_file():
                 raise ValueError(f"a model trained on {self.backend} latents decodes them with its VAE decoder: "
                                  f"vocoder must be a fine-tuned decoder checkpoint (decoder_ft.pt), not {vocoder!r}")
-            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1), decoder=vocoder)
+            self.vocoder = LatentVocoder(self.backend, device, repeat=stats.get("latent_repeat", 1), decoder=vocoder,
+                                         sample_rate=sample_rate)
+            self.sample_rate = self.vocoder.sample_rate
         else:
+            if sample_rate not in (None, SAMPLE_RATE):
+                raise ValueError(f"the {self.backend} vocoders make {SAMPLE_RATE} Hz audio, not {sample_rate} Hz")
             self.vocoder = load_vocoder(vocoder, device, cuda_kernel=cuda_kernel, backend=self.backend)
+            self.sample_rate = SAMPLE_RATE
         if self.vocoder.mel != self.backend:
             raise ValueError(f"vocoder {self.vocoder.name!r} expects {self.vocoder.mel} mels, but the model produces "
                              f"{self.backend} mels")
@@ -660,9 +674,9 @@ class Synthesizer:
                  steps: int | None = None, prosody_temperature: float | None = None,
                  paragraph: bool | int | None = None, context: bool | None = None,
                  acoustic_context: bool | int | None = None) -> tuple[torch.Tensor, dict]:
-        """``text`` -> waveform (CPU float tensor at 24 kHz) and timings. Sentence by sentence (or ``paragraph`` by
-        paragraph, :meth:`units`), each in one pass and vocoded whole, joined by ``pause`` (default: the
-        Synthesizer's; seconds, a callable or ``"punct"``). ``cfg_scale`` / ``temperature``: default the
+        """``text`` -> waveform (CPU float tensor at ``self.sample_rate``) and timings. Sentence by sentence (or
+        ``paragraph`` by paragraph, :meth:`units`), each in one pass and vocoded whole, joined by ``pause`` (default:
+        the Synthesizer's; seconds, a callable or ``"punct"``). ``cfg_scale`` / ``temperature``: default the
         Synthesizer's operating point (:meth:`operating_point`: the checkpoint's or the release's, not 1 / 1).
         ``prosody_temperature``: this call's noise temperature of the prosody predictor (default: the
         Synthesizer's); ``context`` / ``acoustic_context``: see :class:`Synthesizer`."""
@@ -685,9 +699,9 @@ class Synthesizer:
             self._sync()
             t_acoustic += t1 - t0
             t_vocoder += time.perf_counter() - t1
-            wavs += [wav, silence(pause, sentence, rng)]
+            wavs += [wav, silence(pause, sentence, rng, self.sample_rate)]
         wav = torch.cat(wavs[:-1]) if wavs else torch.zeros(0)
-        dur = max(wav.numel() / SAMPLE_RATE, 1e-6)
+        dur = max(wav.numel() / self.sample_rate, 1e-6)
         return wav, {"seconds": dur, "rtf_acoustic": t_acoustic / dur, "rtf_total": (t_acoustic + t_vocoder) / dur}
 
     @torch.no_grad()
@@ -697,8 +711,8 @@ class Synthesizer:
                prosody_temperature: float | None = None, chunked: Chunking | bool | None = None,
                paragraph: bool | int | None = None, context: bool | None = None,
                acoustic_context: bool | int | None = None) -> Iterator[torch.Tensor]:
-        """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz); the operating point
-        and the options are those of :meth:`__call__`.
+        """Yield the waveform in pieces as soon as each is ready (CPU float tensors at ``self.sample_rate``); the
+        operating point and the options are those of :meth:`__call__`.
 
         Each sentence (each unit, :meth:`units`) is generated in one pass. The vocoder then streams: the first
         ``first`` mel frames (0.34 s), then ``chunk``-frame windows, each with the vocoder's ``context`` (32 frames
@@ -731,7 +745,7 @@ class Synthesizer:
                                                    prosody_temperature=prosody_temperature, rhythm=rhythm,
                                                    previous=prev))
             if previous is not None:
-                yield silence(pause, previous, rng)
+                yield silence(pause, previous, rng, self.sample_rate)
             previous = sentence
             for piece in stream_vocoder(self.vocoder, mel, first=first, chunk=chunk, context=self.vocoder.context,
                                         graphs=self.vocoder_graphs):
@@ -765,7 +779,7 @@ class Synthesizer:
             t = cond.shape[-1]
             pc, pm = (None, None) if history is None else history.prefix(t)
             if previous is not None:
-                yield silence(pause, previous, rng)
+                yield silence(pause, previous, rng, self.sample_rate)
             previous = sentence
             if not gen.fits(t, 0 if pc is None else pc.shape[-1]):  # longer than the caches: whole sentence
                 mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc)
@@ -821,7 +835,7 @@ class Synthesizer:
             t = cond.shape[-1]
             wm = WindowedMel(generate, z, cond, spk, alpha, labels, [t], chunking, first + (ctx or 0))
             if previous is not None:
-                yield silence(pause, previous, rng)
+                yield silence(pause, previous, rng, self.sample_rate)
             previous = sentence
             for a, b, start, n in stream_windows(t, first, chunking.chunk, ctx):
                 while wm.committed[0] < b:
@@ -873,7 +887,8 @@ def run(args) -> None:
     synth = Synthesizer(device=args.device, cuda_kernel=args.cuda_kernel, prosody_temperature=args.prosody_temperature,
                         prosody_spread=args.prosody_spread,
                         prosody_duration_temperature=args.prosody_duration_temperature,
-                        prosody_pitch=args.prosody_pitch_model, **pipeline_args(args))
+                        prosody_pitch=args.prosody_pitch_model, sample_rate=args.sample_rate or None,
+                        **pipeline_args(args))
     if args.list_speakers:
         for name, v in VOICES.items():
             default = " (default)" if name == DEFAULT_VOICE else ""
@@ -888,12 +903,12 @@ def run(args) -> None:
         lines = [line.strip() for line in Path(args.text_file).read_text().splitlines() if line.strip()]
         for i, line in enumerate(lines):
             wav, info = synth(line, **kw)
-            sf.write(out_dir / f"{i:03d}.wav", wav.numpy(), SAMPLE_RATE)
+            sf.write(out_dir / f"{i:03d}.wav", wav.numpy(), synth.sample_rate)
             print(f"{out_dir / f'{i:03d}.wav'}  {info['seconds']:.2f}s  RTF {info['rtf_total']:.4f}")
     else:
         if not args.text:
             raise SystemExit("--text or --text-file is required")
         wav, info = synth(args.text, **kw)
-        sf.write(args.out, wav.numpy(), SAMPLE_RATE)
+        sf.write(args.out, wav.numpy(), synth.sample_rate)
         print(f"{args.out}  {info['seconds']:.2f}s  "
               f"RTF acoustic {info['rtf_acoustic']:.4f} total {info['rtf_total']:.4f}")

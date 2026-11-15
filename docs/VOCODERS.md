@@ -395,7 +395,9 @@ frame-level F0. **Its weights are licensed CC BY-NC-SA 4.0: non-commercial use o
   upsampled ×2, the 48 kHz magnitude is twice the 24 kHz one in the 513 shared bins.
   - On the held-out recordings upsampled with torchaudio's default resampler, the least-squares gain is 2.000 up to
     8 kHz. Above that the resampler rolls off: 1.95 at 8–10 kHz and 1.63 at 10–11 kHz.
-  - With a sharp Kaiser resampler (`resample_sharp`), the gain on white noise is 2.000 up to 11 kHz.
+  - With a sharp Kaiser resampler (`resample_sharp`), the gain on white noise is 2.000 up to 11 kHz. Since #94 this
+    is the resampler of every audio path (`drifting_tts.audio.resample`: `prepare`, the codecs' inputs and outputs,
+    `restore`), not only Revox's; the judges keep torchaudio's default.
 - **The conversion** (`RevoxLogMel.convert`):
   1. `griffin-lim`'s NNLS inverts our filterbank to the linear magnitude.
   2. The magnitude is doubled and mapped by Revox's filters; the bins above 12 kHz are empty.

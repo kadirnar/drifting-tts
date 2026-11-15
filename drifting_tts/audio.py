@@ -68,6 +68,24 @@ def make_logmel(backend: str = "vocos") -> torch.nn.Module:
     return LogMel() if backend == "vocos" else BigVGANLogMel()
 
 
+# Kaiser-windowed sinc, flat to 11.5 kHz between 24 and 48 kHz. torchaudio's default (a Hann window 6 zero crossings
+# wide) rolls off from 8 kHz: a gain of 1.63 instead of 2.0 at 10-11 kHz when upsampling 24 -> 48 kHz
+# (docs/VOCODERS.md), and an image of a 10.5 kHz tone only 15 dB below it.
+RESAMPLE = {"lowpass_filter_width": 64, "rolloff": 0.995, "resampling_method": "sinc_interp_kaiser", "beta": 14.77}
+
+
+def resample(wav: torch.Tensor, sr: int, target: int, sharp: bool = True) -> torch.Tensor:
+    """``[..., samples]`` at ``sr`` -> ``[..., ceil(samples * target / sr)]`` at ``target``, with the sharp filter
+    :data:`RESAMPLE`: the resampler of every audio path (``prepare``, the codecs' inputs and outputs, restoration).
+    The judges keep torchaudio's default, so their numbers stay comparable with the earlier ones. ``sharp=False``
+    is that default: the filter every path used before #94, kept for the decoders that were fine-tuned through it."""
+    if sr == target:
+        return wav
+    import torchaudio
+
+    return torchaudio.functional.resample(wav, sr, target, **(RESAMPLE if sharp else {}))
+
+
 def decode_audio(data: bytes) -> tuple[np.ndarray, int]:
     """Decode encoded audio bytes (wav/flac/mp3/...) into a mono float32 array."""
     wav, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
@@ -98,18 +116,20 @@ def normalize_loudness(wav: np.ndarray, target_dbfs: float = -20.0, peak: float 
     return (wav * gain).astype(np.float32)
 
 
-def prepare_waveform(data: bytes, trim: bool = True) -> torch.Tensor:
-    """Bytes -> mono, trimmed, loudness-normalised 24 kHz float tensor ``[samples]``."""
+def prepare_waveform(data: bytes, trim: bool = True, sample_rate: int = SAMPLE_RATE,
+                     also: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Bytes -> mono, trimmed, loudness-normalised float tensor ``[samples]`` at ``sample_rate`` (24 kHz).
+
+    ``also``: a second rate; returns ``(wav at sample_rate, wav at also)``, both resampled from the source: the same
+    trimmed, normalised signal, so that they cover the same time span."""
     wav, sr = decode_audio(data)
     if trim:
         wav = trim_silence(wav, sr)
     wav = normalize_loudness(wav)
     out = torch.from_numpy(wav)
-    if sr != SAMPLE_RATE:
-        import torchaudio
-
-        out = torchaudio.functional.resample(out, sr, SAMPLE_RATE)
-    return out
+    if also is None:
+        return resample(out, sr, sample_rate)
+    return resample(out, sr, sample_rate), resample(out, sr, also)
 
 
 # centre of mel frame i, in hops past sample i * hop: Vocos uses a centred STFT, BigVGAN pads (n_fft - hop) / 2

@@ -151,7 +151,8 @@ def test_export_folds_weight_norm(tiny_backend, tmp_path):
                 p.mul_(1.5)
     gan.export(tmp_path / "decoder_ft.pt", step=7)
     ck = load_decoder_checkpoint(tmp_path / "decoder_ft.pt")  # weights_only=True
-    assert set(ck) == {"decoder", "backend", "target_rate", "sample_rate", "step"}
+    assert set(ck) == {"decoder", "backend", "target_rate", "sample_rate", "resample", "step"}
+    assert ck["resample"] == "sharp"  # the filter of the training graph: LatentVocoder then uses it too
     assert ck["backend"] == "voxcpm2" and ck["target_rate"] == 48000 and ck["sample_rate"] == 24000
     assert not any("parametrizations" in k or k.endswith(("weight_g", "weight_v")) for k in ck["decoder"])
     z = torch.randn(1, 6, 12)
@@ -206,6 +207,10 @@ def test_finetune_voxcpm2_decoder_cpu(tiny_backend, latent_root, tmp_path):  # n
     assert w1.shape == w0.shape and torch.isfinite(w1).all() and not torch.allclose(w1, w0)
     with pytest.raises(ValueError, match="fine-tuned decoder checkpoint"):
         Synthesizer(tmp_path / "tts.pt", "cpu", vocoder="bigvgan-v2")
+    native = Synthesizer(tmp_path / "tts.pt", "cpu", sample_rate=None)  # the decoder's own rate, not resampled (#94)
+    (w2, info2), info0 = native(text + " iyi günler.", speaker=0), stock(text + " iyi günler.", speaker=0)[1]
+    assert (stock.sample_rate, native.sample_rate) == (24_000, 48_000) == (24_000, native.vocoder.backend.output_rate)
+    assert w2.numel() == round(info2["seconds"] * 48_000) and abs(info2["seconds"] - info0["seconds"]) < 1e-3
 
 
 def test_finetune_decoder_of_an_ar_model_cpu(tiny_backend, latent_root, tmp_path):  # noqa: F811

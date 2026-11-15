@@ -89,9 +89,8 @@ def restore_shard(src: str, dst: Path, sidon: Sidon, sample_rate: int, limit: in
     """One parquet shard -> ``dst`` with every row's audio restored (FLAC at ``sample_rate``); returns the rows."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import torchaudio
 
-    from .audio import decode_audio
+    from .audio import decode_audio, resample
 
     table = pq.read_table(src)
     if limit:
@@ -101,8 +100,7 @@ def restore_shard(src: str, dst: Path, sidon: Sidon, sample_rate: int, limit: in
     for row in rows:
         wav, sr = decode_audio(row["bytes"])
         out = torch.from_numpy(sidon.restore(wav, sr))
-        if sample_rate != RATE:
-            out = torchaudio.functional.resample(out, RATE, sample_rate)
+        out = resample(out, RATE, sample_rate)
         path = row.get("path") or ""
         audio.append({"bytes": encode_flac(out.numpy(), sample_rate), "path": str(Path(path).with_suffix(".flac"))})
     i = table.schema.get_field_index("audio")
