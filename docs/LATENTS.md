@@ -193,6 +193,63 @@ in fp32 without TF32, so it isolates the receptive field; the number of frames i
   With TF32 convolutions its output here was only 45 dB from fp32, and its windows matched to about 55 dB. The VAEs
   stay 65–70 dB from fp32 under TF32.
 
+## Codec gate (#91)
+
+`scripts/codec_gate.py` asks every representation (the mel + vocoder pairs and the audio VAEs) the three questions a
+generative target must pass, and one more of a model trained on latents. **No numbers yet:** the script has only run
+on the CPU with tiny random codecs and stub judges (`tests/test_codec_gate.py`); the table below is filled by the
+first GPU run.
+
+```bash
+# the 24 kHz recordings, and the hi-res ones for the 44.1 / 48 kHz codecs
+drifting-tts prepare --parquet-glob "..." --out data/train --save-audio --hires-rate 48000
+pip install pesq pystoi            # optional: the PESQ and STOI columns
+python scripts/codec_gate.py --data data/train --out outputs/codec_gate
+# the copies of one codec frame in a latent model's output (#94), without the judges
+python scripts/codec_gate.py --data data/train --backends voxcpm2 --skip tolerance phonetic --no-judges \
+    --model runs/tts_voxcpm2/model_ema.pt --out outputs/codec_gate_repeat
+```
+
+- **Rows:** `vocos` (the mel through `vocos-v2`), `bigvgan` (`bigvgan-v2-ft`), `dacvae`, `voxcpm2`, `voxcpm1.5`,
+  `mimi`; `--vocos` / `--vocoder` name another vocoder, `mel:<vocoder>` adds one. The first 100 `val` utterances.
+- **Round trip, twice.** From the 24 kHz recordings (`audio.bin`), and from the hi-res recordings (`audio_hr.bin`)
+  for the backends that take or return more than 24 kHz. Without `audio_hr.bin` the second one is skipped with a
+  note. Columns: WER (Whisper large-v3 in the data's language), UTMOSv2, speaker similarity with the recording, PESQ
+  (wide band) and STOI when their packages are installed, the log-mel L1 at 24 kHz, and the log-spectral distance
+  in 8–12 kHz and 12–20 kHz (`metrics.band_lsd`). The judges work at 16 kHz, so only the last two see the top of the
+  band. A VAE's output is shifted by its measured lag before the signal metrics; a vocoder makes its own phase and
+  is not.
+- **Tolerance to latent error.** The recordings' own frames are perturbed in normalised units (per-channel mean and
+  standard deviation over the 100 utterances) and decoded: Gaussian noise of 0.05, 0.1, 0.2, 0.3 and 0.5 standard
+  deviations (one draw per utterance, shared by the levels), shrinking towards the mean by 0.7, 0.8 and 0.9, and a
+  (¼ ½ ¼) smoothing in time. UTMOSv2 and WER for each. One number per row: the noise level that costs 0.2 UTMOSv2,
+  by linear interpolation. This is the Mimi table of [MIMI.md](MIMI.md) (0.2 standard deviations cost 0.67,
+  smoothing 1.3) as a script, for every row.
+- **Phonetic structure of the L2 distance.** The drifting kernel is an L2 distance, and Kyutai attribute drifting on
+  raw latents to a latent in which realisations of one phoneme lie close together. Characters are aligned with MMS
+  forced alignment; a segment is the mean of its normalised frames.
+  - *ABX error:* A and X are two segments of one character, B a segment of another, all of one speaker. An error is
+    d(A, X) ≥ d(B, X); the mean is over (speaker, character pair) cells.
+  - *Linear probe:* logistic regression from one frame to its character, tested on other utterances, next to the
+    majority-class baseline.
+  - **What these numbers are not.** They are character-level and context-free, on our own recordings. They rank the
+    rows of this table. They are not ZeroSpeech ABX (triphones, DTW over frames) and cannot be set against the ~8%
+    Kyutai quote for Mimi. Characters stand in well for phonemes in Turkish and badly in English. A 12.5 Hz frame is
+    longer than most characters, so a Mimi segment also holds its neighbours.
+- **Repeated latents** (`--model`, a DiT trained on latents). `extract-latents` stores every codec frame four times
+  and `LatentVocoder` averages the copies. The script generates the latents of held-out texts and reports, per
+  position in the group, the squared deviation from the group mean over the channel's variance. Stored latents give
+  exactly 0. A large value at some positions is what crops off the frame grid (#94) would produce.
+
+| backend | 24 kHz: WER | UTMOSv2 | SIM | PESQ | STOI | mel L1 | LSD 8–12 kHz | native: WER | UTMOSv2 | LSD 8–12 / 12–20 kHz | noise for −0.2 UTMOSv2 | Δ at 0.2 std | Δ smoothing | ABX error | probe (majority) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| *pending the first GPU run* | | | | | | | | | | | | | | | |
+
+**Gate.** A representation is a candidate target if its 24 kHz round trip loses at most `--max-roundtrip-loss`
+UTMOSv2 against the recordings, and noise of 0.2 standard deviations costs at most `--max-noise-loss`. With both
+flags the table gets a pass / fail column. The thresholds are not set: #91 fixes them after the first table, before
+any TTS run on a new codec.
+
 ## Which latent space for the TTS pilot (#17)
 
 **First VoxCPM2, then DAC-VAE.** Both keep intelligibility and lose the same naturalness at the ceiling

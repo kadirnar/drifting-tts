@@ -51,6 +51,32 @@ def bootstrap_ci(num: Sequence[float], den: Sequence[float] | None = None, n: in
     return float(np.percentile(r, 2.5)), float(np.percentile(r, 97.5))
 
 
+def band_lsd(ref, est, sr: int, lo: float, hi: float, n_fft: int | None = None, floor_db: float = -80.0,
+             active_db: float = -50.0) -> float:
+    """Log-spectral distance in dB between two waveforms inside the band ``[lo, hi)`` Hz: per frame the RMS over the
+    band's STFT bins of the difference of the power spectra in dB, averaged over the active frames. 0 for identical
+    signals; what the 16 kHz judges cannot see above 8 kHz (#85, #91).
+
+    ``ref``, ``est``: ``[samples]`` at ``sr``, time-aligned (the longer one is cut). ``n_fft``: default 1024 at
+    24 kHz, scaled with the rate (hop: a quarter). Powers are floored ``floor_db`` below the reference's loudest bin,
+    so that two empty bands compare as equal; frames quieter than ``active_db`` below the reference's loudest frame
+    (pauses) are left out."""
+    ref, est = (torch.as_tensor(x).detach().double().flatten().cpu() for x in (ref, est))
+    if not 0 <= lo < min(hi, sr / 2):
+        raise ValueError(f"band {lo:g}-{hi:g} Hz is empty at {sr} Hz")
+    n = min(len(ref), len(est))
+    n_fft = n_fft or 2 ** round(math.log2(1024 * sr / SAMPLE_RATE))
+    window = torch.hann_window(n_fft, dtype=torch.float64)
+    pr, pe = (torch.stft(x[:n], n_fft, n_fft // 4, window=window, return_complex=True).abs() ** 2 for x in (ref, est))
+    freqs = torch.linspace(0, sr / 2, pr.shape[0])
+    band = (freqs >= lo) & (freqs < hi)
+    floor = max(float(pr.max()) * 10 ** (floor_db / 10), 1e-30)
+    energy = pr.sum(0)
+    active = energy >= float(energy.max()) * 10 ** (active_db / 10)
+    d = 10 * (pr[band].clamp_min(floor).log10() - pe[band].clamp_min(floor).log10())
+    return float(d[:, active].pow(2).mean(0).sqrt().mean())
+
+
 def mel_center_freqs(backend: str = "vocos") -> Tensor:
     """Centre frequency in Hz (peak of the triangular filter) of every mel bin of the backend's front end."""
     m = make_logmel(backend)
