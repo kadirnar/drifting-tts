@@ -150,6 +150,8 @@ def generate(args, dev: str) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     from drifting_tts.train import load_tts
 
     model, cfg, stats = load_tts(args.model, dev)
+    if args.head:  # a head fine-tuned alone (scripts/head_finetune.py)
+        model.head.load_state_dict(torch.load(args.head, map_location=dev)["head"])
     ds = MelDataset(args.data, args.split, min_frames=1, max_frames=cfg.data.get("max_frames", 1500))
     ds.stats.mean, ds.stats.std = float(stats["mean"]), float(stats["std"])
     if dev == "cuda":
@@ -192,6 +194,7 @@ def generate(args, dev: str) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--head", default=None, help="a head.pt of scripts/head_finetune.py, loaded over the model")
     ap.add_argument("--data", required=True)
     ap.add_argument("--split", default="val")
     ap.add_argument("--num", type=int, default=500)

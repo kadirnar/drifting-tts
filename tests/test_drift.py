@@ -4,7 +4,9 @@ import torch
 from drifting_tts.drift import (
     drift_force,
     drift_loss,
+    energy_score,
     feature_drift_loss,
+    feature_energy_loss,
     kyutai_drift_loss,
     learned_tau_drift_loss,
 )
@@ -292,3 +294,78 @@ def test_kyutai_row_weight_zero_rows_have_no_effect():
     loss_p, tau_loss_p, info_p = kyutai_drift_loss(xp, yp, tau, row_weight=w)
     assert torch.allclose(loss, loss_p[:4], atol=1e-5) and torch.allclose(tau_loss, tau_loss_p, atol=1e-6)
     assert torch.allclose(info["p_data"], info_p["p_data"], atol=1e-6)
+
+
+# ---------------------------------------------------------------- one positive: the field against a proper score
+
+
+def test_energy_score_is_smallest_for_the_data_distribution():
+    g = torch.Generator().manual_seed(0)
+    y = torch.randn(20000, 1, 8, generator=g)
+    scores, spreads = {}, {}
+    for scale in (0.5, 0.9, 1.0, 1.1, 1.5):
+        score, spread = energy_score(scale * torch.randn(20000, 16, 8, generator=g), y)
+        assert score.shape == (20000,)
+        scores[scale], spreads[scale] = float(score.mean()), float(spread)
+    assert min(scores, key=scores.get) == 1.0  # neither narrower nor wider scores better
+    assert spreads[0.5] < spreads[0.9] < 1.0 < spreads[1.1] < spreads[1.5]
+    assert spreads[1.0] == pytest.approx(1.0, abs=0.01)
+    x = torch.randn(4, 6, 3, generator=g, requires_grad=True)
+    energy_score(x, torch.randn(4, 1, 3, generator=g))[0].sum().backward()
+    assert torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0  # the zero self distances give no NaN
+
+
+def test_feature_energy_loss_weights_maps_and_reports_their_spread():
+    g = torch.Generator().manual_seed(0)
+    gen = {"a": torch.randn(64, 8, 3, 5, generator=g), "b": 100 * torch.randn(64, 8, 1, 7, generator=g)}
+    pos = {"a": torch.randn(64, 1, 3, 5, generator=g), "b": 100 * torch.randn(64, 1, 1, 7, generator=g)}
+    loss, info = feature_energy_loss(gen, pos)
+    assert set(info) == {"spread/a", "spread/b"} and 0.8 < float(info["spread/a"]) < 1.2
+    only_a, _ = feature_energy_loss(gen, pos, key_weights={"b": 0.0})
+    only_b, _ = feature_energy_loss(gen, pos, key_weights={"a": 0.0})
+    assert float(loss) == pytest.approx((float(only_a) + float(only_b)) / 2, rel=1e-5)  # the mean of the maps
+    assert float(only_b) == pytest.approx(float(only_a), rel=0.3)  # each map in units of its own distances
+    torch.manual_seed(0)
+    sub, _ = feature_energy_loss(gen, pos, key_weights={"b": 0.0}, max_locations=2)
+    assert float(sub) == pytest.approx(float(only_a), rel=0.3)
+
+
+def _band_equilibrium(loss: str, bands: bool, tau: float = 0.3, steps: int = 300, seed: int = 0) -> torch.Tensor:
+    """Variances (truth: 1) per band of a generator ``x = a_band * z`` trained **from the truth** on Gaussian data
+    whose four bands of 25 dimensions carry 59 / 25 / 11 / 5% of the variance (the residual of a mel patch along
+    temporal frequency, docs/HEAD_REALISM.md), with one positive per row. ``bands``: one kernel map per band instead
+    of one over all 100 dimensions."""
+    torch.manual_seed(seed)
+    n, rows, samples = 25, 256, 16
+    std = (torch.tensor([0.59, 0.25, 0.11, 0.05]) * 4).sqrt().repeat_interleave(n)
+    log_a = torch.zeros(4, requires_grad=True)
+    opt = torch.optim.Adam([log_a], lr=2e-2)
+
+    def maps(t):
+        return {f"b{j}": t[:, :, None, j * n:(j + 1) * n] for j in range(4)} if bands else {"all": t[:, :, None]}
+
+    tail = []
+    for step in range(steps):
+        x = log_a.exp().repeat_interleave(n) * std * torch.randn(rows, samples, 4 * n)
+        fx, fy = maps(x), maps(std * torch.randn(rows, 1, 4 * n))
+        if loss == "kyutai":
+            total, _ = feature_drift_loss(fx, fy, None, taus=torch.tensor(tau), reduce="mean")
+        else:
+            total, _ = feature_energy_loss(fx, fy)
+        opt.zero_grad()
+        total.backward()
+        opt.step()
+        if step >= steps - 50:
+            tail.append(log_a.detach().exp() ** 2)
+    return torch.stack(tail).mean(0)
+
+
+def test_one_positive_field_shrinks_the_small_directions_and_a_proper_score_does_not():
+    joint = _band_equilibrium("kyutai", bands=False)  # seeds 0-3: the smallest band ends at 0.72-0.81, the largest at
+    assert joint[0] > 0.9 and joint[3] < 0.86 and joint[0] - joint[3] > 0.1  # 0.93-0.98: the truth is not a fixed point
+    assert joint.argmin() == 3  # the band that carries the least of the distance shrinks the most
+    per_band = _band_equilibrium("kyutai", bands=True)  # every band its own kernel: no band is small in its map
+    assert per_band.min() > 0.93 and per_band.max() - per_band.min() < 0.06
+    energy = _band_equilibrium("energy", bands=False)  # proper: no band shrinks (the small ones are noisy in this toy)
+    assert energy[3] > 0.9 and abs(float(energy.mean()) - 1) < 0.1
+

@@ -82,6 +82,18 @@ def test_boundary_ratio_is_one_for_a_recording_and_rises_when_patches_do_not_joi
     assert calib.texture(mel + offsets, length, 4)["boundary_ratio"].mean() > 2.0
 
 
+def test_temporal_cosine_transform_separates_the_mean_from_the_alternation():
+    from drifting_tts.utils import dct_matrix
+
+    m = dct_matrix(4)
+    torch.testing.assert_close(m @ m.T, torch.eye(4), atol=1e-6, rtol=0)
+    still, flip = torch.ones(4), torch.tensor([1.0, -1.0, 1.0, -1.0])
+    torch.testing.assert_close(m @ still, torch.tensor([2.0, 0, 0, 0]), atol=1e-6, rtol=0)  # all in coefficient 0
+    assert (m @ flip)[0].abs() < 1e-6 and (m @ flip)[3].abs() > (m @ flip)[1].abs()  # mostly in the fastest
+    x = torch.randn(3, 5, 4, 100)
+    torch.testing.assert_close(calib.frame_detail(x)[1, 2], calib.spectral_detail(x[1, 2].T[None])[0].T)
+
+
 def test_patch_scalars():
     x = torch.randn(3, 5, 400)
     s = calib.patch_scalars(x, 4, 100)
@@ -162,6 +174,9 @@ def test_calibration_script_on_a_tiny_model(tmp_path, monkeypatch, capsys):
     for key in ("patch", "frame", "detail"):  # half the noise: less spread for the same error scale
         assert 0 < t05["spread_over_error"][key] < t1["spread_over_error"][key]
     assert set(t1["rank"]) == {"level", "depth", "motion"} and 0 <= t1["rank"]["level"]["top"] <= 1
+    for name in ("mel", "detail"):  # one ratio per temporal frequency of the 4-frame patch
+        assert len(t1["spread_skill_time"][name]) == 4 and sum(t1["error_share_time"][name]) == pytest.approx(1.0)
+        assert all(a > b > 0 for a, b in zip(t1["spread_skill_time"][name], t05["spread_skill_time"][name]))
     assert set(r["texture"]) == {"recording", "T1/teacher_forced", "T1/free_running", "T0.5/teacher_forced",
                                  "T0.5/free_running"}
     assert r["texture"]["recording"]["boundary_ratio"] == pytest.approx(1.0, abs=0.2)

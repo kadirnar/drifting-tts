@@ -10,6 +10,10 @@ recordings.
 - [The test that sees it: a classifier two-sample test](#the-test-that-sees-it-a-classifier-two-sample-test)
 - [What the classifier sees](#what-the-classifier-sees)
 - [Why the drifting kernel does not see it](#why-the-drifting-kernel-does-not-see-it)
+- [Where the head is miscalibrated: the fast part of the patch](#where-the-head-is-miscalibrated-the-fast-part-of-the-patch)
+- [The mechanism: one positive, unequal directions](#the-mechanism-one-positive-unequal-directions)
+- [Fine-tuning the head alone](#fine-tuning-the-head-alone)
+- [What is not settled](#what-is-not-settled)
 - [Commands](#commands)
 
 ## Setup
@@ -117,6 +121,111 @@ shimmer, breath) is what is missing, which is heard as a buzzing, mechanical tim
   128 leave it at 150k, 256 at 100k: "batch size is part of the objective". ARDrift draws 2,048 patches from about
   48 utterances per step: 87 s of speech in the loss, against about 20 minutes.
 
+## Where the head is miscalibrated: the fast part of the patch
+
+The overall ratio of 0.98 hides where the spread is. Spread-skill (1 = calibrated) for each coefficient of a cosine
+transform along the patch's four frames, on patches of speech of 100 held-out utterances, T 1.0
+(`drift_calibration.py --active -0.5`):
+
+| temporal frequency inside the patch | share of the error energy | mel | harmonic detail |
+|---|---|---|---|
+| the mean of the four frames | 59% | 1.03 | 1.03 |
+| their trend | 25% | 0.97 | 0.96 |
+| mid | 11% | 0.89 | 0.85 |
+| their alternation (fastest) | 5% | **0.80** | **0.76** |
+
+- **The head spends its variance on slow modes.** The two slow coefficients carry 84% of the error energy and set
+  the overall ratio; in the fastest one the samples have 64% of the variance they should have (57% in the harmonic
+  detail). The sample deviations of neighbouring frames correlate at 0.65 / 0.71 / 0.76 where the recordings'
+  residuals correlate at 0.55 / 0.65 / 0.70.
+- **Rescaling the spread per coefficient removes most of the full-view tell.** With every coefficient of the
+  patch's 2-D cosine transform rescaled around the sample mean (gains from training rows: 0.99 / 1.06 / 1.16 / 1.27
+  by temporal frequency), the one-patch C2ST falls from 0.82 to 0.61 on the whole patch and from 0.86 to 0.80 on the
+  harmonic detail. The frame-to-frame-change view stays at 0.89: that part is not a matter of variances.
+
+## The mechanism: one positive, unequal directions
+
+A Gaussian toy with the patch's energy profile (four bands with 59 / 25 / 11 / 5% of the variance, one positive and
+32 samples per row, a generator with one scale per band, **started at the truth**; `tests/test_drift.py` has a
+smaller version). Variance per band after training, truth = 1:
+
+| objective | largest band | | | smallest band |
+|---|---|---|---|---|
+| Kyutai's field, one kernel over all bands, τ fixed at 0.3 | 0.85 | 0.75 | 0.49 | 0.08 |
+| the same, τ fixed at 0.08 (the English model's learned value is 0.085) | 0.96 | 0.93 | 0.86 | **0.66** |
+| the same, τ learned (settles at 0.016 in the toy) | 1.00 | 0.99 | 0.96 | 0.90 |
+| Kyutai's field, one kernel per band | 0.99 | 0.99 | 0.99 | 0.99 |
+| energy score, one kernel per band | 0.99 | 0.99 | 0.99 | 0.99 |
+| **the English head, measured** (the squares of the table above) | 1.05 | 0.95 | 0.79 | **0.64** |
+
+- **The data distribution is not a fixed point of the one-positive field.** Started at the truth, the generator
+  leaves it: the less of the distance a direction carries, the more it shrinks, and the wider the kernel, the
+  stronger the effect. At the temperature the English model learned, the toy ends where the head is.
+- **It is a property of the estimator, not of this implementation.** The field's softmax is normalised over the
+  one positive and the siblings together; with a single positive that weighting is biased
+  ([Analytical Correction for Subsampling Bias in Drifting Models](https://arxiv.org/abs/2604.27239): "suppresses
+  diversity"; [Sinkhorn-Drifting](https://arxiv.org/abs/2603.12366): zero drift does not imply `p = q`).
+- **Why Kyutai do not see it.** Their kernel space is the codec latent normalised per dimension: 32 directions that
+  carry about the same share of the distance. In such a space the bias is a small uniform shrinkage (the "one kernel
+  per band" rows). A raw log-mel patch is far from it: 59% of the residual energy is in the mean of the four frames.
+- **The energy score** (`drift.energy_score`: `E|x − y| − ½ E|x − x'|`) is a strictly proper scoring rule: with one
+  observation per condition its expected gradient is zero only at the data distribution, and it has no temperature.
+  [Engression](https://arxiv.org/abs/2307.00835) trains conditional generators with it,
+  [SLED](https://arxiv.org/abs/2505.13181) the per-step head of a speech language model. It has the field's
+  ingredients (attraction to the observation, repulsion between the samples) without the normalisation.
+
+## Fine-tuning the head alone
+
+`scripts/head_finetune.py`: the text encoder and the backbone frozen, their states computed once on 4,000 training
+utterances (11 h, 8 shards; 500,000 patches), the head trained 2,500 steps from the released weights at 2,048 states
+x 32 samples per step, lr 1e-4, EMA 0.999. Every run sees the same rows and differs only in the objective. Held-out
+utterances as above; C2ST accuracies repeat to about ±0.02 between runs of the same head.
+
+| head | fastest band, mel / detail | one patch, whole / detail / envelope / change | free-running T 1, 4 frames / 16 | UTMOSv2, T 0.5 / T 1 |
+|---|---|---|---|---|
+| released | 0.80 / 0.76 | 0.81 / 0.86 / 0.55 / 0.90 | 0.67 / 0.91 | 2.887 / 2.633 |
+| control: the training's objective | 0.79 / 0.74 | 0.80 / 0.85 / 0.57 / 0.90 | 0.71 / 0.90 | – |
+| Kyutai's field + frame-to-frame change maps | 0.79 / 0.77 | 0.70 / 0.84 / 0.56 / 0.89 | 0.70 / 0.90 | 2.852 / 2.652 |
+| Kyutai's field + time-frequency tiles | 0.81 / 0.77 | 0.77 / 0.84 / 0.59 / 0.90 | 0.73 / 0.89 | – |
+| Kyutai's field + whitened cosine bands | 0.82 / 0.78 | 0.73 / 0.82 / 0.55 / 0.89 | 0.69 / 0.90 | – |
+| energy score, the training's maps + whitened bands | **0.99** / 0.90 | 0.68 / 0.76 / 0.69 / 0.89 | 0.62 / 0.86 | 2.816 / 2.532 |
+| energy score, + Mel-MAE feature maps | 0.94 / 0.88 | **0.51** / **0.72** / 0.59 / 0.89 | **0.56** / 0.86 | 2.852 / 2.595 |
+
+(UTMOSv2: val 100 through NVIDIA's BigVGAN-v2 as released, fine-tuned on neither head; recordings 3.258,
+copy-synthesis 3.294. WER stays at 2.1–2.6% for every head.)
+
+- **More of the same changes nothing**, and the test repeats.
+- **New kernel maps do not help while the field is Kyutai's.** Frame-to-frame changes, tiles of 4 frames x 10 bins
+  and whitened bands leave the fastest band at 0.79–0.82. In a map where the samples are too narrow the learned
+  temperature rises (0.36 in the fastest whitened band, 0.07 in the slowest), and a wide kernel moves every sample
+  by the same vector: it does not spread them. The joint whitened patch as the only map narrowed the samples further
+  (stopped at 800 steps: sample spread 0.104 → 0.101, τ 0.22).
+- **The energy score calibrates the head** in 700 steps: fastest band 0.80 → 0.99, the recording's motion exceeds
+  all 32 samples in 3.8% of the states (16.2% before, 3.0% expected; all patches, pauses included), its harmonic
+  depth in 3.1% (7.2%), and
+  free-running mels at T 1 have the recordings' texture (VarL 0.93 → 1.00, change RMS 0.98 → 1.01).
+- **With the feature maps of a mel masked autoencoder the whole-patch tell is gone**: 0.81 → 0.51 for one
+  teacher-forced patch, 0.67 → 0.56 for four free-running frames, harmonic detail of 16 frames 0.91 → 0.80. The
+  MAE (`configs/mae2d.yaml`, 4.2 M parameters, 16-frame windows, 10k steps on the same 11 h) sees the patch after
+  three recorded patches of history; its five stages are five more maps. This run used 512 states x 16 samples per
+  step, so its bands are less converged (0.94).
+
+## What is not settled
+
+- **UTMOSv2 does not follow.** Sentence by sentence against the released head, the energy head scores 0.07 lower
+  at T 0.5 (95% interval −0.12 to −0.02) and 0.10 lower at T 1 (−0.16 to −0.04); with the MAE maps the difference is
+  −0.04 at both temperatures and within its interval (−0.08 to +0.01). UTMOSv2 also prefers T 0.5 to T 1 for every
+  head by 0.25, i.e. it prefers the narrower samples, and TTSDS2 reports its correlation with listeners at 0.39.
+  Whether a calibrated head is heard as less robotic or as noisier is a listening question:
+  `scripts/listening_test.py` makes the blind A/B page. No listening result exists yet.
+- **The frame-to-frame-change view stays at 0.88–0.90** for every head, also after the oracle rescaling. Part of it
+  is the aligned prior mean: the model's change at token boundaries over the change inside a token is 2.92–3.05
+  against the recordings' 2.82, and the change is more alike across neighbouring mel bins (0.61 against 0.56).
+- **The envelope view of 16 free-running frames got worse** with the energy score (0.62 → 0.74–0.77).
+- **Only the head was trained.** The backbone never saw the new head's patches as its history, 2,500 steps is
+  short, and the whitening scale was measured once. `train-ar` is unchanged.
+- **English only**: the Turkish corpus was not available on this machine.
+
 ## Commands
 
 ```bash
@@ -128,6 +237,22 @@ python scripts/c2st_mel.py --model ardrift_en.pt --data data/en_val --mode free 
 python scripts/c2st_mel.py --model ardrift_en.pt --data data/en_val --mode gta --temperature 1.0 \
     --windows 4 --stride 4 --views full detail envelope delta --active -0.5
 python scripts/c2st_mel.py --model ardrift_en.pt --data data/en_val --mode null      # the test's floor: 0.50
+# spread-skill by temporal frequency, on patches of speech
+python scripts/drift_calibration.py --model ardrift_en.pt --data data/en_val --active -0.5 --no-free
+# the head alone: the states once (--cache), then one objective per run; the tests take --head
+python scripts/head_finetune.py --model ardrift_en.pt --data data/en_ft --cache rows.pt --out runs/head_control
+python scripts/head_finetune.py --model ardrift_en.pt --data data/en_ft --cache rows.pt --out runs/head_energy \
+    --maps patch frame detail wdct --loss energy
+drifting-tts train-mae --config configs/mae2d.yaml --workdir runs/mae16 data.root=data/en_ft \
+    model.speaker_head=false "model.mask_patch=[10,4]" train.crop_frames=16 train.steps=10000
+python scripts/head_finetune.py --model ardrift_en.pt --data data/en_ft --cache rows_c3.pt --context 3 \
+    --mae runs/mae16/mae_ema.pt --maps patch frame detail wdct mae --loss energy --rows 512 --accum 2 --samples 16 \
+    --max-locations 32 --out runs/head_energy_mae
+python scripts/c2st_mel.py --model ardrift_en.pt --head runs/head_energy_mae/head.pt --data data/en_val \
+    --mode gta --temperature 1.0 --windows 4 --stride 4 --active -0.5
+# a blind A/B page from two folders of wavs with the same file names; then the saved answers
+python scripts/listening_test.py --a wavs/released --b wavs/energy --name-a released --name-b energy --out ab.html
+python scripts/listening_test.py --score listening_answers.json
 # audio-level prosody of recording / copy-synthesis / recording's durations / predicted durations
 python scripts/prosody_gap.py --model ardrift_en.pt --vocoder bigvgan_en.pt --data data/en_val --num 60 \
     --temperatures 0.5 1.0 --seeds 2 --out outputs/prosody_gap

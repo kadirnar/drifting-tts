@@ -10,6 +10,10 @@ measures it on held-out utterances, teacher-forced on the recording (the states 
   kernel map (``patch``, ``frame``, ``detail``, as :func:`drifting_tts.models.ar.ar_features`).
 * **spread-skill ratio** per mel band: ``sqrt((1 + 1/G) var_samples) / rmse(sample mean, recording)``, the ensemble
   forecasters' calibration check (1 when calibrated).
+* **spread-skill by temporal frequency** inside the patch: the same ratio for each coefficient of a cosine transform
+  along the patch's frames (their mean, their trend, ..., their alternation), on the mel and on its harmonic detail.
+  The head can be calibrated overall and still too smooth in time: the slow coefficients carry most of the error
+  energy and decide the overall ratio (English 200k model at T 1: 1.03 / 0.97 / 0.89 / 0.80);
 * **rank of the recording** among the ``G`` samples for three scalars of a patch: its level (mean), its harmonic depth
   (RMS of the spectral detail) and its motion (RMS of the frame-to-frame change). Uniform ranks when ``q = p``;
   ``top`` is the share of states whose recording exceeds every sample (expected ``1 / (G + 1)``): for the depth and
@@ -40,6 +44,7 @@ from drifting_tts.models.ar import ar_features, patchify
 from drifting_tts.models.mae import spectral_detail
 from drifting_tts.models.text_encoder import align
 from drifting_tts.train import load_tts
+from drifting_tts.utils import dct_matrix
 
 BANDS = {"low": (0, 33), "mid": (33, 66), "high": (66, 100)}
 
@@ -64,6 +69,12 @@ def texture(mel: torch.Tensor, length: torch.Tensor, patch: int) -> dict[str, to
     return {"varl": varl, "detail_rms": detail, "delta_rms": delta, "boundary_ratio": at(edge) / at(1 - edge)}
 
 
+def frame_detail(frames: torch.Tensor) -> torch.Tensor:
+    """Harmonic detail (:func:`spectral_detail`) of frames ``[R, S, k, c]``, the same shape."""
+    R, S, k, c = frames.shape
+    return spectral_detail(frames.reshape(R * S, k, c).transpose(1, 2)).transpose(1, 2).reshape(R, S, k, c)
+
+
 def patch_scalars(x: torch.Tensor, k: int, c: int) -> dict[str, torch.Tensor]:
     """Patches ``[R, S, k * c]`` -> scalars ``[R, S]``: level, harmonic depth, motion."""
     R, S, _ = x.shape
@@ -77,6 +88,7 @@ def patch_scalars(x: torch.Tensor, k: int, c: int) -> dict[str, torch.Tensor]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--head", default=None, help="a head.pt of scripts/head_finetune.py, loaded over the model")
     ap.add_argument("--data", required=True)
     ap.add_argument("--split", default="val")
     ap.add_argument("--num", type=int, default=100)
@@ -85,6 +97,9 @@ def main() -> None:
     ap.add_argument("--temperatures", type=float, nargs="+", default=[1.0, 0.5])
     ap.add_argument("--input-noise", type=float, default=0.0, help="noise on the teacher-forced history")
     ap.add_argument("--max-rows", type=int, default=1024, help="states per batch for the per-state statistics")
+    ap.add_argument("--active", type=float, default=None,
+                    help="per-state statistics only on patches of speech: the recorded patch's mean level above this "
+                         "(e.g. -0.5; the pauses sit on the log-mel floor)")
     ap.add_argument("--spk-shift", type=int, default=0, help="add to every speaker id (to check a speaker table)")
     ap.add_argument("--no-free", action="store_true", help="skip free-running generation")
     ap.add_argument("--seed", type=int, default=0)
@@ -94,6 +109,8 @@ def main() -> None:
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed)
     model, cfg, stats = load_tts(args.model, dev)
+    if args.head:  # a head fine-tuned alone (scripts/head_finetune.py)
+        model.head.load_state_dict(torch.load(args.head, map_location=dev)["head"])
     ds = MelDataset(args.data, args.split, min_frames=1, max_frames=cfg.data.get("max_frames", 1500))
     ds.stats.mean, ds.stats.std = float(stats["mean"]), float(stats["std"])  # the model's own normalisation
     k, C, G = model.patch, model.n_mels, args.samples
@@ -116,6 +133,8 @@ def main() -> None:
         s = model.teacher_forced(cond, yp, spk, noise)
         S = s.shape[1]
         full = (torch.arange(S, device=dev)[None] + 1) * k <= y_len[:, None]  # whole patches inside the utterance
+        if args.active is not None:
+            full &= patchify(yp, k).mean(-1) > args.active
         rows_all = full.flatten().nonzero()[:, 0]
         rows = rows_all[torch.randperm(rows_all.numel(), device=dev)[: args.max_rows]]
         st, target = s.flatten(0, 1)[rows], patchify(yp, k).flatten(0, 1)[rows]
@@ -141,6 +160,12 @@ def main() -> None:
             for band, (a, b) in BANDS.items():
                 add(f"{tag}/band/{band}/var", var[:, a:b].mean(1))
                 add(f"{tag}/band/{band}/err", err[:, a:b].mean(1))
+            dct = dct_matrix(k, dev)  # along the patch's frames
+            tf = target.view(R, k, C)
+            for name, f, t in (("mel", fr, tf), ("detail", frame_detail(fr), frame_detail(tf[:, None])[:, 0])):
+                cf, ct = torch.einsum("jk,rgkc->rgjc", dct, f), torch.einsum("jk,rkc->rjc", dct, t)
+                add(f"{tag}/time/{name}/var", cf.var(1).mean(-1))  # [R, k]
+                add(f"{tag}/time/{name}/err", (cf.mean(1) - ct).pow(2).mean(-1))
             sg, sp = patch_scalars(x, k, C), patch_scalars(target[:, None], k, C)
             for name in sg:
                 rank = (sg[name] < sp[name]).sum(1)  # 0 .. G: samples below the recording
@@ -167,7 +192,12 @@ def main() -> None:
     out["texture"]["recording"] = rec
     for T in args.temperatures:
         tag = f"T{T:g}"
-        r: dict = {"spread_over_error": {}, "spread_skill": {}, "rank": {}, "scalar_gen_over_rec": {}}
+        r: dict = {"spread_over_error": {}, "spread_skill": {}, "spread_skill_time": {}, "rank": {},
+                   "scalar_gen_over_rec": {}}
+        for name in ("mel", "detail"):  # per temporal frequency of the patch: 0 = the mean of its frames
+            var, err = cat[f"{tag}/time/{name}/var"].mean(0), cat[f"{tag}/time/{name}/err"].mean(0)
+            r["spread_skill_time"][name] = ((1 + 1 / G) * var / err).sqrt().tolist()
+            r.setdefault("error_share_time", {})[name] = (err / err.sum()).tolist()
         for key in ("patch", "frame", "detail"):
             r["spread_over_error"][key] = mean(f"{tag}/{key}/d_neg") / mean(f"{tag}/{key}/d_pos")
         for band in BANDS:
@@ -191,6 +221,10 @@ def main() -> None:
         print(f"\n[{tag}] spread / error (1 = calibrated): "
               + ", ".join(f"{key} {v:.3f}" for key, v in r["spread_over_error"].items()))
         print("      spread-skill by band: " + ", ".join(f"{b} {v:.3f}" for b, v in r["spread_skill"].items()))
+        for name, v in r["spread_skill_time"].items():
+            print(f"      spread-skill by temporal frequency, {name:6s} (mean of the frames .. alternation): "
+                  + " ".join(f"{x:.3f}" for x in v) + "   error share "
+                  + " ".join(f"{x:.2f}" for x in r["error_share_time"][name]))
         for name, v in r["rank"].items():
             print(f"      {name:6s} recording above every sample {v['top']:.3f}, below every sample {v['bottom']:.3f}, "
                   f"mean rank {v['mean']:.3f}; samples / recording {r['scalar_gen_over_rec'][name]:.3f}")

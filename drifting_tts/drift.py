@@ -19,6 +19,10 @@ frozen, drifted target ``stopgrad(x + V(x))``. Implementation details follow the
 Two learned-temperature variants after Kyutai (*Pocket TTS with a drifting objective*, 2026) are included:
 :func:`kyutai_drift_loss` (their released code, ``drift.mode: kyutai``) and :func:`learned_tau_drift_loss`
 (the simplified pseudo-code of their blog post, ``drift.mode: learned``; unstable here, see docs/DESIGN.md §5).
+
+:func:`energy_score` / :func:`feature_energy_loss` are not a drifting field but the proper scoring rule with the same
+ingredients (attraction to the one observation, repulsion between the samples, no kernel normalisation): what the
+field is compared with when a condition has a single positive (docs/HEAD_REALISM.md).
 """
 
 from __future__ import annotations
@@ -303,6 +307,49 @@ def _flatten_locations(t: Tensor) -> Tensor:
     """``[B, S, L, D] -> [B * L, S, D]``: one drift problem per (condition, location)."""
     B, S, L, D = t.shape
     return t.permute(0, 2, 1, 3).reshape(B * L, S, D)
+
+
+def energy_score(gen: Tensor, pos: Tensor) -> tuple[Tensor, Tensor]:
+    """Energy score of samples ``gen`` ``[B, G, D]`` against one observation ``pos`` ``[B, 1, D]`` per row:
+    ``E|x - y| - 1/2 E|x - x'|`` (the pairs of distinct samples), ``[B]``, and the samples' mean distance to each other
+    over their mean distance to the observation (a scalar; 1 when the samples are as spread as the data).
+
+    A strictly proper scoring rule (Gneiting & Raftery 2007): for every condition its expectation over the data is
+    smallest only when the samples' distribution is the data's, with one observation per condition and at no
+    temperature to choose. The one-positive drifting field does not have that property: on data whose directions
+    carry unequal shares of the distance it settles with the small directions under-dispersed
+    (``tests/test_drift.py``, docs/HEAD_REALISM.md). Engression (arXiv 2307.00835) trains conditional generators with
+    this score, SLED (arXiv 2505.13181) the per-step head of a speech language model."""
+    G = gen.shape[1]
+    gen, pos = gen.float(), pos.float()
+    d_pos = cdist(gen, pos)[..., 0].mean(1)
+    d_neg = cdist(gen, gen).sum((1, 2)) / (G * (G - 1))  # the ~0 self distances add nothing
+    return d_pos - 0.5 * d_neg, (d_neg.mean() / d_pos.mean()).detach()
+
+
+def feature_energy_loss(gen_feats: dict[str, Tensor], pos_feats: dict[str, Tensor],
+                        key_weights: dict[str, float] | None = None,
+                        max_locations: int | None = None) -> tuple[Tensor, dict[str, Tensor]]:
+    """:func:`energy_score` over a dict of feature maps ``[B, S, L, D]`` (as :func:`feature_drift_loss`: every
+    (condition, location) is one problem, ``pos_feats`` holds one observation per condition). Each map's mean score
+    is divided by its mean distance to the observation (detached: a scale, so that maps of different size weigh
+    alike) and the maps are averaged with ``key_weights``. ``info``: ``spread/<map>``."""
+    total, weight_sum, info = None, 0.0, {}
+    for key, g in gen_feats.items():
+        w = key_weight(key, key_weights)
+        if w == 0:
+            continue
+        p = pos_feats[key]
+        if max_locations and g.shape[2] > max_locations:
+            idx = torch.randperm(g.shape[2], device=g.device)[:max_locations]
+            g, p = g[:, :, idx], p[:, :, idx]
+        g, p = _flatten_locations(g), _flatten_locations(p)
+        score, spread = energy_score(g, p)
+        scale = cdist(g.detach().float(), p.float()).mean().clamp_min(1e-8)
+        loss = w * score.mean() / scale
+        total, weight_sum = loss if total is None else total + loss, weight_sum + w
+        info[f"spread/{key}"] = spread
+    return total / weight_sum, info
 
 
 def feature_drift_loss(
