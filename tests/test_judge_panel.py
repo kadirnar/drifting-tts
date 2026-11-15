@@ -60,8 +60,11 @@ def test_panel_scores_shared_files_caches_them_and_counts_the_judges(tmp_path, m
     assert "| new | 2 of 2 | 2 | 0 |" in table and "| rec | 2 of 2 | 2 | 0 |" in table
     assert built == ["utmos22", "squim"]
     built.clear()
+    monkeypatch.setattr(sys, "argv", [*argv, "--groups", "00", "nothing"])
     jp.main()  # every score comes from the cache: no judge is built again
-    assert built == [] and "2 of 2" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert built == [] and "2 of 2" in printed
+    assert "**00** (1 sentences)" in printed and "**nothing**" not in printed  # the files that start with "00"
 
 
 def test_forget_speechmos_takes_the_hub_repository_off_the_path(monkeypatch):

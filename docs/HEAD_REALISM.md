@@ -273,6 +273,31 @@ released head sentence by sentence (`*`: the 95% interval of the difference excl
   run (the Turkish corpus was not available here), and UTMOSv2, the only judge the Turkish tables use, is the least
   sensitive of the seven to this gap (0.36 where UTMOS22 sees 0.75).
 
+### The Turkish release through each vocoder
+
+The same check on the public Turkish model (`Vyvo/drifting-tts-tr`, the DiT v3.1): the first 100 Freya-TR-Eval
+sentences in the three built-in voices, the same mel through each vocoder, against the BigVGAN-v2 fine-tuned on that
+model's mels (300 sentences; no recordings of these texts exist, and the judges were trained on English, so only the
+differences are read).
+
+| vocoder | UTMOSv2 | UTMOS22 | SCOREQ | NISQA | DNSMOS OVRL | SQUIM | Audiobox PQ |
+|---|---|---|---|---|---|---|---|
+| BigVGAN-v2 fine-tuned on the model's mels (v3.1's) | 2.86 | 3.08 | 3.60 | 4.70 | 3.30 | 4.42 | 7.37 |
+| Vocos v2, fine-tuned on the model's mels | 2.86 | 2.98* | 3.52* | 4.71 | 3.32* | 4.42 | 7.32* |
+| Vocos-ft, the earlier fine-tune | 2.39* | 2.59* | 3.07* | 3.85* | 3.24* | 4.40* | 7.13* |
+| **NVIDIA's BigVGAN-v2, not adapted** | **2.19*** | **1.47*** | **1.95*** | **3.50*** | **2.61*** | **4.26*** | **6.51*** |
+| release v3.2 (Vocos v2, sampled pitch, punctuation pauses) | 2.91* | 2.92* | 3.52* | 4.69 | 3.33* | 4.41* | 7.41* |
+
+- **An unadapted vocoder costs 1.6 points here**, twice the English gap: every judge, every voice (UTMOS22 −1.4 to
+  −1.7, SCOREQ −1.5 to −1.8).
+- **Among the adapted ones, BigVGAN-v2 is ahead of Vocos v2** on UTMOS22, SCOREQ and Audiobox PQ, most on the male
+  voice (UTMOS22 3.10 against 2.90, SCOREQ 3.57 / 3.39); on the studio voice they tie (SCOREQ 4.20 / 4.21), and
+  UTMOSv2, the judge of the Turkish tables so far, does not see the difference (2.86 / 2.86).
+- **The voices differ more than the vocoders**: studio 3.35 / 4.20 (UTMOS22 / SCOREQ), male 3.10 / 3.57, female
+  2.78 / 3.02, in the order of their hours of training data.
+- **For the Turkish ARDrift** this is the case that was not measured: Vocos v2 adapted to this DiT's mels, decoding
+  another model's. Between the first two rows and the fourth lies everything #89 can gain.
+
 ## Commands
 
 ```bash
@@ -303,6 +328,8 @@ python scripts/listening_test.py --score listening_answers.json
 # seven judges on folders of wavs with the same file names, each system against the baseline sentence by sentence
 python scripts/judge_panel.py --systems recording=wav/recording released=wav/released new=wav/new \
     --baseline released --out outputs/panel                    # pip install -e ".[eval,panel]"
+python scripts/judge_panel.py --systems ft=wav/bigvgan_ft vocos=wav/vocos_v2 --baseline ft \
+    --groups studio male female --out outputs/panel_tr          # also per voice: file names start with it
 # the Turkish vocoder on ARDrift's own mels (#89), then the panel on its snapshots
 drifting-tts finetune-vocoder --config configs/vocoder_bigvgan_tr_gta.yaml --workdir runs/tr_bigvgan_gta
 # audio-level prosody of recording / copy-synthesis / recording's durations / predicted durations

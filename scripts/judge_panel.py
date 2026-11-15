@@ -16,6 +16,7 @@ questions, and compares each system with a baseline **sentence by sentence**:
         --baseline released --out outputs/judge/panel
 
 A judge whose package is missing is skipped with a message. Scores are cached per judge and system in ``--out``.
+``--groups studio male`` adds the comparison on the files whose names start with each group (e.g. per voice).
 """
 
 from __future__ import annotations
@@ -161,6 +162,8 @@ def main() -> None:
     ap.add_argument("--judges", nargs="+", default=list(JUDGES), choices=JUDGES)
     ap.add_argument("--squim-reference", default=None,
                     help="system whose wavs are SQUIM's clean reference (another sentence's; default: the first)")
+    ap.add_argument("--groups", nargs="*", default=[],
+                    help="also summarise the files whose name starts with each of these (e.g. the voices)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
@@ -224,6 +227,18 @@ def main() -> None:
         lines.append(f"| {s} | {sum(x['diff'] > 0 for x in v)} of {len(v)} | "
                      f"{sum(x['significant'] and x['diff'] > 0 for x in v)} | "
                      f"{sum(x['significant'] and x['diff'] < 0 for x in v)} |")
+    for group in args.groups:  # the primary metrics again, on the files of one group
+        keep = [i for i, n in enumerate(names) if n.startswith(group)]
+        if not keep:
+            continue
+        sub = summarize({m: {sy: [v[i] for i in keep] for sy, v in scores[m].items()} for m in primary}, args.baseline)
+        lines += ["", f"**{group}** ({len(keep)} sentences)", "", "| metric | " + " | ".join(order) + " |",
+                  "|---|" + "---|" * len(order)]
+        for metric, r in sub.items():
+            cells = [f"{r['mean'][sy]:.3f}" + (f" ({r['vs_baseline'][sy]['diff']:+.3f}"
+                                                 f"{'*' if r['vs_baseline'][sy]['significant'] else ''})"
+                                                 if sy in r["vs_baseline"] else "") for sy in order]
+            lines.append(f"| {metric} | " + " | ".join(cells) + " |")
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
