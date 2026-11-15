@@ -5,6 +5,8 @@ Output layout (``--out``)::
     mels.bin       float16 [total_frames, 100] log-mels, utterances concatenated
     f0.bin         float16 [total_frames] F0 in Hz at the mel frame rate (0 = unvoiced), with --f0
     audio.bin      float16 24 kHz waveforms the mels were computed from, with --save-audio
+    audio_hr.bin   float16 waveforms of the same utterances at --hires-rate (48 kHz: what the 44.1 / 48 kHz codecs
+                   of `extract-latents` encode; index: hr_offset / hr_samples, stats.json: hr_rate)
     index.jsonl    one line per utterance: offset, frames, text, norm_text, speaker, spk_id, split, ...
                    (split: train / val (reported results) / dev (tuning, with --dev-size))
     speakers.json  speaker name -> integer id
@@ -52,6 +54,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--f0", action="store_true", help="also extract WORLD F0 (pitch conditioning)")
     p.add_argument("--f0-method", choices=("dio", "harvest"), default="dio", help="WORLD F0 estimator")
     p.add_argument("--save-audio", action="store_true", help="also store the 24 kHz waveforms (vocoder fine-tuning)")
+    p.add_argument("--hires-rate", type=int, default=0,
+                   help="with --save-audio: also store the waveforms at this rate, resampled from the source "
+                        "(audio_hr.bin; 48000 for `extract-latents` with dacvae / voxcpm1.5, which otherwise get "
+                        "audio band-limited to 12 kHz)")
     p.add_argument("--speaker-name", default=None,
                    help="one speaker name for every row (single-voice data whose speaker column means something else)")
     p.add_argument("--val-max-seconds", type=float, default=12.0, help="longest utterance eligible for val / dev")
@@ -73,9 +79,10 @@ def _process(row: dict) -> dict | None:
     if len(norm_text) < 2:
         return None
     try:
-        wav = prepare_waveform(row["audio"]["bytes"], trim=row["trim"])
+        wav = prepare_waveform(row["audio"]["bytes"], trim=row["trim"], also=row.get("hires_rate") or None)
     except Exception as e:  # corrupted audio
         return {"error": f"{type(e).__name__}: {e}"}
+    wav, hires = wav if isinstance(wav, tuple) else (wav, None)
     mel = _MEL(wav).T.contiguous().numpy()  # [T, n_mels]
     if not np.isfinite(mel).all():
         return {"error": "non-finite mel"}
@@ -88,6 +95,8 @@ def _process(row: dict) -> dict | None:
            "sumsq": (mel.astype(np.float64) ** 2).sum(0)}
     if row.get("save_audio"):
         res["audio"] = wav.numpy().clip(-1, 1).astype(np.float16)
+    if hires is not None:
+        res["audio_hr"] = hires.numpy().clip(-1, 1).astype(np.float16)
     if row.get("f0"):
         f0 = extract_f0(wav.numpy(), mel.shape[0], method=row["f0_method"], backend=row["backend"])
         lf0 = np.log(f0[f0 > 0])
@@ -106,7 +115,7 @@ def _open(f: str):
 
 def _iter_rows(files: list[str], trim: bool, limit: int, f0: bool = False, save_audio: bool = False,
                f0_method: str = "dio", backend: str = "vocos", speaker_name: str | None = None,
-               speaker_column: str = "speaker", held_out: frozenset[str] = frozenset()):
+               speaker_column: str = "speaker", held_out: frozenset[str] = frozenset(), hires_rate: int = 0):
     n = 0
     columns = [speaker_column if c == "speaker" else c for c in META_COLUMNS]
     for f in files:
@@ -123,7 +132,7 @@ def _iter_rows(files: list[str], trim: bool, limit: int, f0: bool = False, save_
                 row["trim"] = trim
                 row["f0"] = f0
                 row["f0_method"], row["backend"] = f0_method, backend
-                row["save_audio"] = save_audio
+                row["save_audio"], row["hires_rate"] = save_audio, hires_rate
                 yield row
                 n += 1
                 if limit and n >= limit:
@@ -166,6 +175,9 @@ def choose_validation(index: list[dict], size: int, seed: int,
 
 
 def run(args) -> None:
+    hires = getattr(args, "hires_rate", 0)
+    if hires and not args.save_audio:
+        raise SystemExit("--hires-rate stores a second copy of the audio: it needs --save-audio")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     files = _resolve_files(args)
@@ -185,12 +197,13 @@ def run(args) -> None:
     lf0_n = 0
     f0_file = open(out / "f0.bin", "wb") if args.f0 else None
     audio_file = open(out / "audio.bin", "wb") if args.save_audio else None
-    audio_offset = 0
+    hr_file = open(out / "audio_hr.bin", "wb") if hires else None
+    audio_offset = hr_offset = 0
     pool_args = dict(initializer=_init_worker, initargs=(args.backend, args.language))
     with open(out / "mels.bin", "wb") as fbin, Pool(args.workers, **pool_args) as pool:
         rows = _iter_rows(files, trim=not args.no_trim, limit=args.limit, f0=args.f0, save_audio=args.save_audio,
                           f0_method=args.f0_method, backend=args.backend, speaker_name=args.speaker_name,
-                          speaker_column=args.speaker_column, held_out=held_out)
+                          speaker_column=args.speaker_column, held_out=held_out, hires_rate=hires)
         for res in tqdm(pool.imap(_process, rows, chunksize=4), total=total, desc="prepare"):
             if res is None:
                 skipped += 1
@@ -208,6 +221,11 @@ def run(args) -> None:
                 res["meta"]["audio_offset"] = audio_offset
                 res["meta"]["audio_samples"] = int(res["audio"].size)
                 audio_offset += int(res["audio"].size)
+            if hr_file is not None:
+                hr_file.write(res["audio_hr"].tobytes())
+                res["meta"]["hr_offset"] = hr_offset
+                res["meta"]["hr_samples"] = int(res["audio_hr"].size)
+                hr_offset += int(res["audio_hr"].size)
             res["meta"]["offset"] = offset
             offset += res["meta"]["frames"]
             index.append(res["meta"])
@@ -242,6 +260,9 @@ def run(args) -> None:
              "errors": errors, "skipped": skipped}
     if audio_file is not None:
         audio_file.close()
+    if hr_file is not None:
+        hr_file.close()
+        stats["hr_rate"] = hires
     if f0_file is not None:
         f0_file.close()
         lf0_mean = lf0_sum / max(lf0_n, 1)

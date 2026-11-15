@@ -64,12 +64,13 @@ def lr_lambda(warmup: int, total: int, schedule: str = "const", final_frac: floa
 
 
 def random_crop(
-    mel: torch.Tensor, lengths: torch.Tensor, frames: int, generator=None
+    mel: torch.Tensor, lengths: torch.Tensor, frames: int, generator=None, grid: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Crop ``[B, C, T]`` to ``[B, C, frames]`` at random valid starts. Returns crops and starts."""
+    """Crop ``[B, C, T]`` to ``[B, C, frames]`` at random valid starts, multiples of ``grid`` (VAE latents: the
+    copies of one VAE frame). Returns crops and starts."""
     B = mel.shape[0]
     max_start = (lengths - frames).clamp_min(0)
-    starts = (torch.rand(B, generator=generator) * (max_start + 1).float()).long()
+    starts = (torch.rand(B, generator=generator) * (max_start + 1).float()).long() // grid * grid
     if mel.shape[-1] < frames:
         mel = nn.functional.pad(mel, (0, frames - mel.shape[-1]))
     idx = starts[:, None] + torch.arange(frames)[None]

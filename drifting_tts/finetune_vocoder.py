@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .alignment import sequence_mask
-from .audio import HOP_LENGTH, SAMPLE_RATE
+from .audio import HOP_LENGTH, RESAMPLE, SAMPLE_RATE
 from .config import load_config, save_config
 from .data import BucketBatchSampler, MelDataset, MelStats, WeightedBucketBatchSampler, collate, speaker_balance_weights
 from .models import bigvgan_disc as bd
@@ -590,8 +590,8 @@ class VAEDecoderGAN(BigVGANGAN):
       only: the watermark is frozen and still added to every output, in training as at inference. Every export checks
       that the frozen weights are still the released ones.
     * Output: the decoder's rate (48 kHz), resampled to 24 kHz inside the graph with the same band-limited sinc as
-      ``LatentVocoder`` at inference (``torchaudio``), and compared with the 24 kHz recordings. The band above 12 kHz
-      gets no training signal; the TTS pipeline never outputs it.
+      ``LatentVocoder`` at inference (:data:`drifting_tts.audio.RESAMPLE`), and compared with the 24 kHz recordings.
+      The band above 12 kHz gets no training signal; the TTS pipeline outputs it only with ``sample_rate=None``.
     * Weight norm: re-applied to every trainable convolution for training, as the VAE was trained
       (``vocoder.weight_norm``), and folded back on export.
     * Distillation (``train.teacher``): the target is not the recording but the released decoder (a frozen copy) on
@@ -627,7 +627,8 @@ class VAEDecoderGAN(BigVGANGAN):
         self.right = 1 if self.be.causal else max(1, tc.get("right_context_frames", self.context))
         # a causal decoder takes short utterances too, right-padded (latent_windows(pad=True))
         self.min_frames = repeat * (self.segment + 1 if self.be.causal else self.context + self.segment + self.right)
-        self.resample = torchaudio.transforms.Resample(self.be.output_rate, SAMPLE_RATE).to(device)
+        self.resample = torchaudio.transforms.Resample(self.be.output_rate, SAMPLE_RATE, **RESAMPLE)
+        self.resample.to(device)
         self._setup(discriminator_hparams(self.repo, vc.get("hparams")), device)
         trained = sum(p.numel() for p in self.gen.parameters() if p.requires_grad)
         print(f"decoder: {trained / 1e6:.1f}M parameters trained, "
@@ -689,9 +690,12 @@ class VAEDecoderGAN(BigVGANGAN):
         return self.resample(self.be.decode_train(z.float()))
 
     def export(self, path: Path, step: int) -> None:
-        """``{"decoder": state dict (weight norm folded), "backend", "target_rate", "sample_rate", "step"}``: tensors
-        and numbers only, loadable with ``weights_only=True`` (``LatentVocoder(decoder=...)``). The state holds the
-        frozen weights too (DAC-VAE: the watermark), which must still be the released ones."""
+        """``{"decoder": state dict (weight norm folded), "backend", "target_rate", "sample_rate", "resample",
+        "step"}``: tensors, numbers and strings only, loadable with ``weights_only=True``
+        (``LatentVocoder(decoder=...)``). The state holds the frozen weights too (DAC-VAE: the watermark), which must
+        still be the released ones. ``resample``: the filter between the decoder and the 24 kHz losses, which
+        ``LatentVocoder`` then uses too (``"sharp"``: :func:`drifting_tts.audio.resample`; a checkpoint without the
+        key was trained through torchaudio's default)."""
         # the weights are read from the parametrized modules: removing the parametrization from a copy would delete
         # the ``weight`` property of the class it shares with the training modules
         state, tag = {}, ".parametrizations.weight.original"
@@ -706,7 +710,7 @@ class VAEDecoderGAN(BigVGANGAN):
         if changed:
             raise RuntimeError(f"frozen decoder weights changed in training: {', '.join(changed[:5])}")
         save_checkpoint(path, decoder=state, backend=self.backend, target_rate=self.target_rate,
-                        sample_rate=SAMPLE_RATE, step=step)
+                        sample_rate=SAMPLE_RATE, resample="sharp", step=step)
 
 
 class DriftVocoder:

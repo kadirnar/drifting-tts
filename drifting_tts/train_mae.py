@@ -81,7 +81,7 @@ def run(args) -> None:
     it = infinite(loader)
     while step < tc.steps:
         batch = next(it)
-        mel, _ = random_crop(batch["mel"], batch["mel_len"], tc.crop_frames)
+        mel, _ = random_crop(batch["mel"], batch["mel_len"], tc.crop_frames, grid=ds.latent_repeat)
         mel, spk = mel.to(device, non_blocking=True), batch["spk"].to(device)
         cls_w = tc.cls_weight if step >= tc.steps - tc.cls_finetune_steps else 0.0
         with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):

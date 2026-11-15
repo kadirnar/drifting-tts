@@ -229,6 +229,7 @@ class DACVAE(nn.Module):
 
 class DACVAEBackend(AudioBackend):
     name, input_rate, output_rate, frame_rate, dim = "dacvae", 48_000, 48_000, 25.0, 128
+    frame_pad = "reflect"  # DACVAE.posterior
 
     def __init__(self, device: str = "cuda", model: DACVAE | None = None, message: Tensor | None = None,
                  decoder: dict | None = None):

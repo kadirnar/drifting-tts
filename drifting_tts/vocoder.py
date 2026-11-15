@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .audio import HOP_LENGTH, N_FFT
+from .audio import HOP_LENGTH, N_FFT, resample
 from .hub import HUB_REPO  # noqa: F401 (re-exported)
 from .hub import hub_file as _hub_file
 
@@ -289,12 +289,8 @@ def to_revox_frames(x: Tensor) -> Tensor:
 
 
 def resample_sharp(wav: Tensor, sr: int, target: int) -> Tensor:
-    """Kaiser-windowed sinc resampling, flat to 11.5 kHz between 24 and 48 kHz (torchaudio's default rolls off
-    above 8 kHz)."""
-    import torchaudio
-
-    return torchaudio.functional.resample(wav, sr, target, lowpass_filter_width=64, rolloff=0.995,
-                                          resampling_method="sinc_interp_kaiser", beta=14.77)
+    """:func:`drifting_tts.audio.resample`: its filter was Revox's alone before #94."""
+    return resample(wav, sr, target)
 
 
 class RevoxLogMel(torch.nn.Module):

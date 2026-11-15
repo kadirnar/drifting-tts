@@ -16,9 +16,16 @@ Output layout (``--out``), as ``prepare`` (the training code reads either)::
 
     drifting-tts extract-latents --data data/train --backend voxcpm2 --out data/train_voxcpm2
 
+**The encoder's input rate.** The prepared waveforms are 24 kHz, so an encoder that takes 44.1 / 48 kHz audio
+(``dacvae``, ``voxcpm1.5``) would get it band-limited to 12 kHz. A root made with ``prepare --save-audio
+--hires-rate 48000`` also holds the waveforms at that rate (``audio_hr.bin``), and those are what such an encoder
+gets; ``--audio-rate 24000`` keeps the 24 kHz ones (the roots made before #94). ``stats.json`` records the rate
+used (``audio_rate``).
+
 **From parquet files** (``--parquet-glob``, local or ``hf://``) the corpus is encoded without a prepared root or a
 copy of its audio: the shards download in parallel (``--prefetch``), worker processes turn each row into the waveform
-``prepare`` would (decode, trim, loudness, 24 kHz) and its text into the language's normalised form, and the encoder
+``prepare`` would (decode, trim, loudness; at the encoder's input rate if that is above 24 kHz, else 24 kHz, or at
+``--audio-rate``) and its text into the language's normalised form, and the encoder
 runs on batches of similar length on the GPU. ``--val-glob`` names held-out files whose rows form the val split (the
 rest of them: dev), as in ``prepare``; no F0 and no audio are stored. For 10,000 h with Mimi (12.5 Hz x 32, stored
 at 50 Hz with ``--repeat 4``) that is ~115 GB::
@@ -41,7 +48,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .audio import FRAME_RATE, SAMPLE_RATE
+from .audio import FRAME_RATE, SAMPLE_RATE, resample
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -51,6 +58,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--repeat", type=int, default=4, help="copies of every latent frame (alignment resolution)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--audio-rate", type=int, default=None,
+                   help="rate of the audio given to the encoder (default: its input rate if that is above 24 kHz and "
+                        "the audio is there at it, see the module docstring; 24000: as before #94)")
     # --parquet-glob only
     p.add_argument("--val-glob", default=None,
                    help="held-out parquet files: their rows are val (--val-size), the rest dev")
@@ -67,6 +77,43 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tf32", action="store_true",
                    help="TF32 matmuls / convolutions (Mimi latents differ from fp32 by ~2e-4, below fp16 storage)")
+
+
+def source_rate(be, requested: int | None, hires: int | None = None) -> int:
+    """The rate of the waveforms the encoder ``be`` is given: ``requested`` (``--audio-rate``), else the best there
+    is for it. ``hires``: the rate of a prepared root's ``audio_hr.bin`` (``None``: 24 kHz audio only); without a
+    root (parquet files) any rate can be made from the source."""
+    if requested:
+        return requested
+    if be.input_rate <= SAMPLE_RATE:
+        return SAMPLE_RATE
+    return be.input_rate if hires is None else hires
+
+
+def encode_batch(be, wavs: list[np.ndarray], sr: int) -> list[torch.Tensor]:
+    """The latents ``[dim, T_k]`` of waveforms of different lengths, encoded as one right-padded batch.
+
+    Zeros after an utterance do not reach the frames of a causal encoder that zero-pads to whole frames (VoxCPM,
+    Mimi), so its rows are what it returns for each utterance alone. An encoder that reflect-pads to whole frames
+    (``be.frame_pad == "reflect"``: DAC-VAE) gets that padding per row here, as it would make it for the utterance
+    alone; what comes after it is zeros, where alone its convolutions pad the features, so the last frames within its
+    receptive field can still differ from single-utterance encoding (exactly equal for rows of equal frame count)."""
+    frames = [be.num_frames(len(w), sr) for w in wavs]
+    x = torch.zeros(len(wavs), max(len(w) for w in wavs))
+    for k, w in enumerate(wavs):
+        x[k, : len(w)] = torch.from_numpy(w)
+    x = x.to(be.device)
+    if getattr(be, "frame_pad", "constant") == "reflect":
+        x, hop = resample(x, sr, be.input_rate), be.hop_in
+        x = torch.nn.functional.pad(x, (0, max(0, max(frames) * hop - x.shape[1])))
+        for k, w in enumerate(wavs):
+            n, end = -(-len(w) * be.input_rate // sr), frames[k] * hop  # the utterance's samples; its whole frames
+            if 0 < end - n < n:
+                x[k, n:end] = x[k, 2 * n - end - 1: n - 1].flip(0)  # F.pad(..., "reflect")
+            x[k, end:] = 0  # incl. the resampler's ringing past the utterance
+        sr = be.input_rate
+    z = be.encode(x, sr).float()
+    return [z[k, :, :t] for k, t in enumerate(frames)]
 
 
 def resample_f0(f0: np.ndarray, src_rate: float, frames: int, rate: float) -> np.ndarray:
@@ -88,22 +135,32 @@ def run(args) -> None:
     src, out = Path(args.data), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     st_src = json.loads((src / "stats.json").read_text())
-    audio = np.memmap(src / "audio.bin", dtype=np.float16, mode="r")
+    hires = st_src.get("hr_rate") if (src / "audio_hr.bin").exists() else None
     f0_src = np.memmap(src / "f0.bin", dtype=np.float16, mode="r") if (src / "f0.bin").exists() else None
     src_rate = float(st_src.get("frame_rate", FRAME_RATE))
     index = [json.loads(line) for line in open(src / "index.jsonl")]
     be = load_backend(args.backend, args.device)
     rate = be.frame_rate * args.repeat
+    sr = source_rate(be, getattr(args, "audio_rate", None), hires or SAMPLE_RATE)
+    if sr not in (SAMPLE_RATE, hires):
+        raise SystemExit(f"--audio-rate {sr}: {src} holds audio at {SAMPLE_RATE} Hz"
+                         + (f" and {hires} Hz" if hires else " only (prepare --save-audio --hires-rate)"))
+    name, k_off, k_len = ("audio.bin", "audio_offset", "audio_samples") if sr == SAMPLE_RATE else \
+        ("audio_hr.bin", "hr_offset", "hr_samples")
+    audio = np.memmap(src / name, dtype=np.float16, mode="r")
+    if be.input_rate > sr:
+        print(f"the {args.backend} encoder takes {be.input_rate} Hz audio and gets {sr} Hz audio (nothing above "
+              f"{sr // 2000} kHz): `prepare --save-audio --hires-rate {be.input_rate}` stores it", flush=True)
 
     total, done = 0, {}  # (audio offset, samples) -> (offset, frames): merged roots repeat entries
     s = ss = None
     n_native = 0
     with open(out / "mels.bin", "wb") as fm, open(out / "f0.bin", "wb") as ff:
         for e in tqdm(index, desc=f"extract {args.backend}"):
-            key = (e["audio_offset"], e["audio_samples"])
+            key = (e[k_off], e[k_len])
             if key not in done:
                 wav = torch.from_numpy(np.array(audio[key[0]: key[0] + key[1]], dtype=np.float32))
-                z = be.encode(wav.to(args.device), SAMPLE_RATE)[0].float()  # [dim, T]
+                z = be.encode(wav.to(args.device), sr)[0].float()  # [dim, T]
                 zs = z.double()
                 s = zs.sum(1) if s is None else s + zs.sum(1)
                 ss = (zs * zs).sum(1) if ss is None else ss + (zs * zs).sum(1)
@@ -124,8 +181,8 @@ def run(args) -> None:
     mean = (s / n_native).cpu().numpy()
     std = np.sqrt(np.maximum((ss / n_native).cpu().numpy() - mean**2, 0.0))
     stats = {"backend": args.backend, "dim": int(be.dim), "frame_rate": rate, "latent_repeat": args.repeat,
-             "latent_rate": be.frame_rate, "output_rate": be.output_rate, "mean": mean.tolist(), "std": std.tolist(),
-             "frames": int(total), "utterances": len(index)}
+             "latent_rate": be.frame_rate, "output_rate": be.output_rate, "audio_rate": sr, "mean": mean.tolist(),
+             "std": std.tolist(), "frames": int(total), "utterances": len(index)}
     stats.update({k: st_src[k] for k in ("f0_method", "lf0_mean", "lf0_std") if k in st_src})
     (out / "stats.json").write_text(json.dumps(stats, indent=1))
     for name in ("speakers.json", "scores.jsonl"):
@@ -141,30 +198,31 @@ def run(args) -> None:
         raise RuntimeError("non-finite latent statistics")
 
 
-_NORMALIZE = None
+_NORMALIZE, _RATE = None, SAMPLE_RATE
 
 
-def _init_worker(language: str) -> None:
-    global _NORMALIZE
+def _init_worker(language: str, rate: int = SAMPLE_RATE) -> None:
+    global _NORMALIZE, _RATE
     from .text import frontend
 
     torch.set_num_threads(1)
-    _NORMALIZE = frontend(language).normalize
+    _NORMALIZE, _RATE = frontend(language).normalize, rate
 
 
 def _prepare_row(row: dict) -> tuple[dict, np.ndarray] | None:
-    """A parquet row -> (its index entry, the 24 kHz waveform ``prepare`` makes), or None (no text, bad audio)."""
+    """A parquet row -> (its index entry, the waveform ``prepare`` makes, at the worker's rate), or None (no text,
+    bad audio)."""
     from .audio import prepare_waveform
 
     norm = _NORMALIZE(row["text"] or "")
     if len(norm) < 2:
         return None
     try:
-        wav = prepare_waveform(row["audio"]["bytes"]).numpy()
+        wav = prepare_waveform(row["audio"]["bytes"], sample_rate=_RATE).numpy()
     except Exception:  # corrupted audio
         return None
     meta = {"text": row["text"], "norm_text": norm, "speaker": str(row.get("speaker") or "speaker"),
-            "audio_seconds": round(len(wav) / SAMPLE_RATE, 3)}
+            "audio_seconds": round(len(wav) / _RATE, 3)}
     if row.get("held_out"):
         meta["held_out"] = True
     return meta, wav
@@ -224,6 +282,7 @@ def run_parquet(args) -> None:
         raise FileNotFoundError(f"no parquet files match {args.parquet_glob}")
     be = load_backend(args.backend, args.device)
     rate = be.frame_rate * args.repeat
+    sr = source_rate(be, getattr(args, "audio_rate", None))
     index: list[dict] = []
     s = ss = None
     n_native = total = skipped = 0
@@ -231,13 +290,7 @@ def run_parquet(args) -> None:
 
     def encode(batch: list[tuple[dict, np.ndarray]]) -> None:
         nonlocal s, ss, n_native, total
-        n = max(len(w) for _, w in batch)
-        x = torch.zeros(len(batch), n)
-        for k, (_, w) in enumerate(batch):
-            x[k, : len(w)] = torch.from_numpy(w)
-        z = be.encode(x.to(args.device), SAMPLE_RATE).float()  # [B, dim, T]: right padding does not reach the
-        for k, (meta, w) in enumerate(batch):                    # frames of a causal encoder; others: trimmed
-            zk = z[k, :, : be.num_frames(len(w), SAMPLE_RATE)]
+        for (meta, _), zk in zip(batch, encode_batch(be, [w for _, w in batch], sr)):
             zs = zk.double()
             s = zs.sum(1) if s is None else s + zs.sum(1)
             ss = (zs * zs).sum(1) if ss is None else ss + (zs * zs).sum(1)
@@ -250,12 +303,12 @@ def run_parquet(args) -> None:
     def flush(final: bool = False) -> None:
         """Encode the buffer in batches of similar length (each within --batch-seconds of padded audio)."""
         nonlocal buffer
-        if not buffer or (not final and sum(len(w) for _, w in buffer) < 4 * args.batch_seconds * SAMPLE_RATE):
+        if not buffer or (not final and sum(len(w) for _, w in buffer) < 4 * args.batch_seconds * sr):
             return
         buffer.sort(key=lambda item: len(item[1]))
         batch: list = []
         for item in buffer:
-            if batch and (len(batch) + 1) * len(item[1]) > args.batch_seconds * SAMPLE_RATE:
+            if batch and (len(batch) + 1) * len(item[1]) > args.batch_seconds * sr:
                 encode(batch)
                 batch = []
             batch.append(item)
@@ -273,10 +326,10 @@ def run_parquet(args) -> None:
 
     rows = _shard_rows(files, held_out, args.speaker_column, args.prefetch, out / "_shards")
     with open(out / "mels.bin", "wb") as fm, Pool(args.workers, initializer=_init_worker,
-                                                  initargs=(args.language,)) as pool:
+                                                  initargs=(args.language, sr)) as pool:
         for res in tqdm(pool.imap(_prepare_row, throttled(rows), chunksize=8), desc=f"extract {args.backend}"):
             pending.release()
-            if res is None or len(res[1]) > args.max_seconds * SAMPLE_RATE:
+            if res is None or len(res[1]) > args.max_seconds * sr:
                 skipped += 1
                 continue
             buffer.append(res)
@@ -298,8 +351,8 @@ def run_parquet(args) -> None:
     std = np.sqrt(np.maximum((ss / n_native).cpu().numpy() - mean**2, 0.0))
     stats = {"backend": args.backend, "language": args.language, "dim": int(be.dim), "frame_rate": rate,
              "latent_repeat": args.repeat, "latent_rate": be.frame_rate, "output_rate": be.output_rate,
-             "mean": mean.tolist(), "std": std.tolist(), "frames": int(total), "utterances": len(index),
-             "speakers": len(speakers), "skipped": skipped}
+             "audio_rate": sr, "mean": mean.tolist(), "std": std.tolist(), "frames": int(total),
+             "utterances": len(index), "speakers": len(speakers), "skipped": skipped}
     (out / "stats.json").write_text(json.dumps(stats, indent=1))
     shutil.rmtree(out / "_shards", ignore_errors=True)
     print(f"{len(index)} utterances ({n_native / be.frame_rate / 3600:.1f} h of latents at {be.frame_rate:g} Hz, "

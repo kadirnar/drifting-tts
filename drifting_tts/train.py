@@ -125,6 +125,17 @@ def split_features(feats: dict, B: int, S: int) -> dict:
     return {k: v.reshape(B, S, *v.shape[1:]) for k, v in feats.items()}
 
 
+def crop_grid(cfg: Config, latent_repeat: int) -> int:
+    """The grid of the drift crops' starts, in frames: ``drift.crop_grid``, by default the data's ``latent_repeat``
+    (``extract-latents`` stores every VAE frame that many times; the generator's patch and the decoder work on those
+    groups, counted from the utterance's first frame). 1: any frame, the only choice for mels and what every crop
+    used before #94: three latent crops in four then cut through VAE frames."""
+    grid = int(cfg.drift.get("crop_grid") or latent_repeat)
+    if cfg.drift.crop_frames % grid:
+        raise ValueError(f"drift.crop_frames ({cfg.drift.crop_frames}) must be a multiple of drift.crop_grid ({grid})")
+    return grid
+
+
 def build_loader(cfg: Config, split: str = "train") -> tuple[MelDataset, DataLoader]:
     d, t = cfg.data, cfg.train
     ds = MelDataset(d.root, split, min_quality=d.min_quality, min_frames=cfg.drift.crop_frames,
@@ -163,8 +174,12 @@ def training_step(
         h, pitch_pred = model.pitch_condition(h, x_mask, spk, pitch_target)
         l_pitch = ((pitch_pred.float() - pitch_target) ** 2 * x_mask).sum() / x_mask.sum()
 
-    # 2. aligned random crops of target and condition
+    # 2. aligned random crops of target and condition, starting on the grid of ``drift.crop_grid`` frames (VAE
+    #    latents: the copies of one VAE frame, so that a crop holds whole frames, as generation and decoding do)
     starts = (torch.rand(B, device=device) * (y_len - L + 1).float()).long()
+    grid = int(dc.get("crop_grid") or 1)
+    if grid > 1:
+        starts = starts // grid * grid
     y_c = crop_frames(y, starts, L)
     cond = crop_frames(model.frame_condition(h, mu, attn), starts, L)
     if dc.get("detach_cond", False):
@@ -324,6 +339,7 @@ def run(args) -> None:
     device = "cuda" if torch.cuda.is_available() and not tc.get("cpu", False) else "cpu"
 
     ds, loader = build_loader(cfg)
+    cfg.drift.crop_grid = crop_grid(cfg, ds.latent_repeat)
     val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9, filters=cfg.data.get("filters"))
     model = DriftingTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
     if model.pitch_enabled:

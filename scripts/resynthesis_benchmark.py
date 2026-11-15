@@ -12,8 +12,9 @@ score the result against the recordings. This is the quality ceiling of a TTS mo
 * frames: per-channel mean / std ranges, frames per second, the VAEs' posterior std, the delay of the output.
 
 Rows: the recording (reference), BigVGAN-v2 on the recording's mel (``--vocoder``: fine-tuned weights) and each VAE.
-The prepared recordings are 24 kHz, so the 44.1 / 48 kHz encoders see audio band-limited to 12 kHz. Only aggregate
-numbers are written to ``--out`` (no audio unless ``--save-wavs``).
+The prepared recordings are 24 kHz, so the 44.1 / 48 kHz encoders see audio band-limited to 12 kHz
+(``scripts/codec_gate.py`` adds the round trip at the codec's own rate, and Mimi and Vocos). Only aggregate numbers
+are written to ``--out`` (no audio unless ``--save-wavs``).
 
     python scripts/resynthesis_benchmark.py --data data/train --vocoder runs/vocoder/bigvgan_ft.pt
 """
@@ -152,12 +153,13 @@ def streaming(backend: AudioBackend, latents: list[torch.Tensor], args) -> dict:
 
 
 def to16k(wav: np.ndarray, sr: int, band: int = 0) -> np.ndarray:
-    """ASR / judge input: 16 kHz, through ``band`` Hz first when ``band`` > 0 (``benchmark.band_match``)."""
+    """ASR / judge input: 16 kHz, through ``band`` Hz first when ``band`` > 0 (``benchmark.band_match``). With
+    torchaudio's default filter, as ``evaluate`` and ``benchmark`` feed the judges (and as the published table)."""
     x = torch.from_numpy(wav).float()
     if band:
-        x = resample(x, sr, band)
+        x = resample(x, sr, band, sharp=False)
         sr = band
-    return resample(x, sr, 16_000).numpy()
+    return resample(x, sr, 16_000, sharp=False).numpy()
 
 
 def mean_ci(v: list[float]) -> dict:

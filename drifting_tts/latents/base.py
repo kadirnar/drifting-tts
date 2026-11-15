@@ -20,13 +20,7 @@ from collections.abc import Iterable, Iterator
 import torch
 from torch import Tensor
 
-
-def resample(wav: Tensor, sr: int, target: int) -> Tensor:
-    if sr == target:
-        return wav
-    import torchaudio
-
-    return torchaudio.functional.resample(wav, sr, target)
+from ..audio import resample  # noqa: F401 (re-exported: the one resampler of the audio paths)
 
 
 class AudioBackend(ABC):
@@ -38,6 +32,7 @@ class AudioBackend(ABC):
     frame_rate: float  # frames per second
     dim: int  # channels per frame
     causal: bool = False  # the decoder needs no right context (streaming)
+    frame_pad: str = "constant"  # how ``encode`` pads an utterance to whole frames ("reflect": DAC-VAE)
     device: str = "cpu"
 
     @property
