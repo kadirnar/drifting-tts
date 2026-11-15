@@ -81,6 +81,10 @@ sf.write("merhaba.wav", wav.numpy(), 24000)
   IDs also works, e.g. `speaker=17`; [docs/SPEAKERS.md](docs/SPEAKERS.md) scores every one of them.
 - `seed`: v3.2 samples the intonation, so another seed gives another tune for the same text (with the same rhythm).
 - `temperature`: the noise level of the acoustic model. 0.3 sounds clearest; higher values give more variety.
+- **Defaults:** a call without `cfg_scale` / `temperature` uses the release's operating point (guidance 2,
+  temperature 0.3), so `tts(text)` is the measured setting. A checkpoint loaded by path uses the values stored in it
+  (`drifting-tts calibrate-durations --temperature 0.3 --cfg 2`), else temperature 0.5 with guidance 2 for the DiT
+  and 1 (none) for ARDrift; `Synthesizer(..., temperature=, cfg_scale=)` sets them for one object.
 - `prosody_temperature` (v3.2, default 0.5, the tested setting): how freely the pitch is sampled; higher is more
   varied.
 - `prosody_durations="sampled"` (opt-in): the prosody model also samples the durations, so the rhythm and the pauses

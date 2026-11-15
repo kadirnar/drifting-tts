@@ -32,7 +32,6 @@ from .alignment import sequence_mask
 from .audio import HOP_LENGTH, N_FFT
 from .chunked import Chunking, _take, autocast, to_device  # noqa: F401 (_take re-exported)
 from .noise import DiTNoise, Philox, philox_normal, philox_randint
-from .text import text_to_ids
 
 
 @dataclass(frozen=True)
@@ -304,7 +303,8 @@ def _batch_args(synth, sentences: list[str], speaker, prosody_temperature: float
                                   "without a duration temperature, rhythm or pitch predictor of its own")
     _, tempo = synth._speaker(speaker)
     pt = synth.prosody_temperature if prosody_temperature is None else prosody_temperature
-    return [text_to_ids(s, normalized=True) for s in sentences], synth.speaker_id(speaker), tempo, \
+    to_ids = synth.text.text_to_ids  # the frontend of the model's language
+    return [to_ids(s, normalized=True) for s in sentences], synth.speaker_id(speaker), tempo, \
         1.0 if pt is None else pt
 
 
@@ -425,14 +425,15 @@ class _Pieces:
 
 
 @torch.no_grad()
-def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0, temperature: float = 1.0,
-                   seeds: list[int] | None = None, length_scale: float = 1.0, pause=0.0, first: int = 32,
-                   chunk: int = 256, prosody_temperature: float | None = None,
+def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float | None = None,
+                   temperature: float | None = None, seeds: list[int] | None = None, length_scale: float = 1.0,
+                   pause=0.0, first: int = 32, chunk: int = 256, prosody_temperature: float | None = None,
                    chunked: Chunking | bool | None = None,
                    serving: Serving | None = None) -> Iterator[list[tuple[int, Tensor]]]:
     """:meth:`Synthesizer.stream` for many requests at once (one voice). Yields round by round the pieces now on the
     host, ``[(request index, waveform piece), ...]``; each request's pieces join into what ``synth.stream`` gives for
-    its text and seed (default seed: its index), up to float rounding.
+    its text and seed (default seed: its index), up to float rounding. ``cfg_scale`` / ``temperature``: default the
+    Synthesizer's operating point, as its own calls.
 
     A round runs the acoustic model on the next sentence of every request that has used up its mel (all requests in
     the first round), then one masked vocoder batch with the next streaming window of every unfinished request.
@@ -454,6 +455,7 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
     if chunking is not None:
         chunk = chunking.chunk
     speaker = DEFAULT_VOICE if speaker is None else speaker
+    cfg_scale, temperature = synth.operating_point(cfg_scale, temperature)
     voc, dev = synth.vocoder, synth.device
     pause = synth._pause(pause, speaker)
     seeds = list(range(len(texts))) if seeds is None else seeds
@@ -537,9 +539,9 @@ def stream_batched(synth, texts: list[str], speaker=None, cfg_scale: float = 1.0
         if not kept:
             continue
         gens = keys(kept)
-        enc = _encode(synth.model, [text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept], spk_id,
-                      length_scale * tempo, gens, synth.prosody, 1.0 if pt is None else pt, synth.prosody_durations,
-                      sv)
+        ids = [synth.text.text_to_ids(reqs[i]["sentences"][0], normalized=True) for i in kept]  # model's language
+        enc = _encode(synth.model, ids, spk_id, length_scale * tempo, gens, synth.prosody,
+                      1.0 if pt is None else pt, synth.prosody_durations, sv)
         if not sv.pipeline:  # one acoustic batch after the groups' text passes
             groups.append(list(range(len(rows), len(rows) + len(kept))))
             rows += kept

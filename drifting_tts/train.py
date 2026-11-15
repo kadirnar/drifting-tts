@@ -44,7 +44,7 @@ from .utils import EMA, count_params, infinite, lr_lambda, rng_state, save_check
 
 # official: fixed temperatures (paper); kyutai: Kyutai's released learned-tau recipe; learned: their blog pseudo-code
 DRIFT_MODES = ("official", "kyutai", "learned")
-CALIB_KEYS = ("duration_scale", "duration_scales", "temperature")  # stored by `calibrate-durations`
+CALIB_KEYS = ("duration_scale", "duration_scales", "temperature", "cfg_scale")  # stored by `calibrate-durations`
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -500,6 +500,7 @@ def load_tts(path: str | Path, device="cpu") -> tuple[DriftingTTS, Config, dict]
     model.duration_scale = float(ck.get("duration_scale", 1.0))  # set by `drifting-tts calibrate-durations`
     model.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}  # per voice
     model.temperature = ck.get("temperature")  # preferred noise temperature (`calibrate-durations --temperature`)
+    model.cfg_scale = ck.get("cfg_scale")  # preferred guidance scale (`calibrate-durations --cfg`)
     stats = ck.get("stats")
     if stats is None:
         from .data import MelStats

@@ -130,6 +130,18 @@ class DriftHead(nn.Module):
         return self.out(self.norm(x))
 
 
+def join_prefix(cond: Tensor, prefix: Tensor | None, prefix_cond: Tensor | None, k: int) -> tuple[Tensor, int]:
+    """The condition of a generation with ``prefix`` (see :meth:`ARDriftTTS.generate`) and the number of leading
+    frames that are context, not output: ``prefix_cond`` in front of ``cond`` and its length, or ``cond`` and 0."""
+    if prefix is not None and prefix.shape[-1] % k:
+        raise ValueError(f"the prefix has {prefix.shape[-1]} frames: not a multiple of the patch ({k})")
+    if prefix_cond is None:
+        return cond, 0
+    if prefix is None or prefix.shape[-1] != prefix_cond.shape[-1]:
+        raise ValueError("prefix_cond needs a prefix of the same number of frames")
+    return torch.cat([prefix_cond.to(cond.dtype), cond], -1), prefix_cond.shape[-1]
+
+
 def patchify(x: Tensor, k: int) -> Tensor:
     """``[B, C, T]`` (T a multiple of ``k``) -> ``[B, T / k, C * k]`` (frame-major inside a patch)."""
     B, C, T = x.shape
@@ -229,11 +241,15 @@ class ARDriftTTS(nn.Module):
     # ------------------------------------------------------------------------------------------------- inference
     @torch.no_grad()
     def generate(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
-                 prefix: Tensor | None = None, cfg_scale: float = 1.0) -> Tensor:
+                 prefix: Tensor | None = None, cfg_scale: float = 1.0, prefix_cond: Tensor | None = None) -> Tensor:
         """Aligned condition ``[B, C, T]`` -> normalised mel ``[B, n_mels, T]``, one step (patch) at a time with a KV
         cache. ``prefix``: known leading mel frames ``[B, n_mels, Tp]`` (``Tp`` a multiple of ``patch``), kept.
+        ``prefix_cond`` ``[B, C, Tp]``: the prefix is then acoustic context that comes *before* ``cond`` (the end of
+        the previous utterance and the condition it was generated under): the model continues from it as it
+        continues a longer utterance, no noise is drawn for it, and only the ``T`` frames of ``cond`` are returned.
         ``cfg_scale`` != 1: guidance on the backbone state, ``s_null + cfg_scale * (s - s_null)``, the null state
         from the same history without the text (a model trained with ``drift.cond_dropout``)."""
+        cond, lead = join_prefix(cond, prefix, prefix_cond, self.patch)
         T = cond.shape[-1]
         cond = self.pad_frames(cond)
         cp = self.cond_patches(cond)
@@ -261,7 +277,7 @@ class ARDriftTTS(nn.Module):
             out.append(x)
             prev = x[:, None]
         mel = unpatchify(torch.stack(out, 1), k, self.n_mels)
-        return mel[..., :T]
+        return mel[..., lead:T]
 
     def step_static(self, prev: Tensor, cpatch: Tensor, spk: Tensor, pos: Tensor, caches: list[tuple[Tensor, Tensor]],
                     mu: Tensor, z: Tensor, cfg: Tensor | None = None) -> Tensor:
@@ -363,21 +379,32 @@ class ARGenerator:
         return st
 
     @torch.no_grad()
+    def fits(self, frames: int, prefix_frames: int = 0) -> bool:
+        """Whether ``frames`` frames after ``prefix_frames`` of context fit the caches."""
+        return (prefix_frames + frames + (-frames) % self.model.patch) // self.model.patch <= self.max_steps
+
+    @torch.no_grad()
     def __call__(self, cond: Tensor, spk: Tensor, temperature: float = 1.0,
-                 generator: torch.Generator | None = None, cfg_scale: float = 1.0) -> Tensor:
-        """As :meth:`ARDriftTTS.generate` (no prefix): aligned condition ``[B, C, T]`` -> mel ``[B, n_mels, T]``."""
+                 generator: torch.Generator | None = None, cfg_scale: float = 1.0, prefix: Tensor | None = None,
+                 prefix_cond: Tensor | None = None) -> Tensor:
+        """As :meth:`ARDriftTTS.generate`: aligned condition ``[B, C, T]`` -> mel ``[B, n_mels, T]``."""
         m = self.model
         T = cond.shape[-1]
-        if m.pad_frames(cond).shape[-1] // m.patch > self.max_steps:
-            return m.generate(cond, spk, temperature, generator, cfg_scale=cfg_scale)
-        out = list(self.steps(cond, spk, temperature, generator, cfg_scale))
+        if not self.fits(T, 0 if prefix_cond is None else prefix_cond.shape[-1]):
+            return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond)
+        out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond))
         return unpatchify(torch.stack(out, 1), m.patch, m.n_mels)[..., :T]
 
     @torch.no_grad()
     def steps(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
-              cfg_scale: float = 1.0):
-        """Yield the generated patches ``[B, k * n_mels]`` one step at a time (streaming); at most ``max_steps``."""
+              cfg_scale: float = 1.0, prefix: Tensor | None = None, prefix_cond: Tensor | None = None):
+        """Yield the patches ``[B, k * n_mels]`` of ``cond`` one step at a time (streaming); at most ``max_steps``
+        with the prefix. ``prefix`` / ``prefix_cond``: as :meth:`ARDriftTTS.generate` (kept leading frames are
+        yielded as they are; the steps of a context before ``cond`` run, to fill the caches, but are not yielded)."""
         m = self.model
+        cond, lead = join_prefix(cond, prefix, prefix_cond, m.patch)
+        pre = None if prefix is None else patchify(prefix, m.patch)
+        n_pre = 0 if pre is None else pre.shape[1]
         cond = m.pad_frames(cond)
         cp = m.cond_patches(cond)
         B, S = cp.shape[:2]
@@ -397,14 +424,18 @@ class ARGenerator:
             st["cp"].copy_(cp[:, t])
             st["mu"].copy_(mu[:, t])
             st["pos"].fill_(t)
-            st["z"].copy_(torch.randn(B, m.head.noise_dim, device=cond.device, generator=generator) * temperature)
+            if t >= n_pre:  # a known patch draws no noise (its step only fills the caches)
+                st["z"].copy_(torch.randn(B, m.head.noise_dim, device=cond.device, generator=generator) * temperature)
             if self.graphs:
                 st["graph"].replay()
                 x = st["out"].clone()
             else:
                 x = st["run"]()
+            if t < n_pre:
+                x = pre[:, t].to(x.dtype)
             st["prev"].copy_(x)
-            yield x
+            if t * m.patch >= lead:
+                yield x
 
 
 def band_energy(frames: Tensor, scale: float, bands: Sequence[int]) -> Tensor:

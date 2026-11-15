@@ -43,6 +43,16 @@ text ─► text encoder ─► durations ─► frame-aligned condition [mu; h]
   backbone; at inference the head gets `s_null + α (s - s_null)` (Pocket TTS's latent CFG, on the backbone state).
 - **Fast generation** (`ARGenerator`, `Synthesizer(fast=True)`): preallocated KV caches of 512 steps and one CUDA
   graph per step (backbone + head), replayed step by step; the same output as the eager loop.
+- **Across sentences** (`Synthesizer(paragraph=, acoustic_context=)`, #87): an ARDrift checkpoint reads in paragraph
+  mode by default (units of up to 180 characters in one pass: one pass beats sentence by sentence below). A unit
+  after the first continues from the last 256 frames (2.7 s) generated before it: their mel and the condition they
+  were generated under are put in front of the unit's sequence (`generate(prefix=, prefix_cond=)`), so the backbone
+  starts from that history, as inside a long training utterance, instead of from the beginning-of-sequence patch.
+  No noise is drawn for the context, and context and unit together stay within `data.max_frames`.
+  `acoustic_context=0` (`--acoustic-context 0`) gives independent units as before. **Not measured yet:** compare
+  `benchmark --join 3` and `prosody` with and without it before relying on it.
+- **Operating point:** calls without `temperature` / `cfg_scale` use the checkpoint's (`calibrate-durations
+  --temperature / --cfg`), else temperature 0.5 and no guidance (cfg 1), the setting of the results below.
 
 ## Training
 
@@ -312,6 +322,11 @@ drifting-tts train-ar --config configs/ar_tts_ft.yaml --workdir runs/ar_ft \
 drifting-tts calibrate-durations --model runs/ar_ft/model_ema.pt --speakers 722 389 323
 drifting-tts benchmark --model runs/ar_ft/model_ema.pt --vocoder vocos-v2 --num 100 --speaker studio \
     --temperature 0.5 --cfg 1 --pause punct
+# paragraphs of three sentences, sentence by sentence: with and without the acoustic context of the sentence before
+drifting-tts benchmark --model runs/ar_ft/model_ema.pt --vocoder vocos-v2 --speaker studio --join 3 --paragraph 0 \
+    --pause punct --out outputs/bench_ctx
+drifting-tts benchmark --model runs/ar_ft/model_ema.pt --vocoder vocos-v2 --speaker studio --join 3 --paragraph 0 \
+    --pause punct --acoustic-context 0 --out outputs/bench_noctx
 
 # new voices from 16 kHz recordings: prepare + score each (data/voiceN), re-cut at the words, merge (the voices'
 # scores carried over by src_i, without bw_hz), fine-tune, then the bandwidth extension

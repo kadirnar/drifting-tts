@@ -20,7 +20,10 @@ from .latents import VAE_BACKENDS
 from .text import frontend, group_sentences, normalize, split_sentences, text_to_ids  # noqa: F401 (re-exported)
 from .voices import DEFAULT_VOICE, VOICES, voice_id
 
-DEFAULT_TEMPERATURE = 0.5  # CLI default noise temperature (lowest CER in the README sweep)
+DEFAULT_TEMPERATURE = 0.5  # noise temperature of a checkpoint without a stored one (lowest CER in the README sweep)
+DEFAULT_CFG = {"dit": 2.0, "ar": 1.0}  # guidance of a checkpoint without a stored one: the DiT's operating point
+#                                        (README), none for ARDrift (it does not help: docs/AR_DRIFT.md)
+AR_CONTEXT_FRAMES = 256  # ARDrift: frames of the audio before a unit that it continues from (2.7 s)
 PARAGRAPH_CHARS = 180  # paragraph mode: characters per unit, within the CUDA graphs' buckets (fast.warmup)
 CONTEXT_CHARS = 190  # left context + unit, within the 384-token bucket of the CUDA graphs
 DURATION_SOURCES = ("sampled", "regressor", "pauses")
@@ -40,9 +43,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--list-speakers", action="store_true", help="list the voices")
     p.add_argument("--out", default="out.wav")
     p.add_argument("--out-dir", default="outputs/synth")
-    p.add_argument("--cfg", type=float, default=1.0, help="guidance scale alpha learned during training")
+    p.add_argument("--cfg", type=float, default=None,
+                   help="guidance scale alpha learned during training (default: the release's, the checkpoint's "
+                        "preferred one, else 2 for the DiT and 1 for ARDrift)")
     p.add_argument("--temperature", type=float, default=None,
-                   help=f"noise temperature (default: the checkpoint's preferred one, else {DEFAULT_TEMPERATURE})")
+                   help=f"noise temperature (default: the release's, the checkpoint's preferred one, else "
+                        f"{DEFAULT_TEMPERATURE})")
     p.add_argument("--length-scale", type=float, default=1.0,
                    help=">1 slower, <1 faster speech (on top of the calibrated duration_scale)")
     p.add_argument("--seed", type=int, default=0)
@@ -74,9 +80,13 @@ def add_args(p: argparse.ArgumentParser) -> None:
                    help="regressor: --prosody samples only the token pitch; durations stay the model's; pauses: it "
                         "also samples the durations between words (pauses, phrase breaks), the letters' stay the "
                         "model's (default: the release's, else sampled)")
-    p.add_argument("--paragraph", type=int, nargs="?", const=PARAGRAPH_CHARS, default=0, metavar="CHARS",
+    p.add_argument("--paragraph", type=int, nargs="?", const=PARAGRAPH_CHARS, default=None, metavar="CHARS",
                    help=f"paragraph mode: consecutive sentences in one pass, up to CHARS characters per unit "
-                        f"(default {PARAGRAPH_CHARS}); the model renders the gaps between them")
+                        f"(default {PARAGRAPH_CHARS}); the model renders the gaps between them. 0: sentence by "
+                        f"sentence. Default: the release's, else on for ARDrift and off for the DiT")
+    p.add_argument("--acoustic-context", type=int, default=None, metavar="FRAMES",
+                   help=f"ARDrift: frames of the audio before a unit that it continues from (default "
+                        f"{AR_CONTEXT_FRAMES}; 0: every unit starts from silence)")
     p.add_argument("--context", action="store_true",
                    help="condition each sentence (unit) on the text before it (text encoder and prosody predictor)")
     add_vocoder_args(p)
@@ -138,13 +148,56 @@ def preferred_temperature(model) -> float:
     return DEFAULT_TEMPERATURE if t is None else float(t)
 
 
+def is_ar(model) -> bool:
+    """Whether ``model`` is an ARDrift model (:class:`drifting_tts.models.ar.ARDriftTTS`), not the DiT."""
+    return getattr(model, "generator", None) is None
+
+
+def preferred_cfg(model) -> float:
+    """The checkpoint's preferred guidance scale (``calibrate-durations --cfg``), else the architecture's
+    (:data:`DEFAULT_CFG`)."""
+    c = getattr(model, "cfg_scale", None)
+    return DEFAULT_CFG["ar" if is_ar(model) else "dit"] if c is None else float(c)
+
+
+class AcousticContext:
+    """ARDrift across the units of one call: the end of what was generated so far (the aligned condition and the
+    normalised mel, the last ``frames`` frames, whole patches), given to the next unit as the prefix of
+    :meth:`drifting_tts.models.ar.ARDriftTTS.generate`. The next unit then continues the voice and the intonation of
+    the previous one, as the model continues a multi-sentence utterance in training, instead of starting from the
+    beginning-of-sequence patch. ``limit``: frames of context and unit together (the longest training utterance)."""
+
+    def __init__(self, frames: int, patch: int, limit: int):
+        self.frames, self.patch, self.limit = frames // patch * patch, patch, limit
+        self.cond: torch.Tensor | None = None
+        self.mel: torch.Tensor | None = None
+
+    def prefix(self, unit_frames: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """``(prefix_cond, prefix)`` for a unit of ``unit_frames`` frames, or ``(None, None)``."""
+        if self.cond is None:
+            return None, None
+        n = min(self.cond.shape[-1], self.limit - unit_frames) // self.patch * self.patch
+        return (self.cond[..., -n:], self.mel[..., -n:]) if n > 0 else (None, None)
+
+    def update(self, cond: torch.Tensor, mel: torch.Tensor) -> None:
+        """Append a generated unit (its condition ``[1, C, T]`` and normalised mel ``[1, n_mels, T]``)."""
+        t = min(cond.shape[-1], mel.shape[-1]) // self.patch * self.patch  # whole patches: the tail frames are dropped
+        if not t or not self.frames:
+            return
+        cond, mel = cond[..., :t], mel[..., :t]
+        if self.cond is not None:
+            cond, mel = torch.cat([self.cond, cond], -1), torch.cat([self.mel, mel], -1)
+        self.cond, self.mel = cond[..., -self.frames:], mel[..., -self.frames:]
+
+
 class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False,
                  prosody: str | Path | None = None, prosody_temperature: float | None = None,
                  prosody_spread: float = 1.0, prosody_durations: str = "sampled", pause: Pause = 0.15,
                  prosody_duration_temperature: float | None = None, prosody_pitch: str | Path | None = None,
-                 paragraph: bool | int = False, context: bool = False):
+                 paragraph: bool | int | None = None, context: bool = False, temperature: float | None = None,
+                 cfg_scale: float | None = None, acoustic_context: bool | int | None = None):
         """``vocoder``: a name of :data:`drifting_tts.vocoder.VOCODERS` (e.g. ``bigvgan-v2-ft``, ``griffin-lim``), a
         checkpoint path, or ``None`` for the stock vocoder of the model's mel front end. A model trained on VAE
         latents decodes with the VAE decoder: ``vocoder`` is then ``None`` (the released decoder) or a fine-tuned
@@ -161,11 +214,19 @@ class Synthesizer:
         :class:`~drifting_tts.prosody.PausePolicy`, or ``"punct"``: by punctuation, measured per voice).
         ``paragraph``: synthesise consecutive sentences together, up to :data:`PARAGRAPH_CHARS` characters (or the
         given number) per pass (:func:`drifting_tts.text.group_sentences`); the pauses then only separate the units.
+        ``None``: on for an ARDrift model (it is trained on multi-sentence utterances and reads them better in one
+        pass, docs/AR_DRIFT.md), off for the DiT.
+        ``temperature`` / ``cfg_scale``: the operating point of the calls that do not give one (``default_temperature``
+        / ``default_cfg``). ``None``: the checkpoint's (``calibrate-durations --temperature / --cfg``), else 0.5 and
+        the architecture's guidance (:data:`DEFAULT_CFG`: 2 for the DiT, 1 for ARDrift).
+        ``acoustic_context`` (ARDrift): a unit after the first continues from the last frames generated before it
+        (:class:`AcousticContext`), instead of starting from silence: ``None`` / ``True``
+        :data:`AR_CONTEXT_FRAMES` frames, a number that many, ``False`` / 0 none. The DiT has none.
         ``context``: each sentence (unit) is conditioned on the text before it: the end of the previous one, whole
         words, up to :data:`CONTEXT_CHARS` characters with the current one, runs through the text encoder and the
         prosody predictor with it, and only the current one is generated (:meth:`DriftingTTS.synthesize`).
         :meth:`from_pretrained` builds a published release (v3.2: ``vocos-v2``, ``prosody="drift"``,
-        ``pause="punct"``)."""
+        ``pause="punct"``, T 0.3, guidance 2)."""
         from .train import load_tts
         from .vocoder import load_vocoder
 
@@ -187,14 +248,21 @@ class Synthesizer:
             raise ValueError(f"vocoder {self.vocoder.name!r} expects {self.vocoder.mel} mels, but the model produces "
                              f"{self.backend} mels")
         self.device = device
-        self.default_temperature = preferred_temperature(self.model)
+        self.ar = is_ar(self.model)
+        self.default_temperature = preferred_temperature(self.model) if temperature is None else float(temperature)
+        self.default_cfg = preferred_cfg(self.model) if cfg_scale is None else float(cfg_scale)
+        if acoustic_context and not self.ar:
+            raise ValueError("acoustic_context is ARDrift's: the DiT generates each unit from noise alone")
+        if acoustic_context is None or acoustic_context is True:
+            acoustic_context = AR_CONTEXT_FRAMES if self.ar else 0
+        self.acoustic_context = int(acoustic_context)
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
         self.acoustic, self.vocoder_graphs, self.prosody = None, None, None
         self.fast, self._graph_opts = fast, {"compile": compile, "tf32": tf32}
         resolve_pause(pause, 0)  # validate
         self.pause = pause
-        self.paragraph, self.context = paragraph, context
+        self.paragraph, self.context = self.ar if paragraph is None else paragraph, context
         self.set_prosody(prosody, prosody_temperature, prosody_spread, prosody_durations, prosody_duration_temperature,
                          prosody_pitch)
         if fast:
@@ -222,7 +290,8 @@ class Synthesizer:
                 prosody_spread: float = 1.0, prosody_durations: str = "sampled",
                 prosody_duration_temperature: float | None = None,
                 prosody_pitch: str | Path | None = None, paragraph: bool | int = _KEEP,
-                context: bool = _KEEP) -> Synthesizer:
+                context: bool = _KEEP, temperature: float = _KEEP, cfg_scale: float = _KEEP,
+                acoustic_context: bool | int = _KEEP) -> Synthesizer:
         """A Synthesizer that shares this one's acoustic model (no second copy in memory) with another vocoder (a
         registry name, a checkpoint or a loaded :class:`~drifting_tts.vocoder.Vocoder`), prosody source
         (:meth:`set_prosody`) or default pause; arguments left out are kept. E.g. v3.1 next to v3.2:
@@ -250,7 +319,42 @@ class Synthesizer:
             other.paragraph = paragraph
         if context is not _KEEP:
             other.context = context
+        if temperature is not _KEEP:
+            other.default_temperature = float(temperature)
+        if cfg_scale is not _KEEP:
+            other.default_cfg = float(cfg_scale)
+        if acoustic_context is not _KEEP:
+            if acoustic_context and not self.ar:
+                raise ValueError("acoustic_context is ARDrift's")
+            other.acoustic_context = AR_CONTEXT_FRAMES if acoustic_context is True else int(acoustic_context)
         return other
+
+    def operating_point(self, cfg_scale: float | None = None, temperature: float | None = None) -> tuple[float, float]:
+        """``(cfg_scale, temperature)`` of a call: the given ones, else the Synthesizer's defaults."""
+        return (self.default_cfg if cfg_scale is None else float(cfg_scale),
+                self.default_temperature if temperature is None else float(temperature))
+
+    def _history(self, acoustic_context: bool | int | None = None) -> AcousticContext | None:
+        """The acoustic context of one call (``acoustic_context``: this call's, default the Synthesizer's), or
+        ``None``: the DiT, or switched off."""
+        n = self.acoustic_context if acoustic_context is None else \
+            AR_CONTEXT_FRAMES if acoustic_context is True else int(acoustic_context)
+        if not self.ar or n <= 0:
+            return None
+        return AcousticContext(n, self.model.patch, int(self.cfg.data.get("max_frames", 1500)))
+
+    def _ar_generate(self, cond: torch.Tensor, spk: torch.Tensor, temperature: float, g: torch.Generator,
+                     cfg_scale: float, history: AcousticContext | None) -> torch.Tensor:
+        """ARDrift: the normalised mel of one unit's aligned condition, continuing from ``history`` (then updated)."""
+        m = self.model
+        pc, pm = (None, None) if history is None else history.prefix(cond.shape[-1])
+        if m.fast_generator is not None:
+            mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc)
+        else:
+            mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc)
+        if history is not None:
+            history.update(cond, mel)
+        return mel
 
     @staticmethod
     def with_context(sentence: str, previous: str | None, language: str = "tr") -> tuple[list[int], int]:
@@ -408,10 +512,12 @@ class Synthesizer:
     def _mel(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
              length_scale: float, attn_window: int | None = None, pitch_shift: float = 0.0,
              steps: int | None = None, prosody_temperature: float | None = None,
-             rhythm: tuple[torch.Tensor, float] | None = None, previous: str | None = None) -> torch.Tensor:
+             rhythm: tuple[torch.Tensor, float] | None = None, previous: str | None = None,
+             history: AcousticContext | None = None) -> torch.Tensor:
         """One normalised sentence -> normalised mel ``[1, n_mels, T]`` (CUDA graphs when ``fast`` allows it).
         ``rhythm``: the speaker whose durations are sampled and the edge factor (:meth:`_rhythm`); ``previous``: the
-        text before it, as left context (:meth:`with_context`)."""
+        text before it, as left context (:meth:`with_context`); ``history`` (ARDrift): the audio before it
+        (:meth:`_history`)."""
         ids, ctx = self.with_context(sentence, previous, self.language)
         ids = torch.tensor([ids], device=self.device)
         pt = self.prosody_temperature if prosody_temperature is None else prosody_temperature
@@ -436,6 +542,9 @@ class Synthesizer:
                                                       spread=self.prosody_spread)
             if self.prosody_durations == "regressor":
                 durations = None
+        if self.ar:  # ARDriftTTS.synthesize, with the acoustic context of the units before
+            cond, _ = self.model.aligned_condition(ids, ids_len, spk, length_scale, pitch_shift, durations, pitch, ctx)
+            return self._ar_generate(cond, spk, temperature, g, cfg_scale, history)
         mel, _ = self.model.synthesize(ids, ids_len, spk, cfg_scale=cfg_scale, temperature=temperature,
                                        length_scale=length_scale, generator=g, attn_window=attn_window,
                                        pitch_shift=pitch_shift, steps=steps, durations=durations, pitch=pitch,
@@ -528,40 +637,48 @@ class Synthesizer:
         return generate
 
     @torch.no_grad()
-    def mels(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
-             length_scale: float = 1.0, seed: int = 0, prosody_temperature: float | None = None,
-             paragraph: bool | int | None = None, context: bool | None = None) -> list[torch.Tensor]:
+    def mels(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float | None = None,
+             temperature: float | None = None, length_scale: float = 1.0, seed: int = 0,
+             prosody_temperature: float | None = None, paragraph: bool | int | None = None,
+             context: bool | None = None, acoustic_context: bool | int | None = None) -> list[torch.Tensor]:
         """The unnormalised log-mel ``[1, n_mels, T]`` of each sentence (each unit, :meth:`units`), with the same
         draws as :meth:`__call__` (whose waveform joins their vocoded sentences with ``pause`` seconds of silence)."""
         spk, tempo = self._speaker(speaker)
         rhythm = self._rhythm(speaker)
+        cfg_scale, temperature = self.operating_point(cfg_scale, temperature)
         g = torch.Generator(device=self.device).manual_seed(seed)
+        history = self._history(acoustic_context)
         return [self.stats.denormalize(self._mel(s, spk, g, cfg_scale, temperature, length_scale * tempo,
                                                  prosody_temperature=prosody_temperature, rhythm=rhythm,
-                                                 previous=prev))
+                                                 previous=prev, history=history))
                 for s, prev in self._units(text, paragraph, context)]
 
     @torch.no_grad()
-    def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0,
-                 temperature: float = 1.0, length_scale: float = 1.0, seed: int = 0, pause: Pause | None = None,
-                 attn_window: int | None = None, pitch_shift: float = 0.0, steps: int | None = None,
-                 prosody_temperature: float | None = None, paragraph: bool | int | None = None,
-                 context: bool | None = None) -> tuple[torch.Tensor, dict]:
+    def __call__(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float | None = None,
+                 temperature: float | None = None, length_scale: float = 1.0, seed: int = 0,
+                 pause: Pause | None = None, attn_window: int | None = None, pitch_shift: float = 0.0,
+                 steps: int | None = None, prosody_temperature: float | None = None,
+                 paragraph: bool | int | None = None, context: bool | None = None,
+                 acoustic_context: bool | int | None = None) -> tuple[torch.Tensor, dict]:
         """``text`` -> waveform (CPU float tensor at 24 kHz) and timings. Sentence by sentence (or ``paragraph`` by
         paragraph, :meth:`units`), each in one pass and vocoded whole, joined by ``pause`` (default: the
-        Synthesizer's; seconds, a callable or ``"punct"``). ``prosody_temperature``: this call's noise temperature of
-        the prosody predictor (default: the Synthesizer's); ``context``: see :class:`Synthesizer`."""
+        Synthesizer's; seconds, a callable or ``"punct"``). ``cfg_scale`` / ``temperature``: default the
+        Synthesizer's operating point (:meth:`operating_point`: the checkpoint's or the release's, not 1 / 1).
+        ``prosody_temperature``: this call's noise temperature of the prosody predictor (default: the
+        Synthesizer's); ``context`` / ``acoustic_context``: see :class:`Synthesizer`."""
         spk, tempo = self._speaker(speaker)
         rhythm = self._rhythm(speaker)
         pause = self._pause(pause, speaker, context)
+        cfg_scale, temperature = self.operating_point(cfg_scale, temperature)
         g = torch.Generator(device=self.device).manual_seed(seed)
+        history = self._history(acoustic_context)
         wavs, t_acoustic, t_vocoder = [], 0.0, 0.0
         rng = random.Random(seed)  # pause jitter only: the acoustic draws stay those of ``g``
         for sentence, prev in self._units(text, paragraph, context):
             self._sync()
             t0 = time.perf_counter()
             mel = self._mel(sentence, spk, g, cfg_scale, temperature, length_scale * tempo, attn_window,
-                            pitch_shift, steps, prosody_temperature, rhythm, prev)
+                            pitch_shift, steps, prosody_temperature, rhythm, prev, history)
             self._sync()
             t1 = time.perf_counter()
             wav = self.vocoder(self.stats.denormalize(mel))[0].cpu()
@@ -574,12 +691,14 @@ class Synthesizer:
         return wav, {"seconds": dur, "rtf_acoustic": t_acoustic / dur, "rtf_total": (t_acoustic + t_vocoder) / dur}
 
     @torch.no_grad()
-    def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float = 1.0, temperature: float = 1.0,
-               length_scale: float = 1.0, seed: int = 0, pause: Pause | None = None,
-               first: int = 32, chunk: int = 256, prosody_temperature: float | None = None,
-               chunked: Chunking | bool | None = None, paragraph: bool | int | None = None,
-               context: bool | None = None) -> Iterator[torch.Tensor]:
-        """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz).
+    def stream(self, text: str, speaker: str | int = DEFAULT_VOICE, cfg_scale: float | None = None,
+               temperature: float | None = None, length_scale: float = 1.0, seed: int = 0,
+               pause: Pause | None = None, first: int = 32, chunk: int = 256,
+               prosody_temperature: float | None = None, chunked: Chunking | bool | None = None,
+               paragraph: bool | int | None = None, context: bool | None = None,
+               acoustic_context: bool | int | None = None) -> Iterator[torch.Tensor]:
+        """Yield the waveform in pieces as soon as each is ready (CPU float tensors at 24 kHz); the operating point
+        and the options are those of :meth:`__call__`.
 
         Each sentence (each unit, :meth:`units`) is generated in one pass. The vocoder then streams: the first
         ``first`` mel frames (0.34 s), then ``chunk``-frame windows, each with the vocoder's ``context`` (32 frames
@@ -590,9 +709,10 @@ class Synthesizer:
         It runs on windows of the sentence (the first one ``first`` + the vocoder's context + ``right`` frames long),
         so the first piece no longer waits for the whole sentence's mel; ``chunk`` is then ``chunked.chunk``. The
         output is another sample of the same model, not the same audio (docs/LATENCY.md)."""
-        if getattr(self.model, "generator", None) is None:  # ARDrift: generated step by step, streamed as it goes
+        cfg_scale, temperature = self.operating_point(cfg_scale, temperature)
+        if self.ar:  # ARDrift: generated step by step, streamed as it goes
             yield from self._stream_ar(text, speaker, cfg_scale, temperature, length_scale, seed, pause, first, chunk,
-                                       paragraph, context)
+                                       paragraph, context, acoustic_context)
             return
         if chunked:
             yield from self._stream_chunked(text, speaker, cfg_scale, temperature, length_scale, seed, pause, first,
@@ -619,10 +739,11 @@ class Synthesizer:
 
     def _stream_ar(self, text: str, speaker: str | int, cfg_scale: float, temperature: float, length_scale: float,
                    seed: int, pause: Pause | None, first: int, chunk: int, paragraph: bool | int | None,
-                   context: bool | None) -> Iterator[torch.Tensor]:
+                   context: bool | None, acoustic_context: bool | int | None = None) -> Iterator[torch.Tensor]:
         """:meth:`stream` for an ARDrift model: each vocoder window runs as soon as the steps that cover it and its
-        right context are generated, so the first piece waits for ``first`` + context frames, not the sentence. The
-        same draws as :meth:`__call__` (the audio matches it up to the vocoder's streaming windows)."""
+        right context are generated, so the first piece waits for ``first`` + context frames, not the sentence (a
+        unit after the first also for the steps of its acoustic context, which only fill the caches). The same draws
+        as :meth:`__call__` (the audio matches it up to the vocoder's streaming windows)."""
         from .batched import stream_windows
         from .fast import stream_vocoder, vocode_window
         from .models.ar import ARGenerator
@@ -635,22 +756,26 @@ class Synthesizer:
         voc, ctx = self.vocoder, self.vocoder.context
         sizes = () if ctx is None else (first + ctx, chunk + 2 * ctx)
         rng, previous = random.Random(seed), None
+        history = self._history(acoustic_context)
         for sentence, prev in self._units(text, paragraph, context):
             ids, c = self.with_context(sentence, prev, self.language)
             ids = torch.tensor([ids], device=self.device)
             cond, _ = m.aligned_condition(ids, torch.tensor([ids.shape[1]], device=self.device), spk,
                                           length_scale * tempo, context=c)
             t = cond.shape[-1]
+            pc, pm = (None, None) if history is None else history.prefix(t)
             if previous is not None:
                 yield silence(pause, previous, rng)
             previous = sentence
-            if m.pad_frames(cond).shape[-1] // m.patch > gen.max_steps:  # longer than the caches: whole sentence
-                mel = self.stats.denormalize(m.generate(cond, spk, temperature, g, cfg_scale=cfg_scale))
-                for piece in stream_vocoder(voc, mel, first=first, chunk=chunk, context=ctx,
+            if not gen.fits(t, 0 if pc is None else pc.shape[-1]):  # longer than the caches: whole sentence
+                mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc)
+                if history is not None:
+                    history.update(cond, mel)
+                for piece in stream_vocoder(voc, self.stats.denormalize(mel), first=first, chunk=chunk, context=ctx,
                                             graphs=self.vocoder_graphs):
                     yield piece.cpu()
                 continue
-            steps = gen.steps(cond, spk, temperature, g, cfg_scale)
+            steps = gen.steps(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc)
             mel = torch.zeros(1, m.n_mels, m.pad_frames(cond).shape[-1], device=self.device)
             done = 0
             for a, b, start, n in stream_windows(t, first, chunk, ctx):
@@ -660,8 +785,11 @@ class Synthesizer:
                 x = self.stats.denormalize(mel[..., a:b])
                 yield vocode_window(voc, x, self.vocoder_graphs, sizes)[start * HOP_LENGTH: (start + n) * HOP_LENGTH
                                                                         ].cpu()
-            for _ in steps:  # the remaining draws, so that the next sentence's match __call__'s
-                pass
+            for patch in steps:  # the remaining draws, so that the next sentence's match __call__'s
+                mel[..., done: done + m.patch] = patch.view(1, m.patch, m.n_mels).transpose(1, 2)
+                done += m.patch
+            if history is not None:
+                history.update(cond, mel[..., :t])
 
     def _stream_chunked(self, text: str, speaker: str | int, cfg_scale: float, temperature: float,
                         length_scale: float, seed: int, pause: Pause | None, first: int,
@@ -732,10 +860,13 @@ def pipeline_args(args) -> dict:
     if pause == "punct" and getattr(args, "pause_jitter", 0.0):
         pause = f"punct:{args.pause_jitter}"
     durations = getattr(args, "prosody_durations", None) or rel.get("prosody_durations", "sampled")
+    paragraph = getattr(args, "paragraph", None)  # None: the release's, else the model's default; 0: off
     return {"model_path": model, "vocoder": args.vocoder or rel.get("vocoder"),
             "prosody": None if str(prosody).lower() == "none" else prosody, "prosody_durations": durations,
-            "pause": pause, "paragraph": getattr(args, "paragraph", 0) or rel.get("paragraph", False),
-            "context": bool(getattr(args, "context", False))}
+            "pause": pause, "paragraph": rel.get("paragraph") if paragraph is None else paragraph or False,
+            "context": bool(getattr(args, "context", False)),
+            "temperature": rel.get("temperature"), "cfg_scale": rel.get("cfg_scale"),
+            "acoustic_context": getattr(args, "acoustic_context", None)}
 
 
 def run(args) -> None:
@@ -748,8 +879,7 @@ def run(args) -> None:
             default = " (default)" if name == DEFAULT_VOICE else ""
             print(f"{name:7s} speaker {v['id']}, median pitch {v['pitch_hz']} Hz{default}")
         return
-    temperature = synth.default_temperature if args.temperature is None else args.temperature
-    kw = dict(speaker=args.speaker, cfg_scale=args.cfg, temperature=temperature,
+    kw = dict(speaker=args.speaker, cfg_scale=args.cfg, temperature=args.temperature,  # None: the Synthesizer's
               length_scale=args.length_scale, seed=args.seed, attn_window=args.attn_window,
               pitch_shift=args.pitch_shift, steps=args.steps)
     if args.text_file:

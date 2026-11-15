@@ -25,6 +25,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--temperature", type=float, default=None,
                    help="also store the preferred noise temperature (chosen with `evaluate --split dev`); "
                         "synthesize / evaluate use it by default")
+    p.add_argument("--cfg", type=float, default=None,
+                   help="also store the preferred guidance scale; the Synthesizer and the CLIs use it by default")
     p.add_argument("--dry-run", action="store_true", help="only print the ratio")
     p.add_argument("--speakers", nargs="*", default=None,
                    help="voices / speaker IDs that get their own factor (default: the offered voices)")
@@ -75,6 +77,9 @@ def run(args) -> None:
     ck["duration_scale"], ck["duration_scales"] = scale, scales
     if args.temperature is not None:
         ck["temperature"] = args.temperature
+    if args.cfg is not None:
+        ck["cfg_scale"] = args.cfg
     save_checkpoint(args.model, **ck)
     extra = "" if args.temperature is None else f" and temperature={args.temperature:g}"
+    extra += "" if args.cfg is None else f" and cfg_scale={args.cfg:g}"
     print(f"stored duration_scale={scale:.3f}, {len(scales)} per-voice factors{extra} in {args.model}")

@@ -159,3 +159,53 @@ def test_benchmark_text_sets_and_band_matching(tmp_path):
     full, narrow = band_match(tone, 0), band_match(tone, 8000)
     assert len(full) == len(narrow) == 16_000
     assert (narrow ** 2).mean() < 0.01 * (full ** 2).mean()  # band-matching removes it
+
+
+def test_benchmark_follows_the_checkpoint_language_and_operating_point(tmp_path, monkeypatch):
+    """#86 / #87: an English ARDrift checkpoint is transcribed and normalised in English, at its own operating point
+    (no guidance, paragraph mode, acoustic context), and needs its own text set."""
+    import drifting_tts.judges
+    import drifting_tts.vocoder
+    from drifting_tts.config import Config
+    from drifting_tts.models.ar import ARDriftTTS
+    from tests.test_ar import CFG
+
+    class FakeVocoder:
+        context = None
+
+        def __init__(self, *args, backend="vocos", **kwargs):
+            self.mel, self.name = backend, "fake"
+
+        def __call__(self, mel):
+            return 0.1 * torch.sin(0.05 * torch.arange(mel.shape[-1] * 256, dtype=torch.float32))[None]
+
+    model = {**CFG, "text": {**CFG["text"], "language": "en"}}
+    torch.manual_seed(0)
+    tts = ARDriftTTS(Config(model), num_speakers=3)
+    torch.save({"ema": tts.state_dict(), "config": {"data": {"root": str(tmp_path)}, "model": model},
+                "num_speakers": 3, "stats": {"mean": -5.0, "std": 2.0, "backend": "bigvgan"}}, tmp_path / "en.pt")
+    (tmp_path / "en.txt").write_text("It's 7:45, isn't it?\nDr. Smith paid $12.50.\n")
+    seen = {}
+
+    def fake_judges(*args, language="tr", **kwargs):
+        seen["language"] = language
+        return Judges(asr=lambda w: "It's 7:45, isn't it?", mos=None)
+
+    monkeypatch.setattr(drifting_tts.vocoder, "load_vocoder", FakeVocoder)
+    monkeypatch.setattr(drifting_tts.judges, "load_judges", fake_judges)
+    out = tmp_path / "bench"
+    args = ["benchmark", "--model", str(tmp_path / "en.pt"), "--speaker", "1", "--device", "cpu", "--out", str(out)]
+    with pytest.raises(SystemExit, match="--texts is required"):  # the default set is Turkish
+        main(args)
+    main([*args, "--texts", str(tmp_path / "en.txt")])
+    r = json.loads((out / "results.json").read_text())
+    assert seen["language"] == "en" and r["language"] == "en" and r["sentences"] == 2
+    rows = [json.loads(line) for line in open(out / "utterances.jsonl")]
+    assert rows[0]["ref"] == rows[0]["hyp"] == "it's seven forty five isn't it"  # the English frontend, both sides
+    assert rows[0]["word_errors"] == 0 and rows[1]["ref"].startswith("doctor smith paid twelve dollars")
+    assert r["rows"][0]["cfg"] == 1.0 and r["rows"][0]["temperature"] == 0.5  # ARDrift's, not the DiT's guidance 2
+    assert r["paragraph"] is True and r["acoustic_context"] == 256
+    main([*args, "--texts", str(tmp_path / "en.txt"), "--cfg", "1.5", "--paragraph", "0", "--acoustic-context", "0"])
+    r = json.loads((out / "results.json").read_text())
+    assert r["rows"][0]["cfg"] == 1.5 and r["paragraph"] is False and r["acoustic_context"] == 0
+

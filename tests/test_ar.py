@@ -96,6 +96,34 @@ def test_train_ar_cli_and_synthesis(tmp_path):
     assert streamed.shape == wav.shape  # Griffin-Lim does not stream: one piece per sentence, the same draws
     torch.testing.assert_close(streamed, wav, atol=1e-4, rtol=1e-4)
 
+    # the defaults of an ARDrift checkpoint (#87): its operating point (no guidance, T 0.5, not 1 / 1), paragraph
+    # mode, and a unit after the first continues from the audio before it
+    text = "merhaba dünya. nasılsın?"
+    assert synth.ar and synth.operating_point() == (1.0, 0.5)
+    assert synth.paragraph is True and synth.units(text) == [text]
+    assert synth.units(text, paragraph=False) == ["merhaba dünya.", "nasılsın?"]
+    assert synth.acoustic_context == 256 and synth.variant(acoustic_context=0).acoustic_context == 0
+    torch.testing.assert_close(synth(text, speaker=0, seed=1)[0], wav)  # temperature 0.5 is the default
+    with torch.no_grad():
+        for q in synth.model.parameters():  # two training steps leave the output layers near zero
+            q.add_(torch.randn_like(q) * 0.05)
+    on = synth.mels(text, speaker=0, seed=1, paragraph=False)
+    off = synth.mels(text, speaker=0, seed=1, paragraph=False, acoustic_context=0)
+    assert [m.shape for m in on] == [m.shape for m in off] and len(on) == 2
+    assert torch.equal(on[0], off[0]) and not torch.allclose(on[1], off[1], atol=1e-3)  # the same draws, a history
+    m = synth.model  # the second unit is the model's continuation of the first one's last whole patches
+    cond = [m.aligned_condition(torch.tensor([synth.text.text_to_ids(u, normalized=True)]),
+                                torch.tensor([2 * len(u) + 1]), torch.tensor([0]))[0] for u in ("merhaba dünya.",
+                                                                                               "nasılsın?")]
+    n = cond[0].shape[-1] // m.patch * m.patch
+    g = torch.Generator().manual_seed(1)
+    first = m.generate(cond[0], torch.tensor([0]), 0.5, g)
+    second = m.generate(cond[1], torch.tensor([0]), 0.5, g, prefix=first[..., :n], prefix_cond=cond[0][..., :n])
+    torch.testing.assert_close(synth.stats.denormalize(second), on[1], atol=1e-4, rtol=1e-4)
+    a = synth(text, speaker=0, seed=1, paragraph=False)[0]
+    b = torch.cat(list(synth.stream(text, speaker=0, seed=1, paragraph=False)))
+    torch.testing.assert_close(b, a, atol=1e-4, rtol=1e-4)  # the streaming path carries the same history
+
 
 def test_fast_generator_matches_generate():
     import pytest
@@ -194,3 +222,63 @@ def test_training_step_with_band_energies_and_own_history():
     training_step(m, batch, cfg, "cpu", tau, mel_std=2.4)
     hist = seen[-1]
     assert hist.shape[-1] == 40 and not torch.allclose(hist, batch["mel"][:, :, :40])
+
+
+
+def test_generation_continues_an_acoustic_context():
+    """``prefix`` + ``prefix_cond``: the frames of ``cond`` are those the model generates for it at the end of one
+    longer utterance (the same noise), and no noise is drawn for the context."""
+    import pytest
+
+    from drifting_tts.models.ar import ARGenerator
+
+    m = _model()
+    ca, cb, spk = torch.randn(2, 116, 16), torch.randn(2, 116, 13), torch.tensor([0, 2])
+    for cfg in (1.0, 1.5):
+        joint = m.generate(torch.cat([ca, cb], -1), spk, 0.7, torch.Generator().manual_seed(3), cfg_scale=cfg)
+
+        def after_context():
+            g = torch.Generator().manual_seed(3)
+            for _ in range(4):  # the draws of the four steps of the first utterance
+                torch.randn(2, m.head.noise_dim, generator=g)
+            return g
+
+        cont = m.generate(cb, spk, 0.7, after_context(), prefix=joint[..., :16], cfg_scale=cfg, prefix_cond=ca)
+        assert cont.shape == (2, 100, 13)
+        torch.testing.assert_close(cont, joint[..., 16:], atol=1e-4, rtol=1e-4)
+        fast = ARGenerator(m, max_steps=16, graphs=False)
+        out = fast(cb, spk, 0.7, after_context(), cfg, prefix=joint[..., :16], prefix_cond=ca)
+        torch.testing.assert_close(out, cont, atol=1e-4, rtol=1e-4)
+        assert not fast.fits(13, 64) and fast.fits(13, 48) and not ARGenerator(m, max_steps=6).fits(13, 16)
+        short = ARGenerator(m, max_steps=6, graphs=False)  # context + unit exceed the caches: the eager loop
+        torch.testing.assert_close(short(cb, spk, 0.7, after_context(), cfg, prefix=joint[..., :16], prefix_cond=ca),
+                                   cont, atol=1e-4, rtol=1e-4)
+    # kept leading frames (no prefix_cond): the fast generator yields them as generate does
+    y = torch.randn(2, 100, 8)
+    cond = torch.cat([ca, cb], -1)
+    ref = m.generate(cond, spk, 0.7, torch.Generator().manual_seed(4), prefix=y)
+    assert torch.equal(ref[..., :8], y)
+    out = ARGenerator(m, max_steps=16, graphs=False)(cond, spk, 0.7, torch.Generator().manual_seed(4), prefix=y)
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    with pytest.raises(ValueError, match="multiple of the patch"):
+        m.generate(cb, spk, prefix=joint[..., :6], prefix_cond=ca[..., :6])
+    with pytest.raises(ValueError, match="same number of frames"):
+        m.generate(cb, spk, prefix=joint[..., :8], prefix_cond=ca)
+
+
+def test_acoustic_context_keeps_the_last_whole_patches():
+    from drifting_tts.synthesize import AcousticContext
+
+    h = AcousticContext(frames=10, patch=4, limit=24)  # 8 frames of context, at most 24 frames with the unit
+    assert h.frames == 8 and h.prefix(12) == (None, None)
+    cond, mel = torch.arange(10.0).view(1, 1, 10), torch.arange(10.0).view(1, 1, 10) + 100
+    h.update(cond, mel)  # 10 frames: two whole patches, the last two frames are dropped
+    pc, pm = h.prefix(13)
+    assert pc.flatten().tolist() == list(range(8)) and pm.flatten().tolist() == [100.0 + i for i in range(8)]
+    assert h.prefix(18)[0].flatten().tolist() == [4, 5, 6, 7]  # only 6 frames of room: one patch
+    assert h.prefix(22) == (None, None)  # no room for a whole patch
+    h.update(torch.arange(20.0, 26.0).view(1, 1, 6), torch.zeros(1, 1, 6))  # one whole patch more
+    assert h.prefix(0)[0].flatten().tolist() == [4, 5, 6, 7, 20, 21, 22, 23]
+    off = AcousticContext(frames=0, patch=4, limit=24)
+    off.update(cond, mel)
+    assert off.prefix(4) == (None, None)

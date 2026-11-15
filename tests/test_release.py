@@ -130,6 +130,18 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     v31 = Synthesizer.from_pretrained("v3.1", "cpu", vocoder="griffin-lim")
     assert v31.prosody is None and v31.pause == 0.15
     assert synth.paragraph is True and v31.paragraph is False  # paragraph mode is v3.2's default, not v3.1's
+    # the releases' operating point is the default of the calls (#87), not temperature 1 / no guidance
+    assert synth.operating_point() == (2.0, 0.3) and v31.operating_point() == (2.0, 0.3)
+    assert synth.operating_point(1.5) == (1.5, 0.3) and synth.operating_point(temperature=0.7) == (2.0, 0.7)
+    seen, mel = [], synth._mel
+    monkeypatch.setattr(synth, "_mel", lambda s, spk, g, cfg, t, *a, **kw: seen.append((cfg, t)) or mel(
+        s, spk, g, cfg, t, *a, **kw))
+    synth(TEXT, speaker=2, seed=1)
+    synth.mels(TEXT, speaker=2, seed=1)
+    list(synth.stream(TEXT, speaker=2, seed=1))
+    synth(TEXT, speaker=2, seed=1, cfg_scale=1.0, temperature=1.0)
+    assert seen == [(2.0, 0.3)] * 3 + [(1.0, 1.0)]  # what the acoustic model is called with
+    assert Synthesizer.from_pretrained("v3.2", "cpu", vocoder="griffin-lim", temperature=0.5).default_temperature == 0.5
     with pytest.raises(ValueError, match="v3.2"):
         Synthesizer.from_pretrained("v9", "cpu")
 
@@ -140,15 +152,18 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--vocoder", "griffin-lim"]))
     assert a == {"model_path": str(hub / "drifting_tts_v3.2.pt"), "vocoder": "griffin-lim", "prosody": "drift",
                  "prosody_durations": "regressor", "pause": "punct", "paragraph": True,
-                 "context": False}
+                 "context": False, "temperature": 0.3, "cfg_scale": 2.0, "acoustic_context": None}
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody-durations", "sampled"]))
     assert a["prosody_durations"] == "sampled"
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody", "none", "--pause", "0.2"]))
     assert a["prosody"] is None and a["pause"] == 0.2 and a["vocoder"] == "vocos-v2"
-    a = pipeline_args(p.parse_args(["--model", "m.pt"]))  # no release: v3.1 behaviour
+    a = pipeline_args(p.parse_args(["--model", "m.pt"]))  # no release: the checkpoint's own defaults (None)
     assert a == {"model_path": "m.pt", "vocoder": None, "prosody": None, "prosody_durations": "sampled", "pause": 0.15,
-                 "paragraph": False, "context": False}
+                 "paragraph": None, "context": False, "temperature": None, "cfg_scale": None,
+                 "acoustic_context": None}
     assert pipeline_args(p.parse_args(["--model", "m.pt", "--paragraph"]))["paragraph"] == 180
+    assert pipeline_args(p.parse_args(["--model", "m.pt", "--paragraph", "0"]))["paragraph"] is False
+    assert pipeline_args(p.parse_args(["--release", "v3.2", "--paragraph", "0"]))["paragraph"] is False
     a = pipeline_args(p.parse_args(["--model", "m.pt", "--pause-policy", "punct", "--pause-jitter", "1"]))
     assert a["pause"] == "punct:1.0"
 

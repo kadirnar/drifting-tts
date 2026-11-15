@@ -5,12 +5,14 @@ Protocol of the FreyaTTS technical report (arXiv 2607.09530, Table 2), applied a
 * every sentence is synthesised once (seed = sentence index) with a fixed voice (``--speaker``, default ``male``);
 * the audio is band-matched: downsampled to 8 kHz before transcription, so wideband and telephony-band systems
   are scored alike (``--band 0`` keeps the full band);
-* Whisper large-v3 (Turkish, beam 5) transcribes it; transcript and reference go through the same Turkish
-  normaliser without punctuation; WER / CER are corpus-level with 95% bootstrap intervals.
+* Whisper large-v3 (beam 5) transcribes it in the checkpoint's language (``model.text.language``); transcript and
+  reference go through that language's normaliser without punctuation; WER / CER are corpus-level with 95% bootstrap
+  intervals.
 
 UTMOSv2 is reported on the full-band audio as a relative naturalness proxy. The report's MOS column comes from a
-listening study, so it is not comparable. Texts: a Hugging Face dataset id with a ``freya_tr_eval.jsonl`` file,
-a local ``.jsonl`` (field ``text``) or a ``.txt`` file (one sentence per line).
+listening study, so it is not comparable. Texts: a Hugging Face dataset id (``<id>`` with a ``freya_tr_eval.jsonl``
+file, or ``<id>:<file>`` for another ``.jsonl`` / ``.txt`` file of it), a local ``.jsonl`` (field ``text``) or a
+``.txt`` file (one sentence per line). The default set is Turkish: a checkpoint of another language needs ``--texts``.
 """
 
 from __future__ import annotations
@@ -29,17 +31,22 @@ from .synthesize import add_vocoder_args, pause_arg
 from .voices import DEFAULT_VOICE, VOICES
 
 FREYA = "freyavoice/freya-tr-eval"
+DEFAULT_TEXTS = {"tr": FREYA}  # per language of the checkpoint
+WARMUP = {"tr": "Merhaba.", "en": "Hello."}
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="TTS checkpoint")
     add_vocoder_args(p)
-    p.add_argument("--texts", default=FREYA, help="HF dataset id, .jsonl (field 'text') or .txt")
+    p.add_argument("--texts", default=None,
+                   help=f"HF dataset id (or <id>:<file>), .jsonl (field 'text') or .txt (default for a Turkish "
+                        f"checkpoint: {FREYA})")
     p.add_argument("--num", type=int, default=0, help="first N sentences only (0: all)")
     p.add_argument("--speaker", nargs="+", default=[DEFAULT_VOICE],
                    help=f"voice(s): {', '.join(VOICES)} or speaker IDs; with several, sentence i uses the (i %% n)-th")
     p.add_argument("--temperature", type=float, default=None, help="default: the checkpoint's preferred one")
-    p.add_argument("--cfg", type=float, default=2.0)
+    p.add_argument("--cfg", type=float, default=None,
+                   help="guidance scale (default: the checkpoint's preferred one, else 2 for the DiT, 1 for ARDrift)")
     p.add_argument("--band", type=int, default=8000, help="band-match: resample to this rate before ASR (0: off)")
     p.add_argument("--asr", default="large-v3")
     p.add_argument("--mos", default="utmosv2", choices=["utmosv2", "utmos22", "none"])
@@ -55,8 +62,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
                         "--prosody-temperature)")
     p.add_argument("--prosody-pitch-model", default=None,
                    help="a second prosody predictor that samples the token pitch; the durations stay --prosody's")
-    p.add_argument("--paragraph", type=int, nargs="?", const=180, default=0, metavar="CHARS",
-                   help="paragraph mode (Synthesizer(paragraph=CHARS)): the sentences of an item in one pass")
+    p.add_argument("--paragraph", type=int, nargs="?", const=180, default=None, metavar="CHARS",
+                   help="paragraph mode (Synthesizer(paragraph=CHARS)): the sentences of an item in one pass; 0: "
+                        "sentence by sentence (default: on for ARDrift, off for the DiT)")
+    p.add_argument("--acoustic-context", type=int, default=None, metavar="FRAMES",
+                   help="ARDrift: frames of the audio before a unit that it continues from "
+                        "(Synthesizer(acoustic_context=FRAMES); 0: every unit starts from silence)")
     p.add_argument("--context", action="store_true",
                    help="Synthesizer(context=True): each sentence conditioned on the text before it")
     p.add_argument("--join", type=int, default=1,
@@ -95,12 +106,14 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 
 def load_texts(spec: str) -> list[dict]:
-    """``[{"id", "text", ...}]`` from a HF dataset id, a .jsonl or a .txt file."""
+    """``[{"id", "text", ...}]`` from a .jsonl or a .txt file, or from a HF dataset: ``<id>`` (its
+    ``freya_tr_eval.jsonl``) or ``<id>:<file>``."""
     path = Path(spec)
     if not path.exists():
         from huggingface_hub import hf_hub_download
 
-        path = Path(hf_hub_download(spec, "freya_tr_eval.jsonl", repo_type="dataset"))
+        repo, _, filename = spec.partition(":")
+        path = Path(hf_hub_download(repo, filename or "freya_tr_eval.jsonl", repo_type="dataset"))
     if path.suffix == ".jsonl":
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     return [{"id": f"{i:04d}", "text": t.strip()} for i, t in enumerate(path.read_text().splitlines()) if t.strip()]
@@ -123,7 +136,7 @@ def band_match(wav: torch.Tensor, band: int) -> np.ndarray:
     return torchaudio.functional.resample(x, SAMPLE_RATE, 16_000).numpy()
 
 
-def batch_synthesize(synth, items: list[dict], args, temperature: float, chunked,
+def batch_synthesize(synth, items: list[dict], args, cfg: float, temperature: float, chunked,
                      serving) -> list[tuple[torch.Tensor, dict]]:
     """Every sentence through :func:`drifting_tts.batched.stream_batched`, ``args.batch`` at a time (seed = sentence
     index): ``(waveform, {"rtf_total"})`` per sentence, the RTF of its batch."""
@@ -137,7 +150,7 @@ def batch_synthesize(synth, items: list[dict], args, temperature: float, chunked
         pieces = {i: [] for i in idx}
         t0 = time.perf_counter()
         for rnd in stream_batched(synth, [items[i]["text"] for i in idx], speaker=args.speaker[0],
-                                  cfg_scale=args.cfg, temperature=temperature, seeds=idx, pause=None, chunked=chunked,
+                                  cfg_scale=cfg, temperature=temperature, seeds=idx, pause=None, chunked=chunked,
                                   serving=serving):
             for j, p in rnd:
                 pieces[idx[j]].append(p)
@@ -155,18 +168,23 @@ def run(args) -> None:
 
     out = Path(args.out)
     (out / "wav").mkdir(parents=True, exist_ok=True)
-    items = load_texts(args.texts)
-    items = items[: args.num] if args.num else items
-    if args.join > 1:
-        items = join_items(items, args.join)
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder, cuda_kernel=args.cuda_kernel, fast=args.fast,
                         prosody=args.prosody, prosody_temperature=args.prosody_temperature,
                         prosody_spread=args.prosody_spread, prosody_durations=args.prosody_durations, pause=args.pause,
                         prosody_duration_temperature=args.prosody_duration_temperature,
-                        prosody_pitch=args.prosody_pitch_model, paragraph=args.paragraph or False,
-                        context=args.context)
-    temperature = synth.default_temperature if args.temperature is None else args.temperature
-    judges = load_judges(args.asr, None, args.mos, args.device)
+                        prosody_pitch=args.prosody_pitch_model,
+                        paragraph=None if args.paragraph is None else args.paragraph or False,
+                        context=args.context, acoustic_context=args.acoustic_context)
+    language = synth.language  # of the checkpoint: Whisper's language and the normaliser of both texts
+    texts = args.texts or DEFAULT_TEXTS.get(language)
+    if texts is None:
+        raise SystemExit(f"--texts is required for a {language!r} checkpoint (the default set, {FREYA}, is Turkish)")
+    items = load_texts(texts)
+    items = items[: args.num] if args.num else items
+    if args.join > 1:
+        items = join_items(items, args.join)
+    cfg, temperature = synth.operating_point(args.cfg, args.temperature)
+    judges = load_judges(args.asr, None, args.mos, args.device, language=language)
 
     chunked = None
     if args.chunked:
@@ -191,23 +209,23 @@ def run(args) -> None:
 
     def generate(text: str, speaker: str, seed: int) -> tuple[torch.Tensor, dict]:
         if not (args.stream or args.fast or chunked):
-            return synth(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature, seed=seed)
+            return synth(text, speaker=speaker, cfg_scale=cfg, temperature=temperature, seed=seed)
         t0 = time.perf_counter()
-        wav = torch.cat(list(synth.stream(text, speaker=speaker, cfg_scale=args.cfg, temperature=temperature,
+        wav = torch.cat(list(synth.stream(text, speaker=speaker, cfg_scale=cfg, temperature=temperature,
                                           seed=seed, chunked=chunked)))
         return wav, {"rtf_total": (time.perf_counter() - t0) / max(wav.numel() / SAMPLE_RATE, 1e-6)}
 
-    generate("Merhaba.", args.speaker[0], 0)  # warm-up for the RTF
-    batched = batch_synthesize(synth, items, args, temperature, chunked, serving) if args.batch else None
+    generate(WARMUP.get(language, items[0]["text"]), args.speaker[0], 0)  # warm-up for the RTF
+    batched = batch_synthesize(synth, items, args, cfg, temperature, chunked, serving) if args.batch else None
 
     rows = []
     for i, item in enumerate(items):
         spk = args.speaker[i % len(args.speaker)]
         wav, info = batched[i] if batched else generate(item["text"], spk, i)
-        ref = _plain(item["text"])
+        ref = _plain(item["text"], language)
         row = {"id": item.get("id", i), "speaker": spk, "ref": ref, "rtf": info["rtf_total"]}
         if judges.asr is not None:
-            row["hyp"] = _plain(judges.asr(band_match(wav, args.band)))
+            row["hyp"] = _plain(judges.asr(band_match(wav, args.band)), language)
             row.update(error_counts(ref, row["hyp"]))
         if judges.mos is not None:
             row["mos"] = judges.mos(band_match(wav, 0))
@@ -217,16 +235,18 @@ def run(args) -> None:
     with open(out / "utterances.jsonl", "w") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    res = {"system": "drifting_tts", "temperature": temperature, "cfg": args.cfg, **summarize(rows),
+    res = {"system": "drifting_tts", "temperature": temperature, "cfg": cfg, **summarize(rows),
            "rtf": float(np.mean([r["rtf"] for r in rows]))}
-    results = {"texts": args.texts, "sentences": len(rows), "band_hz": args.band, "voices": args.speaker,
+    results = {"texts": texts, "language": language, "sentences": len(rows), "band_hz": args.band,
+               "voices": args.speaker,
                "stream": args.stream or args.fast or args.chunked or args.batch > 0, "fast": args.fast,
                "batch": args.batch, "serving": None if serving is None else vars(serving),
                "chunked": None if chunked is None else vars(chunked),
                "model": args.model, "vocoder": args.vocoder or "stock", "asr": args.asr, "rows": [res],
                "prosody": args.prosody, "prosody_temperature": synth.prosody_temperature if args.prosody else None,
                "prosody_spread": args.prosody_spread, "prosody_durations": args.prosody_durations, "pause": args.pause,
-               "paragraph": args.paragraph, "join": args.join, "context": args.context,
+               "paragraph": synth.paragraph, "join": args.join, "context": args.context,
+               "acoustic_context": synth.acoustic_context,
                "prosody_duration_temperature": synth.prosody_duration_temperature if args.prosody else None,
                "prosody_pitch_model": args.prosody_pitch_model}
     (out / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))

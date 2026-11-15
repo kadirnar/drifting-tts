@@ -200,6 +200,7 @@ class Runner:
     def __init__(self, synth, speaker: int, temperature: float, cfg_scale: float, release: dict | None = None):
         """``release``: ``vocoder`` and ``prosody`` / ``prosody_temperature`` of the ``release`` system."""
         self.synth, self.model, self.device = synth, synth.model, synth.device
+        self.language = synth.language  # of the token ids: the symbol table of the token-level controls
         self.spk = torch.tensor([speaker], device=self.device)
         self.speaker = speaker
         self.tempo = getattr(self.model, "duration_scales", {}).get(speaker, self.model.duration_scale)
@@ -240,7 +241,8 @@ class Runner:
             durations = t["durations_gt"][None]
         elif s.dur[0] == "gain":
             logw = t["logw"] + math.log(self.tempo)
-            durations = frames_from_logw(scale_deviations(logw, s.dur[1], letter_tokens(t["ids"]), keep_total=True))
+            durations = frames_from_logw(scale_deviations(logw, s.dur[1], letter_tokens(t["ids"], self.language),
+                                                          keep_total=True))
             durations = durations[None]
         elif s.dur[0] == "mix":
             lam = s.dur[1]
@@ -249,7 +251,7 @@ class Runner:
         if s.pitch[0] == "gt":
             pitch = t["pitch_gt"][None, None]
         elif s.pitch[0] == "gain":
-            pitch = scale_deviations(t["pitch"], s.pitch[1], voiced_tokens(t["ids"]))[None, None]
+            pitch = scale_deviations(t["pitch"], s.pitch[1], voiced_tokens(t["ids"], self.language))[None, None]
         return durations, pitch
 
     @torch.no_grad()
@@ -293,7 +295,7 @@ class Runner:
             d, p = self.prosody(u, s)
             frames = frames_from_logw(t["logw"], self.tempo) if d is None else d[0]
             pitch = t.get("pitch") if p is None else p[0, 0]
-        mask = t["voiced_gt"] if "voiced_gt" in t else voiced_tokens(t["ids"])
+        mask = t["voiced_gt"] if "voiced_gt" in t else voiced_tokens(t["ids"], self.language)
         out = {"frames": frames.float().cpu().numpy(), "mask": mask.cpu().numpy()}
         if pitch is not None:
             lf0_mean, lf0_std = self.model.lf0_stats.tolist()
@@ -309,7 +311,8 @@ class Runner:
         durations, pitch = self.prosody(u, s)
         frames = frames_from_logw(u.targets["logw"], self.tempo) if durations is None else durations[0]
         return token_report(u.targets, FRAME_RATE, frames=frames, pitch=None if pitch is None else pitch[0, 0],
-                            lf0_std=float(self.model.lf0_stats[1]) if self.model.pitch_enabled else 1.0)
+                            lf0_std=float(self.model.lf0_stats[1]) if self.model.pitch_enabled else 1.0,
+                            language=self.language)
 
 
 # --- CPU feature workers -----------------------------------------------------------------------------------------
@@ -321,12 +324,12 @@ def _init_worker() -> None:
 
 
 def _features(path: str, text: str, method: str, ref_path: str | None, ref_f0: np.ndarray | None,
-              align: dict | None = None) -> dict:
+              align: dict | None = None, language: str = "tr") -> dict:
     from .prosody import f0_contour, paired_metrics, prosody_features, token_f0
 
     wav, sr = sf.read(path, dtype="float64")
     f0 = f0_contour(wav, sr, method)
-    row = prosody_features(wav, sr, f0=f0, text=text)
+    row = prosody_features(wav, sr, f0=f0, text=text, language=language)
     if ref_path is not None and ref_path != path:
         ref, _ = sf.read(ref_path, dtype="float64")
         row.update(paired_metrics(ref, wav, sr, ref_f0=ref_f0, gen_f0=f0))
@@ -362,16 +365,17 @@ def retry_oom(fn, *args, tries: int = 30, wait: float = 30.0, **kw):
             time.sleep(wait)
 
 
-def judge(judges, wav: torch.Tensor, text: str, band: int, spk_ref: torch.Tensor | None):
-    """CER / WER counts, UTMOSv2 and speaker similarity of one utterance; returns the row and its embedding."""
+def judge(judges, wav: torch.Tensor, text: str, band: int, spk_ref: torch.Tensor | None, language: str = "tr"):
+    """CER / WER counts, UTMOSv2 and speaker similarity of one utterance; returns the row and its embedding.
+    ``language``: the text frontend that normalises the reference and the transcript."""
     from .benchmark import band_match
     from .evaluate import _plain
     from .metrics import error_counts
 
     row: dict = {}
     if judges.asr is not None:
-        ref = _plain(text)
-        row["hyp"] = _plain(judges.asr(band_match(wav, band)))
+        ref = _plain(text, language)
+        row["hyp"] = _plain(judges.asr(band_match(wav, band)), language)
         row.update(error_counts(ref, row["hyp"]))
     full = band_match(wav, 0)
     emb = judges.sv(full) if judges.sv is not None else None
@@ -436,7 +440,6 @@ def format_table(rows: list[dict], cols: list[tuple]) -> str:
 def load_utterances(args, synth, speaker: int) -> list[Utterance]:
     from .data import MelDataset
     from .prosody import token_targets
-    from .text import normalize, text_to_ids
 
     dev = synth.device
     if args.texts:
@@ -445,8 +448,8 @@ def load_utterances(args, synth, speaker: int) -> list[Utterance]:
         items = load_texts(args.texts)[args.offset: args.offset + args.num]
         out = []
         for k, item in enumerate(items):
-            text = normalize(item["text"])
-            ids = torch.tensor([text_to_ids(text, normalized=True)], device=dev)
+            text = synth.text.normalize(item["text"])  # the frontend of the model's language
+            ids = torch.tensor([synth.text.text_to_ids(text, normalized=True)], device=dev)
             u = Utterance(args.offset + k, text, ids)
             u.targets = token_targets(synth.model, ids, torch.tensor([speaker], device=dev))
             out.append(u)
@@ -491,7 +494,8 @@ def run(args) -> None:
     runner = Runner(synth, speaker, args.temperature, args.cfg, release)
     utts = load_utterances(args, synth, speaker)
     band = (8000 if args.texts else 0) if args.band is None else args.band
-    judges = retry_oom(load_judges, args.asr, args.sv if not args.texts else None, args.mos, args.device)
+    judges = retry_oom(load_judges, args.asr, args.sv if not args.texts else None, args.mos, args.device,
+                       language=synth.language)
     pool = ProcessPoolExecutor(args.workers, mp_context=get_context("spawn"), initializer=_init_worker)
     with_rec = not args.texts
     if with_rec and systems[0].name != "recording":  # the reference for the paired metrics and similarity
@@ -537,7 +541,7 @@ def run(args) -> None:
                                        sv=None if s.name == "recording" or "speaker_sim" in r else judges.sv)
                         wav = torch.from_numpy(sf.read(wav_path(s, u), dtype="float32")[0])
                         r.update(retry_oom(judge, need, u.audio if s.name == "recording" else wav, u.text, band,
-                                           spk_ref.get(u.index))[0])
+                                           spk_ref.get(u.index), synth.language)[0])
                     cached.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
                     print(f"{s.name}: judges added", flush=True)
                 results[s.name] = {"system": s.name, **aggregate(rows)}
@@ -555,8 +559,8 @@ def run(args) -> None:
             sf.write(path, wav.numpy(), SAMPLE_RATE, subtype="FLOAT")  # lossless: judges may read it later
             ref = wav_path(parse_system("recording"), u) if with_rec else None
             futs.append(pool.submit(_features, str(path), u.text, args.f0, None if ref is None else str(ref),
-                                    rec_f0.get(u.index), runner.alignment(u, s)))
-            row, emb = retry_oom(judge, judges, wav, u.text, band, spk_ref.get(u.index))
+                                    rec_f0.get(u.index), runner.alignment(u, s), synth.language))
+            row, emb = retry_oom(judge, judges, wav, u.text, band, spk_ref.get(u.index), synth.language)
             if s.name == "recording":
                 spk_ref[u.index] = emb
             row.update(index=u.index, text=u.text, seconds=wav.numel() / SAMPLE_RATE, **runner.token_report(u, s))
@@ -572,7 +576,7 @@ def run(args) -> None:
     diversity = run_diversity(args, runner, utts, pool, out) if args.diversity else None
     pool.shutdown()
     rows = [results[s.name] for s in systems if s.name in results]
-    report = {"model": args.model, "vocoder": args.vocoder, "release": release,
+    report = {"model": args.model, "language": synth.language, "vocoder": args.vocoder, "release": release,
               "split": None if args.texts else args.split,
               "texts": args.texts, "speaker": speaker, "num_utterances": len(utts), "offset": args.offset,
               "longest": args.longest or None,
