@@ -1,0 +1,20 @@
+# Issue #102, step 3: the English run continued from 200k to 400k steps at the same constant rate, with the
+# evaluation in the loop and a second, slow EMA. Kyutai report that their drifting models sit on a naturalness
+# plateau for a long time and reach their final level in a jump of a few thousand steps (between 100k and 200k steps
+# for their 24-layer backbone), and that annealing the learning rate before the jump stopped it. This run asks
+# whether a mel-target ARDrift has such a jump after 200k: watch eval/mos, eval/f0_std and the held-out eval/loss/*
+# of both EMAs in TensorBoard, or eval_history.json.
+# Not run yet: about 12 h on an RTX 5090, streaming the corpus; it needs the run's last.pt (the optimizer, the EMA,
+# the learned temperature and the step), which a released model_ema.pt does not hold.
+#   cp -r runs/ar_en_10k runs/ar_en_10k_400k
+#   drifting-tts train-ar --config configs/ar_tts_en_10k_400k.yaml --workdir runs/ar_en_10k_400k
+# One evaluation of 24 sentences takes about two minutes per EMA (Whisper large-v3, UTMOSv2, harvest F0).
+base: ar_tts_en_10k.yaml
+
+train:
+  steps: 400000            # schedule: const, so the rate stays 2e-4 from step 200k on
+  ema_decays: [0.999, 0.9999]   # the slow EMA starts from the 0.999 one at step 200k
+  vocoder: runs/en_bigvgan_gta/bigvgan_ft_40000.pt   # the vocoder the model is released with (samples and judges)
+  eval_every: 10000
+  eval:
+    at_start: true         # step 200k: the released model's point

@@ -15,6 +15,9 @@ One step:
    drifting loss (:func:`~drifting_tts.drift.kyutai_drift_loss`, one learned temperature) pulls them to the recorded
    patch and pushes them apart, in the kernel space of :func:`~drifting_tts.models.ar.ar_features` (the whole patch,
    each frame, each frame's harmonic detail and, with ``drift.energy_bands``, each frame's band energies).
+
+``train.eval_every`` evaluates every EMA inside the loop, on the held-out objective and on synthesised held-out
+sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`drifting_tts.loop_eval`).
 """
 
 from __future__ import annotations
@@ -29,13 +32,14 @@ import torch
 
 from .alignment import sequence_mask
 from .config import Config, load_config, save_config
-from .data import MelDataset
+from .data import MelDataset, collate
 from .drift import feature_drift_loss
 from .latents import VAE_BACKENDS
+from .loop_eval import AudioEval, build_emas, heldout_metrics, load_emas, other_emas, record
 from .models.ar import ARDriftTTS, ar_features, patchify
 from .models.text_encoder import align, duration_loss, expand, prior_loss
 from .train import build_loader, dataset_stats, grow_speakers
-from .utils import EMA, count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
+from .utils import count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
@@ -45,8 +49,10 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 
 def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torch.Tensor,
-                  mel_std: float | None = None) -> tuple:
-    """One training step; ``mel_std``: the scalar std of the mel statistics (for ``drift.energy_bands``)."""
+                  mel_std: float | None = None, detail: bool = False) -> tuple:
+    """One training step; ``mel_std``: the scalar std of the mel statistics (for ``drift.energy_bands``).
+    ``detail``: the metrics also hold every feature map's drift loss, raw field and data mass (``loss/<map>``,
+    ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop."""
     dc, lc = cfg.drift, cfg.loss
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
@@ -102,6 +108,8 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                    "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean(),
                    "rows": float(R), "tau": tau.detach().reshape(()),
                    "p_data": torch.stack([v for kk, v in info.items() if kk.startswith("p_data/")]).mean()}
+        if detail:
+            metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
     return loss, metrics
 
 
@@ -157,13 +165,14 @@ def run(args) -> None:
                              {"params": [tau], "weight_decay": 0.0}],
                             lr=tc.lr, betas=betas, weight_decay=tc.weight_decay, fused=device == "cuda")
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(tc.warmup, tc.steps, tc.schedule))
-    ema = EMA(model, tc.ema_decay)
+    emas = build_emas(model, tc)  # train.ema_decays: the first is model_ema.pt
+    ema = next(iter(emas.values()))
     writer = SummaryWriter(work / "tb")
     step, rng = 0, None
     if (work / "last.pt").exists():
         ck = torch.load(work / "last.pt", map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
-        ema.model.load_state_dict(ck["ema"])
+        load_emas(emas, ck)
         tau.data.fill_(float(ck["tau"]))
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
@@ -177,14 +186,20 @@ def run(args) -> None:
         init = torch.load(tc.init_from, map_location="cpu", weights_only=False)
         state = grow_speakers(init.get("ema", init.get("model")), model.state_dict())
         missing, unexpected = model.load_state_dict(state, strict=False)
-        ema.model.load_state_dict(model.state_dict())
+        for e in emas.values():
+            e.model.load_state_dict(model.state_dict())
         if init.get("tau") is not None:
             tau.data.fill_(float(init["tau"]))
         print(f"initialised from {tc.init_from} (missing {len(missing)}, unexpected {len(unexpected)}, "
               f"tau {float(tau):.4g})", flush=True)
 
     vocoder = None
-    if tc.get("sample_every", 0) and device == "cuda":
+    sample_every = tc.get("sample_every", 0) if device == "cuda" else 0
+    eval_every = int(tc.get("eval_every", 0))
+    if eval_every and not len(val_ds):
+        print(f"no 'val' utterances in {cfg.data.root}: no evaluation in the loop", flush=True)
+        eval_every = 0
+    if sample_every or eval_every:
         if ds.backend in VAE_BACKENDS:  # latent frames (extract-latents): the codec's decoder
             from .latents.vocoder import LatentVocoder
 
@@ -195,6 +210,32 @@ def run(args) -> None:
             vocoder = load_vocoder(tc.get("vocoder", "vocos-v2"), device)
 
     mel_std = None if ds.stats.per_channel else ds.stats.std  # drift.energy_bands: log-mel data only
+
+    def evaluate(at: int) -> None:  # every EMA on the held-out objective and on synthesised sentences (#102)
+        t = time.time()
+        for n, (name, e) in enumerate(emas.items()):
+            res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True)[1],
+                                  heldout)
+            res.update(audio(e.model))
+            record(writer, work, at, name, n == 0, res)
+        print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
+
+    if eval_every:
+        ec = tc.get("eval") or {}
+        temperature = float(ec.get("temperature", tc.get("sample_temperature", 0.5)))
+
+        def synthesize(m, item, g):
+            text = item["text"][None].to(device)
+            return m.synthesize(text, torch.tensor([text.shape[1]], device=device),
+                                torch.tensor([item["spk"]], device=device), temperature=temperature, generator=g)[0]
+
+        audio = AudioEval(val_ds, vocoder, device, synthesize, num=ec.get("num", 24), asr=ec.get("asr", "large-v3"),
+                          mos=ec.get("mos", "utmosv2"), f0=ec.get("f0", True), asr_device=ec.get("asr_device"))
+        size = int(ec.get("batch_size", 8))
+        heldout = [collate([val_ds[i] for i in range(s, min(s + size, len(val_ds)))])
+                   for s in range(0, min(int(ec.get("batches", 8)) * size, len(val_ds)), size)]
+        if ec.get("at_start", False) and step < tc.steps:  # the point a continued or fine-tuned run starts from
+            evaluate(step)
     model.train()
     if rng is not None:
         set_rng_state(rng)
@@ -211,7 +252,8 @@ def run(args) -> None:
         sched.step()
         with torch.no_grad():
             tau.clamp_(min=1e-3)
-        ema.update(model)
+        for e in emas.values():
+            e.update(model)
         step += 1
         metrics["grad_norm"], metrics["grad_norm_enc"] = gnorm, gnorm_enc
         for kk, v in metrics.items():
@@ -225,17 +267,20 @@ def run(args) -> None:
             print(f"step {step} " + " ".join(f"{kk}={v:.4g}" for kk, v in agg.items())
                   + f" ({n / (time.time() - t0):.2f} it/s)", flush=True)
             agg, t0 = {}, time.time()
-        if vocoder is not None and step % tc.sample_every == 0:
+        if sample_every and step % sample_every == 0:
             log_samples(ema.model, val_ds, vocoder, work / "samples", step, device,
                         temperature=tc.get("sample_temperature", 0.5))
+        if eval_every and (step % eval_every == 0 or step == tc.steps):
+            evaluate(step)
         if step % tc.save_every == 0 or step == tc.steps:
             save_checkpoint(work / "last.pt", model=model.state_dict(), ema=ema.model.state_dict(),
                             tau=float(tau.detach()), opt=opt.state_dict(), sched=sched.state_dict(), step=step,
                             rng=rng_state(), epoch=getattr(loader.batch_sampler, "epoch", 0), config=cfg.to_dict(),
-                            num_speakers=ds.num_speakers)
-            save_checkpoint(work / "model_ema.pt", ema=ema.model.state_dict(), config=cfg.to_dict(),
-                            num_speakers=ds.num_speakers, step=step, tau=float(tau.detach()), n_mels=ds.dim,
-                            stats=dataset_stats(ds))
+                            num_speakers=ds.num_speakers, emas=other_emas(emas))
+            for n, (name, e) in enumerate(emas.items()):  # model_ema.pt, and model_ema_<decay>.pt for another EMA
+                save_checkpoint(work / ("model_ema.pt" if n == 0 else f"model_ema_{name}.pt"),
+                                ema=e.model.state_dict(), config=cfg.to_dict(), num_speakers=ds.num_speakers,
+                                step=step, tau=float(tau.detach()), n_mels=ds.dim, stats=dataset_stats(ds))
             if tc.get("keep_snapshots", False):
                 shutil.copyfile(work / "model_ema.pt", work / f"model_ema_{step}.pt")
     print(f"done: {work / 'model_ema.pt'}", flush=True)

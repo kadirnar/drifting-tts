@@ -259,6 +259,43 @@ conditioned on the ground-truth prosody. `slm.enabled` stays in the code as an e
   drift loss itself is constant by construction.
 - **Audio samples** are written to `runs/<run>/samples/` every `sample_every` steps.
 
+### Evaluation in the loop and several EMAs (#102)
+
+Kyutai on their drifting models: the word error rate saturates within the first few percent of a run, the predicted
+MOS sits on a plateau for a long time and then jumps within a few thousand steps, and annealing the learning rate
+before the jump stopped it. Samples on disk cannot show such a jump, so both loops (`train`, `train-ar`) can
+evaluate themselves (`drifting_tts/loop_eval.py`):
+
+```yaml
+train:
+  eval_every: 10000              # 0: off
+  ema_decays: [0.999, 0.9999]    # the first is model_ema.pt, another is model_ema_<decay>.pt
+  eval:
+    num: 24                      # held-out sentences of the val split
+    at_start: true               # also before the first step: where a continued run starts from
+```
+
+- **Synthesised sentences, judged**: every EMA renders `eval.num` held-out sentences (`train.vocoder` for ARDrift,
+  `eval.vocoder` or the backend's stock vocoder for the DiT). TensorBoard gets `eval/wer`, `eval/cer` (Whisper),
+  `eval/mos` (UTMOSv2), `eval/f0_std` (semitones), `eval/pauses` and `eval/length_ratio` (against the recording);
+  another EMA writes `eval_<decay>/...`. `eval.asr` / `eval.mos: none` and `eval.f0: false` skip a judge.
+- **The held-out objective** (`train-ar`): the training step on fixed held-out batches without a gradient and with
+  the same noise at every evaluation: `eval/loss`, `eval/drift`, `eval/prior`, `eval/duration`, `eval/sample_std`,
+  `eval/p_data`, and per feature map `eval/loss/<map>`, `eval/force/<map>` (the raw field) and `eval/p_data/<map>`.
+  The DiT's step feeds a memory bank, so its objective is not replayed.
+- **`eval_history.json`** in the run's directory holds every row (step, EMA, metrics).
+- **It does not move the training.** The random streams are put back after every evaluation: a run with it ends
+  with the same weights as one without (tested for both loops).
+- **Cost** (the released English ARDrift on a shared A10, its released vocoder): 24 sentences take about 110 s per
+  EMA (Whisper large-v3, UTMOSv2, harvest F0), the held-out objective 3 s. At step 200k that model reads WER 0.69%,
+  UTMOSv2 3.52, F0 spread 3.61 st, 2.0 pauses per utterance and 0.92 of the recordings' length: the first row of
+  a continued run.
+- **A slow EMA only pays off late**: 0.9999 averages over about 10,000 steps. Resuming a run that kept one EMA
+  starts another from it.
+- **Not run yet:** `configs/ar_tts_en_10k_400k.yaml` continues the English run from 200k to 400k steps at its
+  constant rate with all of the above (about 12 h on an RTX 5090). It needs the run's `last.pt`: a released
+  `model_ema.pt` holds neither the optimizer nor the learned temperature.
+
 ## Judging the result
 
 Tune on the `dev` split and report on `val` once:

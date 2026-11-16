@@ -35,12 +35,13 @@ from .config import Config, load_config, save_config
 from .data import BucketBatchSampler, MelDataset, collate
 from .drift import feature_drift_loss
 from .latents import VAE_BACKENDS
+from .loop_eval import AudioEval, build_emas, load_emas, other_emas, record
 from .models.mae import delta_features
 from .models.text_encoder import align, duration_loss, expand, prior_loss, token_pitch
 from .models.tts import DriftingTTS
 from .slm import audio_segments, needs_audio, slm_enabled
 from .train_mae import load_mae
-from .utils import EMA, count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
+from .utils import count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
 
 # official: fixed temperatures (paper); kyutai: Kyutai's released learned-tau recipe; learned: their blog pseudo-code
 DRIFT_MODES = ("official", "kyutai", "learned")
@@ -373,7 +374,8 @@ def run(args) -> None:
     opt = torch.optim.AdamW(groups, lr=tc.lr, betas=(0.9, 0.95), weight_decay=tc.weight_decay,
                             fused=True if device == "cuda" else None)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(tc.warmup, tc.steps, tc.schedule))
-    ema = EMA(model, tc.ema_decay)  # a deep copy made before compiling: sampling and export stay eager
+    emas = build_emas(model, tc)  # deep copies made before compiling: sampling and export stay eager
+    ema = next(iter(emas.values()))  # train.ema_decays: the first is model_ema.pt (#102)
     if tc.get("compile", False):  # in place, so state_dict keys are unchanged; the training shapes are static
         model.generator.compile()
     bank = CropBank(cfg.drift.uncond_bank, ds.dim, cfg.drift.crop_frames, device)
@@ -382,7 +384,7 @@ def run(args) -> None:
     if (work / "last.pt").exists():
         ck = torch.load(work / "last.pt", map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
-        ema.model.load_state_dict(ck["ema"])
+        load_emas(emas, ck)
         if log_taus is not None and ck.get("log_taus"):
             log_taus.load_state_dict(ck["log_taus"])
         if taus is not None and ck.get("taus"):
@@ -410,7 +412,8 @@ def run(args) -> None:
         init = torch.load(tc.init_from, map_location="cpu", weights_only=False)
         state = grow_speakers(init.get("ema", init.get("model")), model.state_dict())
         missing, unexpected = model.load_state_dict(state, strict=False)
-        ema.model.load_state_dict(model.state_dict())
+        for e in emas.values():
+            e.model.load_state_dict(model.state_dict())
         print(f"initialised from {tc.init_from} (missing: {len(missing)}, unexpected: {len(unexpected)})", flush=True)
         if taus is not None and init.get("taus") and set(init["taus"]) == set(taus.state_dict()):
             taus.load_state_dict(init["taus"])  # fine-tuning continues at the learned kernel temperature
@@ -420,16 +423,45 @@ def run(args) -> None:
             print(f"calibration from {tc.init_from}: {sorted(calib)}", flush=True)
 
     vocoder = None
-    if tc.sample_every > 0 and device == "cuda":
+    sample_every = tc.sample_every if device == "cuda" else 0
+    eval_every, ec = int(tc.get("eval_every", 0)), tc.get("eval") or {}
+    if eval_every and not len(val_ds):
+        print(f"no 'val' utterances in {cfg.data.root}: no evaluation in the loop", flush=True)
+        eval_every = 0
+    if sample_every > 0 or eval_every:
         if ds.backend in VAE_BACKENDS:
             from .latents.vocoder import LatentVocoder
 
             vocoder = LatentVocoder(ds.backend, device, repeat=ds.latent_repeat)
+        elif ec.get("vocoder"):  # e.g. the vocoder the model will be released with
+            from .vocoder import load_vocoder
+
+            vocoder = load_vocoder(ec.get("vocoder"), device)
         else:
             from .vocoder import Vocoder
 
             vocoder = Vocoder(device, backend=ds.backend)
 
+    def evaluate(at: int) -> None:  # held-out sentences through every EMA, judged (#102, loop_eval.py)
+        t = time.time()
+        for n, (name, e) in enumerate(emas.items()):
+            record(writer, work, at, name, n == 0, audio(e.model))
+        print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
+
+    if eval_every:
+        temperature = float(ec.get("temperature", tc.get("sample_temperature", 0.5)))
+        cfg_scale = float(ec.get("cfg_scale", 2.0))
+
+        def synthesize(m, item, g):
+            text = item["text"][None].to(device)
+            return m.synthesize(text, torch.tensor([text.shape[1]], device=device),
+                                torch.tensor([item["spk"]], device=device), cfg_scale=cfg_scale,
+                                temperature=temperature, generator=g)[0]
+
+        audio = AudioEval(val_ds, vocoder, device, synthesize, num=ec.get("num", 24), asr=ec.get("asr", "large-v3"),
+                          mos=ec.get("mos", "utmosv2"), f0=ec.get("f0", True), asr_device=ec.get("asr_device"))
+        if ec.get("at_start", False) and step < tc.steps:
+            evaluate(step)
     model.train()
     if rng is not None:
         set_rng_state(rng)
@@ -447,7 +479,8 @@ def run(args) -> None:
             torch.nn.utils.clip_grad_norm_(temps.parameters(), tc.grad_clip)
         opt.step()
         sched.step()
-        ema.update(model)
+        for e in emas.values():
+            e.update(model)
         step += 1
         metrics["grad_norm"], metrics["grad_norm_enc"] = gnorm, gnorm_enc
         for k, v in metrics.items():  # summed on the device: no host sync until the next log
@@ -465,20 +498,24 @@ def run(args) -> None:
             print(f"step {step} " + " ".join(f"{k}={agg[k]:.4g}" for k in keys if k in agg)
                   + f" ({rate:.2f} it/s)", flush=True)
             agg, t0 = {}, time.time()
-        if vocoder is not None and step % tc.sample_every == 0:
+        if sample_every > 0 and step % sample_every == 0:
             log_samples(ema.model, val_ds, vocoder, writer, step, work / "samples", device,
                         temperature=tc.get("sample_temperature", 0.5))
+        if eval_every and (step % eval_every == 0 or step == tc.steps):
+            evaluate(step)
         if step % tc.save_every == 0 or step == tc.steps:
             save_checkpoint(work / "last.pt", model=model.state_dict(), ema=ema.model.state_dict(),
                             opt=opt.state_dict(), sched=sched.state_dict(), step=step,
                             log_taus=None if log_taus is None else log_taus.state_dict(),
                             taus=None if taus is None else taus.state_dict(),
                             epoch=loader.batch_sampler.epoch, bank=bank.state_dict(), rng=rng_state(),
-                            config=cfg.to_dict(), num_speakers=ds.num_speakers,
+                            config=cfg.to_dict(), num_speakers=ds.num_speakers, emas=other_emas(emas),
                             **({} if slm is None else {"slm": slm.state_dict()}))
-            save_checkpoint(work / "model_ema.pt", ema=ema.model.state_dict(), config=cfg.to_dict(),
-                            num_speakers=ds.num_speakers, step=step, taus=None if taus is None else taus.state_dict(),
-                            n_mels=ds.dim, stats=dataset_stats(ds), **calib)
+            for n, (name, e) in enumerate(emas.items()):  # model_ema.pt, and model_ema_<decay>.pt for another EMA
+                save_checkpoint(work / ("model_ema.pt" if n == 0 else f"model_ema_{name}.pt"),
+                                ema=e.model.state_dict(), config=cfg.to_dict(), num_speakers=ds.num_speakers,
+                                step=step, taus=None if taus is None else taus.state_dict(), n_mels=ds.dim,
+                                stats=dataset_stats(ds), **calib)
             if tc.get("keep_snapshots", False):  # every export also as model_ema_<step>.pt
                 shutil.copyfile(work / "model_ema.pt", work / f"model_ema_{step}.pt")
     stale = "" if duration_scale is None else " (stale duration_scale: re-run `drifting-tts calibrate-durations`)"
