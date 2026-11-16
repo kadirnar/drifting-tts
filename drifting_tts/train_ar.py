@@ -157,7 +157,8 @@ def sample_targets(y: torch.Tensor, y_len: torch.Tensor, noise, group: int = 1,
         scale = std.to(y.dtype)
     else:
         scale = float(noise)
-    return torch.where(sequence_mask(y_len, T)[:, None], y + scale * eps, y)
+    used = (y != 0).flatten(2).any(-1).any(0)[None, :, None]  # a channel the codec does not use stays 0 (#93)
+    return torch.where(sequence_mask(y_len, T)[:, None] & used, y + scale * eps, y)
 
 
 def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, prompt: torch.Tensor,

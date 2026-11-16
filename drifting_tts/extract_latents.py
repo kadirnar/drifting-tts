@@ -132,9 +132,11 @@ def frame_bytes(z: torch.Tensor, copies: int) -> bytes:
     return z.T.contiguous().cpu().numpy().astype(np.float16).tobytes()
 
 
-def check_posterior(be, args) -> None:
+def check_posterior(be, args) -> bool:
+    """Whether the backend has a posterior (its statistics then go to ``stats.json``; ``--save-std`` needs one)."""
     if args.save_std and not hasattr(be, "posterior"):
         raise SystemExit(f"--save-std: the {args.backend} backend has no posterior (its encoder gives one latent)")
+    return hasattr(be, "posterior")
 
 
 def resample_f0(f0: np.ndarray, src_rate: float, frames: int, rate: float) -> np.ndarray:
@@ -146,12 +148,17 @@ def resample_f0(f0: np.ndarray, src_rate: float, frames: int, rate: float) -> np
 
 
 def storage_stats(args, sd, n_native: int, std: np.ndarray) -> dict:
-    """``stats.json`` entries of ``--native`` and ``--save-std``: how the frames are stored, and the posterior's
-    mean standard deviation relative to each channel's spread (what a posterior sample adds, in normalised units)."""
+    """``stats.json`` entries of ``--native`` and of a codec with a posterior: how the frames are stored, and
+    ``active``: the channels whose spread over the data exceeds the posterior's own standard deviation. The other
+    channels are unused by the VAE (their posterior is as wide as the prior) and are left out of the normalised
+    frames (:class:`drifting_tts.data.MelStats`). ``posterior_rel``: the posterior's standard deviation over the
+    data's, median of the active channels: what a posterior sample adds, in normalised units."""
     out = {"stored_repeat": 1 if args.native else args.repeat}
     if sd is not None:
-        rel = (sd / n_native).cpu().numpy() / np.maximum(std, 1e-3)
-        out.update(posterior_std=True, posterior_rel=float(rel.mean()))
+        post = (sd / n_native).cpu().numpy()
+        active = std > post
+        out.update(posterior_std=bool(args.save_std), active=[bool(a) for a in active],
+                   posterior_rel=float(np.median((post / np.maximum(std, 1e-3))[active])) if active.any() else None)
     return out
 
 
@@ -183,7 +190,7 @@ def run(args) -> None:
         print(f"the {args.backend} encoder takes {be.input_rate} Hz audio and gets {sr} Hz audio (nothing above "
               f"{sr // 2000} kHz): `prepare --save-audio --hires-rate {be.input_rate}` stores it", flush=True)
 
-    check_posterior(be, args)
+    post = check_posterior(be, args)
     copies = 1 if args.native else args.repeat  # stored frames per latent frame
     total, done = 0, {}  # (audio offset, samples) -> (offset, frames): merged roots repeat entries
     s = ss = sd = None
@@ -194,9 +201,10 @@ def run(args) -> None:
             key = (e[k_off], e[k_len])
             if key not in done:
                 wav = torch.from_numpy(np.array(audio[key[0]: key[0] + key[1]], dtype=np.float32))
-                if args.save_std:
+                if post:
                     z, std = (t[0].float() for t in be.posterior(wav.to(args.device), sr))
-                    fs.write(frame_bytes(std, copies))
+                    if args.save_std:
+                        fs.write(frame_bytes(std, copies))
                     sd = std.double().sum(1) if sd is None else sd + std.double().sum(1)
                 else:
                     z = be.encode(wav.to(args.device), sr)[0].float()  # [dim, T]
@@ -321,7 +329,7 @@ def run_parquet(args) -> None:
     be = load_backend(args.backend, args.device)
     rate = be.frame_rate * args.repeat
     sr = source_rate(be, getattr(args, "audio_rate", None))
-    check_posterior(be, args)
+    post = check_posterior(be, args)
     copies = 1 if args.native else args.repeat  # stored frames per latent frame
     index: list[dict] = []
     s = ss = sd = None
@@ -330,10 +338,11 @@ def run_parquet(args) -> None:
 
     def encode(batch: list[tuple[dict, np.ndarray]]) -> None:
         nonlocal s, ss, sd, n_native, total
-        for (meta, _), zk in zip(batch, encode_batch(be, [w for _, w in batch], sr, args.save_std)):
-            if args.save_std:
+        for (meta, _), zk in zip(batch, encode_batch(be, [w for _, w in batch], sr, post)):
+            if post:
                 zk, std = zk
-                fs.write(frame_bytes(std, copies))
+                if args.save_std:
+                    fs.write(frame_bytes(std, copies))
                 sd = std.double().sum(1) if sd is None else sd + std.double().sum(1)
             zs = zk.double()
             s = zs.sum(1) if s is None else s + zs.sum(1)

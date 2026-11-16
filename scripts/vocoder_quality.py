@@ -363,7 +363,7 @@ def gta_mels(args, items: list[dict], path: Path) -> list[torch.Tensor]:
     from drifting_tts.train import load_tts
 
     tts, _, stats = load_tts(args.model, args.device)
-    mel_stats, out = MelStats(stats["mean"], stats["std"]), []
+    mel_stats, out = MelStats.from_dict(stats), []
     for i, it in enumerate(items):
         g = torch.Generator(device=args.device).manual_seed(i)
         m = teacher_forced(tts, collate([it]), args.temperature, args.device, cfg_scale=args.cfg, generator=g)

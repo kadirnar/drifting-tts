@@ -252,8 +252,25 @@ def mean_metrics(rows: list[dict]) -> dict[str, float | None]:
 
 
 def active_channels(stats: LatentStats) -> Tensor:
-    """Channels that carry signal (some VAE channels are unused: constant, std ~ 0)."""
-    return stats.std > 0.01 * stats.std.median()
+    """Channels that carry signal. Some VAE channels are unused: constant (std ~ 0), or, for a codec with a
+    posterior, as wide as the prior: their spread over the data is below the posterior's own standard deviation
+    (``stats.posterior``, :func:`posterior_spread`), so they hold its noise and nothing of the audio."""
+    active = stats.std > 0.01 * stats.std.median()
+    post = getattr(stats, "posterior", None)
+    return active if post is None else active & (stats.std > post)
+
+
+@torch.no_grad()
+def posterior_spread(backend: AudioBackend, wavs: Sequence[Tensor], sr: int) -> Tensor | None:
+    """The posterior's mean standard deviation per channel ``[dim]`` over the recordings, or ``None`` for a backend
+    without a posterior."""
+    if not hasattr(backend, "posterior"):
+        return None
+    total, frames = None, 0
+    for w in wavs:
+        std = backend.posterior(w.to(backend.device), sr)[1][0].double().cpu()
+        total, frames = (std.sum(1) if total is None else total + std.sum(1)), frames + std.shape[1]
+    return (total / frames).float()
 
 
 def normalize(z: Tensor, stats: LatentStats) -> Tensor:
@@ -792,7 +809,11 @@ def gate_backend(name: str, backend: AudioBackend, rec: Recordings, spans: Seque
             row["roundtrip"]["native"]["source_rate"] = rec.hr_rate
             audio[f"{name}/native"] = [to16k(y, rate) for y in nat]
     stats = LatentStats.from_latents(latents)
+    stats.posterior = posterior_spread(backend, rec.wavs, SAMPLE_RATE)
     row["active_channels"] = int(active_channels(stats).sum())
+    if stats.posterior is not None:  # what a posterior sample adds, in standard deviations of an active channel
+        act = active_channels(stats)
+        row["posterior_rel"] = float((stats.posterior / stats.std)[act].median()) if act.any() else None
     if "tolerance" not in args.skip:
         conds = perturbations(args.noise, args.scale)
         for c, _, _ in conds:

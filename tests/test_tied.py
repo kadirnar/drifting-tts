@@ -155,7 +155,8 @@ def test_native_storage_reads_as_the_repeated_one_and_carries_the_posterior(root
     rep, nat = (MelDataset(roots / name, "train", min_frames=1) for name in ("repeated", "native"))
     st = json.loads((roots / "native" / "stats.json").read_text())
     assert st["stored_repeat"] == 1 and st["latent_repeat"] == 4 and st["posterior_std"] and st["posterior_rel"] > 0
-    assert json.loads((roots / "repeated" / "stats.json").read_text())["stored_repeat"] == 4
+    other = json.loads((roots / "repeated" / "stats.json").read_text())
+    assert other["stored_repeat"] == 4 and not other["posterior_std"] and other["active"] == st["active"]
     assert (roots / "native" / "mels.bin").stat().st_size * 4 == (roots / "repeated" / "mels.bin").stat().st_size
     assert len(rep) == len(nat) and nat.copies == 4 and rep.copies == 1
     for i in range(len(rep)):
@@ -166,9 +167,30 @@ def test_native_storage_reads_as_the_repeated_one_and_carries_the_posterior(root
     it = ds[0]
     assert it["mel_std"].shape == it["mel"].shape and torch.equal(it["mel_std"][:, 0], it["mel_std"][:, 3])
     raw = it["mel_std"] * ds.stats.std  # back in the codec's units: 0.1, 0.15, ... per channel
-    np.testing.assert_allclose(raw[:, 0].numpy(), 0.1 + 0.05 * np.arange(6), rtol=2e-3)
+    act = np.array(st["active"])
+    np.testing.assert_allclose(raw[:, 0].numpy()[act], (0.1 + 0.05 * np.arange(6))[act], rtol=2e-3)
+    assert act.any() and not it["mel_std"][~torch.from_numpy(act)].any()
     batch = collate([ds[0], ds[1]])
     assert batch["mel_std"].shape == batch["mel"].shape
+
+
+def test_unused_channels_are_left_out_of_the_normalised_frames():
+    from drifting_tts.data import MelStats
+
+    st = MelStats([1.0, -2.0, 0.5], [2.0, 0.5, 0.1], active=[True, False, True])
+    x = torch.randn(2, 3, 7)
+    z = st.normalize(x)
+    assert not z[:, 1].any() and torch.allclose(z[:, 0], (x[:, 0] - 1.0) / 2.0)
+    back = st.denormalize(z + 0.3)  # whatever a model writes there, the channel decodes as its mean
+    assert torch.allclose(back[:, 1], torch.full((2, 7), -2.0)) and torch.allclose(back[:, 2], (z[:, 2] + 0.3) * 0.1 + 0.5)
+    again = MelStats.from_dict(st.to_dict())
+    assert again.to_dict() == st.to_dict() and st.to_dict()["active"] == [True, False, True]
+    assert MelStats([0.0, 1.0], [1.0, 1.0], active=[True, True]).active is None  # all used: nothing to mask
+    assert "active" not in MelStats([0.0, 1.0], [1.0, 1.0]).to_dict()
+    y = torch.randn(2, 3, 8)
+    y[:, 1] = 0  # the unused channel of a batch stays 0 under sampled targets
+    out = sample_targets(y, torch.tensor([8, 8]), 0.2)
+    assert not out[:, 1].any() and not torch.equal(out[:, 0], y[:, 0])
 
 
 def test_train_ar_on_native_latents_with_a_tied_model(roots, tmp_path):

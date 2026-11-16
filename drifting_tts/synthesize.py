@@ -266,7 +266,7 @@ class Synthesizer:
         self.model, self.cfg, stats = load_tts(model_path, device)
         self.language = self.cfg.model.text.get("language", "tr")
         self.text = frontend(self.language)  # normalisation and symbols of the model's language
-        self.stats = MelStats(stats["mean"], stats["std"])
+        self.stats = MelStats.from_dict(stats)
         self.backend = stats.get("backend", "vocos")
         if self.backend in VAE_BACKENDS:  # a model trained on VAE latents: the VAE decoder is the vocoder
             from .latents.vocoder import LatentVocoder

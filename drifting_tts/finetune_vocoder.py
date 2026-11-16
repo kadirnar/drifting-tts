@@ -960,7 +960,7 @@ def run(args) -> None:
     if arch == "bigvgan" and backend != "bigvgan":
         raise ValueError("a BigVGAN vocoder needs a TTS model trained on bigvgan mels")
     tts.requires_grad_(False)
-    mel_stats = MelStats(stats["mean"], stats["std"])  # one scalar for log-mels, per channel for latents
+    mel_stats = MelStats.from_dict(stats)  # one scalar for log-mels, per channel for latents
     if vae:
         if cfg.vocoder.get("objective", "gan") != "gan":
             raise ValueError("a VAE decoder is fine-tuned with the GAN objective (vocoder.objective: gan)")

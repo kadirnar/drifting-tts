@@ -403,3 +403,15 @@ def test_repeated_latents_part(root):
                      "m.pt")
     assert "repeated_latents" not in gate.run(args, backends={"voxcpm2": tiny_voxcpm(True)},
                                               generate=lambda a: 1 / 0)
+
+
+def test_channels_as_wide_as_the_posterior_are_not_active():
+    """A VAE channel whose spread over the data is below the posterior's own standard deviation holds noise."""
+    from drifting_tts.latents import LatentStats
+
+    stats = LatentStats(torch.zeros(4), torch.tensor([1.0, 0.2, 0.9, 1e-6]))
+    assert gate.active_channels(stats).tolist() == [True, True, True, False]  # only the constant one is out
+    stats.posterior = torch.tensor([0.1, 0.7, 0.05, 0.7])
+    assert gate.active_channels(stats).tolist() == [True, False, True, False]
+    z = gate.normalize(torch.ones(4, 3), stats)
+    assert not z[1].any() and not z[3].any() and torch.allclose(z[0], torch.ones(3))

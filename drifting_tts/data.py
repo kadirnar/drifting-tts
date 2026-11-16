@@ -65,19 +65,33 @@ def passes(rec: dict | None, rules: list[tuple[str, float, float]], require: boo
 
 class MelStats:
     """Normalisation ``(x - mean) / std``: one scalar for log-mels, one value per channel for VAE latents (lists in
-    ``stats.json``; a channel's std is floored at ``min_std`` so collapsed channels stay finite)."""
+    ``stats.json``; a channel's std is floored at ``min_std`` so collapsed channels stay finite).
 
-    def __init__(self, mean: float | list[float], std: float | list[float], min_std: float = 1e-3):
+    ``active`` (per channel, ``stats.json`` of ``extract-latents`` for a codec with a posterior, #93): a VAE can
+    leave channels unused, their posterior as wide as the prior. Such a channel holds the posterior's noise and
+    nothing of the audio, and dividing it by its small spread would give it the weight of a real one in every L2
+    distance. Inactive channels are 0 in normalised units and the channel's mean after ``denormalize``."""
+
+    def __init__(self, mean: float | list[float], std: float | list[float], min_std: float = 1e-3,
+                 active: list[bool] | None = None):
         m, s = torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32)
+        self.active = None
         if m.numel() == 1:
             self.mean, self.std = float(m), float(s)
         else:  # [C, 1]: broadcasts over [..., C, T]
             self.mean, self.std = m.reshape(-1, 1), s.reshape(-1, 1).clamp_min(min_std)
+            if active is not None and not all(active):
+                self.active = torch.as_tensor(active, dtype=torch.float32).reshape(-1, 1)
 
     @classmethod
     def load(cls, root: str | Path) -> MelStats:
         s = json.loads((Path(root) / "stats.json").read_text())
-        return cls(s["mean"], s["std"])
+        return cls(s["mean"], s["std"], active=s.get("active"))
+
+    @classmethod
+    def from_dict(cls, s: dict) -> MelStats:
+        """The statistics stored in a checkpoint (:meth:`to_dict`)."""
+        return cls(s["mean"], s["std"], active=s.get("active"))
 
     @property
     def per_channel(self) -> bool:
@@ -90,16 +104,22 @@ class MelStats:
 
     def normalize(self, mel: torch.Tensor) -> torch.Tensor:
         mean, std = self._on(mel)
-        return (mel - mean) / std
+        x = (mel - mean) / std
+        return x if self.active is None else x * self.active.to(x.device, x.dtype)
 
     def denormalize(self, mel: torch.Tensor) -> torch.Tensor:
         mean, std = self._on(mel)
+        if self.active is not None:
+            mel = mel * self.active.to(mel.device, mel.dtype)
         return mel * std + mean
 
     def to_dict(self) -> dict:
         if not self.per_channel:
             return {"mean": self.mean, "std": self.std}
-        return {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
+        out = {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
+        if self.active is not None:
+            out["active"] = [bool(a) for a in self.active.flatten().tolist()]
+        return out
 
 
 def reference_frames(rc) -> tuple[int, int] | None:
@@ -246,6 +266,8 @@ class MelDataset(Dataset):
                 self._stds = np.memmap(self._stds_path, dtype=np.float16, mode="r").reshape(-1, self.dim)
             std = self._stored(self._stds, i)
             item["mel_std"] = std / self.stats.std  # normalised units, as the frames
+            if self.stats.active is not None:  # an unused channel has no sample: it is 0
+                item["mel_std"] = item["mel_std"] * self.stats.active
         if self.reference:
             others = [j for j in self.by_speaker.get(e["spk_id"], ()) if j != i]
             item["ref"] = crop_reference(self._mel(random.choice(others)), *self.reference) if others else None
