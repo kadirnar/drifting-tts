@@ -8,8 +8,8 @@
 # Not run yet: the Turkish corpus was not available where this was written. Score the snapshots with
 # scripts/judge_panel.py (recording, copy-synthesis, Vocos v2, each snapshot) before choosing one.
 # GTA mels (#90, measured on the English model): teacher-forced, as here. Mixing in free-running mels
-# (train.gta_free_prob: 0.5) did not help: lower on six of seven judges at 2,500 steps, mixed at 5,000, and no
-# better on the free-running mels in particular. Most of the gain comes early: 2,500 steps on 6 h recovered
+# (train.gta_free_prob) did not help: at 2,500 steps the more of them the lower (five of seven judges), at 5,000
+# half of them is mixed and no better on the free-running mels in particular. Most of the gain comes early: 2,500 steps on 6 h recovered
 # 91-95% of the 40k vocoder's gain on UTMOS22 / SCOREQ / SQUIM / Audiobox PQ, so the first snapshots already
 # say whether the vocoder was the problem.
 base: vocoder_bigvgan.yaml

@@ -216,7 +216,7 @@ both mels under the recording's alignment):
   better than its own training mels (all seven judges higher, three significantly).
 
 **Does training on free-running mels help?** `train.gta_free_prob` draws that share of the generated batches
-free-running (the recording's alignment, the model's own history; guidance is allowed there). Two fine-tunes of
+free-running (the recording's alignment, the model's own history; guidance is allowed there). Three fine-tunes of
 NVIDIA's generator with the released recipe, the same seed and the same data (3,194 utterances of up to 16 s, 6.0 h,
 1,266 speakers, from eight shards of the corpus), on an A10. The system as it is used (predicted durations,
 free-running, T 0.5; val 100; WER by Whisper large-v3):
@@ -228,12 +228,14 @@ free-running, T 0.5; val 100; WER by Whisper large-v3):
 | | 5,000 | 3.22 | 4.09 | 4.25 | 4.56 | 3.27 | 4.29 | 7.45 | 2.17% |
 | half free-running (`gta_free_prob: 0.5`) | 2,500 | 3.25 | 4.04 | 4.17 | 4.55 | 3.25 | 4.33 | 7.43 | 2.17% |
 | | 5,000 | 3.34 | 4.07 | 4.23 | 4.58 | 3.26 | 4.30 | 7.45 | 2.17% |
+| all free-running (`gta_free_prob: 1`) | 2,500 | 3.26 | 4.01 | 4.12 | 4.52 | 3.24 | 4.33 | 7.41 | 2.37% |
 | released: teacher-forced GTA, 105 h | 40,000 | 3.38 | 4.13 | 4.25 | 4.63 | 3.29 | 4.32 | 7.51 | 2.37% |
 | recording | – | 3.27 | 4.20 | 4.28 | 4.63 | 3.29 | 4.33 | 7.49 | 2.44% |
 
-- **No.** With half of the generated batches free-running the system is lower on six of seven judges after 2,500
-  steps (four significantly) and mixed after 5,000 (three judges higher; UTMOSv2 +0.13 and SCOREQ -0.03 are the
-  significant ones).
+- **No, and the more of them the lower.** After 2,500 steps the system falls with the share of free-running
+  batches on five of seven judges: UTMOS22 4.10 / 4.04 / 4.01 and SCOREQ 4.20 / 4.17 / 4.12 for none, half and all
+  of them (four judges significantly lower for half, the same four for all; the third run was stopped there). After
+  5,000 steps half is mixed (three judges higher; UTMOSv2 +0.13 and SCOREQ -0.03 are the significant ones).
 - **What differs between the two vocoders is not how they decode the model's mels.** They differ by the same
   amounts on copy-synthesis of *recorded* mels (UTMOSv2 +0.16, SCOREQ -0.03): system minus copy-synthesis is within
   0.03 on every judge and no interval excludes 0. And each decodes the free-running mel better than the

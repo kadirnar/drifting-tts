@@ -218,9 +218,10 @@ Details: [VOCODERS.md](VOCODERS.md).
     every patch boundary (frame change 5.9 dB across, 4.7 inside; free-running 4.7 / 4.7). A classifier tells the
     two kinds apart at 0.86 from 16 frames, and NVIDIA's unadapted BigVGAN-v2 decodes the teacher-forced mel 0.42
     UTMOS22 *below* the free-running one.
-  - Training on it does not help: half of the generated batches free-running (`train.gta_free_prob: 0.5`) is lower
-    on six of seven judges at 2,500 steps and mixed at 5,000; the two vocoders differ by the same amounts on
-    copy-synthesis, and neither decodes the free-running mel relatively better. It is 30% slower.
+  - Training on it does not help: at 2,500 steps the system falls with the share of free-running batches
+    (`train.gta_free_prob` 0 / 0.5 / 1: UTMOS22 4.10 / 4.04 / 4.01, SCOREQ 4.20 / 4.17 / 4.12); at 5,000 steps half
+    is mixed, the two vocoders differ by the same amounts on copy-synthesis, and neither decodes the free-running
+    mel relatively better. It is 30% slower.
   - 2,500 steps on 6 h of audio recover 91-95% of the 40k vocoder's gain on UTMOS22, SCOREQ, SQUIM and Audiobox PQ.
 
 ## 4. Audio-VAE latent spaces
