@@ -24,6 +24,8 @@ train:
   segment_frames: 64       # 64 mel frames <-> 16384 samples (official: 256 frames = 65536 samples x 4 per GPU)
   gta_prob: 0.8            # fraction of batches with generated mels (the rest: recorded mels)
   gta_temperature: 0.5     # noise temperature used for the generated mels (match inference)
+  gta_free_prob: 0.0       # ARDrift: share of the generated batches drawn free-running, on the model's own history
+                           # (#90, docs/ENGLISH.md: no gain on the judge panel, 30% slower; teacher-forced is the default)
   lr: 1.35e-5              # = 1e-4 * 0.9999996^5M: where the released LR schedule ended (stored in the optimizer)
   lr_decay: 0.9999996      # per step, as in config.json (-4% over 100k steps)
   betas: [0.8, 0.99]       # adam_b1 / adam_b2 of config.json
