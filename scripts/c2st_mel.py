@@ -182,7 +182,8 @@ def generate(args, dev: str) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         elif args.mode == "null":
             x = y.clone()
         else:
-            x = (model.fast_generator or model.generate)(cond, spk, args.temperature, g)
+            x = (model.fast_generator or model.generate)(cond, spk, args.temperature, g,
+                                                         history_noise=args.history_noise)
         for i, n in enumerate(y_len.tolist()):
             real.append(y[i, :, :n].cpu())
             fake.append(x[i, :, :n].float().cpu())
@@ -209,6 +210,8 @@ def main() -> None:
                     help="windows start at multiples of this many frames (the model's patch: whole patches)")
     ap.add_argument("--temperature", type=float, default=0.5)
     ap.add_argument("--input-noise", type=float, default=0.0, help="gta: noise on the teacher-forced history")
+    ap.add_argument("--history-noise", type=float, default=0.0,
+                    help="free: noise on the model's own history, as on the recorded one in training (#101)")
     ap.add_argument("--windows", type=int, nargs="+", default=[4, 16, 64])
     ap.add_argument("--views", nargs="+", default=list(VIEWS), choices=VIEWS)
     ap.add_argument("--steps", type=int, default=1500)

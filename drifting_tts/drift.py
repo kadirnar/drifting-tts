@@ -310,7 +310,8 @@ def _flatten_locations(t: Tensor) -> Tensor:
 
 
 def energy_score(gen: Tensor, pos: Tensor) -> tuple[Tensor, Tensor]:
-    """Energy score of samples ``gen`` ``[B, G, D]`` against one observation ``pos`` ``[B, 1, D]`` per row:
+    """Energy score of samples ``gen`` ``[B, G, D]`` against the observations ``pos`` ``[B, P, D]`` of each row (one,
+    or several: their mean score):
     ``E|x - y| - 1/2 E|x - x'|`` (the pairs of distinct samples), ``[B]``, and the samples' mean distance to each other
     over their mean distance to the observation (a scalar; 1 when the samples are as spread as the data).
 
@@ -322,7 +323,7 @@ def energy_score(gen: Tensor, pos: Tensor) -> tuple[Tensor, Tensor]:
     this score, SLED (arXiv 2505.13181) the per-step head of a speech language model."""
     G = gen.shape[1]
     gen, pos = gen.float(), pos.float()
-    d_pos = cdist(gen, pos)[..., 0].mean(1)
+    d_pos = cdist(gen, pos).mean((1, 2))  # over the observations too, when a row has more than one (#98)
     d_neg = cdist(gen, gen).sum((1, 2)) / (G * (G - 1))  # the ~0 self distances add nothing
     return d_pos - 0.5 * d_neg, (d_neg.mean() / d_pos.mean()).detach()
 

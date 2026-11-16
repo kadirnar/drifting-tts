@@ -25,6 +25,9 @@ free-running by the model (:meth:`~drifting_tts.models.ar.ARDriftTTS.rollout`), 
 patches drawn one step after the recording. The targets stay the recording's. ``model.ar.noise_level`` tells the
 backbone the level of ``drift.input_noise``.
 
+``drift.teacher`` (#98): a frozen model draws ``positives`` more positives per row beside the recording, from its
+own state of the clean recorded history (:class:`Teacher`): its one-step head, or a multi-step flow-matching head.
+
 ``drift.loss: energy`` replaces the drifting field by the energy score (:func:`~drifting_tts.drift.energy_score`, a
 proper scoring rule without a temperature; docs/HEAD_REALISM.md). ``drift.window`` adds kernel maps over a window
 (#97): the recorded patches before a step and the step's patch through a frozen 2-D Mel-MAE
@@ -175,12 +178,55 @@ def kernel_loss(f_gen: dict, f_pos: dict, kind: str, tau: torch.Tensor, key_weig
                               max_locations=max_locations)
 
 
+class Teacher:
+    """The frozen model that draws positives (#98, ``drift.teacher``): a trained ARDrift model (``path``), whose
+    backbone gives the state of every row from the clean recorded history, and its one-step head (teacher A,
+    self-distillation) or a multi-step flow-matching head trained on those states (``head``: teacher B,
+    ``scripts/head_finetune.py --loss flow``)."""
+
+    def __init__(self, tc, device):
+        from .models.ar import FlowHead
+        from .train import load_tts
+
+        self.model = load_tts(tc.path, device)[0].eval().requires_grad_(False)
+        self.positives, self.temperature = int(tc.get("positives", 15)), float(tc.get("temperature", 1.0))
+        self.steps, self.flow = int(tc.get("steps", 8)), None
+        if tc.get("head"):
+            ck = torch.load(tc.head, map_location="cpu", weights_only=False)
+            if ck.get("kind") != "flow":
+                raise ValueError(f"{tc.head} is not a flow head (scripts/head_finetune.py --loss flow)")
+            m = self.model
+            self.flow = FlowHead(m.x_in.out_features, m.head.out.out_features, m.head.inp.out_features,
+                                 len(m.head.blocks)).to(device).eval().requires_grad_(False)
+            self.flow.load_state_dict(ck["head"])
+
+    @torch.no_grad()
+    def draw(self, text, text_len, spk, spk_emb, attn, y, idx) -> torch.Tensor:
+        """Positives ``[R, P, D]`` for the rows ``idx`` (indices into the flattened steps): the teacher's own text
+        condition under the student's alignment ``attn``, its backbone on the recorded history ``y``, its head.
+        Voices of the speaker table (a teacher with a reference encoder reads its null tokens)."""
+        m, P = self.model, self.positives
+        amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
+        with amp:
+            h, mu, _, _ = m.encoder(text, text_len, spk, spk_emb)
+        cond = m.pad_frames(m.frame_condition(h.float(), mu.float(), attn))
+        cond = torch.nn.functional.pad(cond, (y.shape[-1] - cond.shape[-1], 0))  # a prompt in front: no condition
+        with amp:
+            s = m.teacher_forced(cond, y, spk).flatten(0, 1)[idx]
+        base = m.squeeze(patchify(cond[:, : m.n_mels], m.patch).flatten(0, 1)[idx])
+        z = torch.randn(s.shape[0] * P, m.head.noise_dim, device=y.device) * self.temperature
+        with amp:
+            rows = s.repeat_interleave(P, 0)
+            res = self.flow.sample(rows, z, self.steps) if self.flow is not None else m.head(rows, z)
+        return base[:, None] + res.float().view(s.shape[0], P, -1)
+
+
 def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torch.Tensor,
-                  mel_std: float | None = None, detail: bool = False, mae=None) -> tuple:
+                  mel_std: float | None = None, detail: bool = False, mae=None, teacher=None) -> tuple:
     """One training step; ``mel_std``: the scalar std of the mel statistics (for ``drift.energy_bands``).
     ``detail``: the metrics also hold every feature map's drift loss, raw field and data mass (``loss/<map>``,
     ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop. ``mae``: the frozen Mel-MAE of
-    ``drift.window``."""
+    ``drift.window``; ``teacher``: the :class:`Teacher` of ``drift.teacher``."""
     dc, lc = cfg.drift, cfg.loss
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
@@ -284,8 +330,14 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         opts["energy_scale"] = 2.0 * float(mel_std)
     kf = 1 if model.tied else k  # frames in what the head draws
     f_gen = ar_features(x, kf, C, **opts)
+    positives = target[:, None]  # [R, 1, D]: the recording
+    if teacher is not None:  # ... and the teacher's samples for the same step (#98)
+        if prompting and (lead > 0).any():
+            raise ValueError("drift.teacher does not go with prompts (drift.prompt): the teacher needs the cut text")
+        drawn = teacher.draw(text, text_len, spk_in, spk_emb, attn, y, idx)
+        positives = torch.cat([positives, drawn], 1)
     with torch.no_grad():
-        f_pos = ar_features(target[:, None], kf, C, **opts)
+        f_pos = ar_features(positives, kf, C, **opts)
     kind = dc.get("loss", "field")
     l_drift, info = kernel_loss(f_gen, f_pos, kind, tau, dc.get("key_weights"))
     wc = dc.get("window")
@@ -297,7 +349,7 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         with amp:
             w_gen = window_features(mae, hist, x[:rw, :gw], k, C)
             with torch.no_grad():
-                w_pos = window_features(mae, hist, target[:rw, None], k, C)
+                w_pos = window_features(mae, hist, positives[:rw], k, C)
         l_win, w_info = kernel_loss(w_gen, w_pos, wc.get("loss", "energy"), tau, None, wc.get("max_locations", 32))
         l_drift = l_drift + float(wc.get("weight", 1.0)) * l_win
         info = {**info, **{kk: v for kk, v in w_info.items() if kk != "tau_loss"},
@@ -316,6 +368,9 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
             metrics["window"] = info["window"]
         if rc:
             metrics["rollout"] = float(rolled)
+        if teacher is not None:  # the teacher's spread beside the student's, and how far its mean is from the data
+            metrics["teacher_std"] = positives[:, 1:].std(1).mean()
+            metrics["teacher_mse"] = ((positives[:, 1:].mean(1) - target) ** 2).mean()
         if prompting or referencing:
             metrics["prompted"] = (lead > 0).float().mean()
             metrics["id_dropped"] = dropped.float().mean()
@@ -426,6 +481,12 @@ def run(args) -> None:
             vocoder = load_vocoder(tc.get("vocoder", "vocos-v2"), device)
 
     mel_std = None if ds.stats.per_channel else ds.stats.std  # drift.energy_bands: log-mel data only
+    teacher = None
+    if cfg.drift.get("teacher"):  # a frozen model draws positives beside the recording (#98)
+        teacher = Teacher(cfg.drift.teacher, device)
+        print(f"teacher: {cfg.drift.teacher.path}, {teacher.positives} positives per row"
+              + (f" from the flow head {cfg.drift.teacher.head} ({teacher.steps} steps)" if teacher.flow else ""),
+              flush=True)
     mae = None
     if cfg.drift.get("window"):  # the frozen Mel-MAE of the window maps (#97)
         from .train_mae import load_mae
@@ -439,7 +500,7 @@ def run(args) -> None:
         t = time.time()
         for n, (name, e) in enumerate(emas.items()):
             res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True,
-                                                                     mae=mae)[1], heldout)
+                                                                     mae=mae, teacher=teacher)[1], heldout)
             res.update(audio(e.model))
             record(writer, work, at, name, n == 0, res)
         print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
@@ -466,7 +527,7 @@ def run(args) -> None:
     it = infinite(loader)
     t0, agg = time.time(), {}
     while step < tc.steps:
-        loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std, mae=mae)
+        loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std, mae=mae, teacher=teacher)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm_enc = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)

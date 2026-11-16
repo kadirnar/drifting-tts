@@ -130,6 +130,40 @@ class DriftHead(nn.Module):
         return self.out(self.norm(x))
 
 
+class FlowHead(nn.Module):
+    """A multi-step head for the same backbone states (#98, teacher B): a flow-matching velocity field over the
+    patch residual, sampled with a few Euler steps. Same body as :class:`DriftHead` (so it can start from a trained
+    one), plus the time as an input of the conditioning. It is a teacher: it draws positives for the one-step head,
+    it is not used at inference."""
+
+    def __init__(self, cond: int, out: int, dim: int = 512, depth: int = 6):
+        super().__init__()
+        self.noise_dim = out
+        self.body = DriftHead(cond, out, dim, depth, out)
+        self.time = LevelEmbedding(cond)
+
+    def velocity(self, s: Tensor, x: Tensor, t: Tensor) -> Tensor:
+        """States ``[N, cond]``, points ``[N, out]`` on the path at times ``t`` ``[N]`` -> velocities ``[N, out]``."""
+        return self.body(s + self.time(t).to(s.dtype), x)
+
+    def loss(self, s: Tensor, target: Tensor, generator: torch.Generator | None = None) -> Tensor:
+        """Rectified-flow loss: on the straight path from noise ``z`` to the residual ``target`` ``[N, out]`` the
+        velocity is ``target - z``."""
+        z = torch.randn(target.shape, device=target.device, generator=generator)
+        t = torch.rand(target.shape[0], device=target.device, generator=generator)
+        x = (1 - t[:, None]) * z + t[:, None] * target
+        return (self.velocity(s, x.to(s.dtype), t).float() - (target - z)).pow(2).mean()
+
+    @torch.no_grad()
+    def sample(self, s: Tensor, z: Tensor, steps: int = 8) -> Tensor:
+        """Residuals ``[N, out]`` from the noise ``z`` (already scaled by the temperature): ``steps`` Euler steps."""
+        x = z
+        for i in range(steps):
+            t = torch.full((s.shape[0],), i / steps, device=s.device)
+            x = x + self.velocity(s, x.to(s.dtype), t).to(x.dtype) / steps
+        return x
+
+
 class LevelEmbedding(nn.Module):
     """The noise level of the history as an input of the backbone (#101): Fourier features of the level, then an
     MLP whose output starts at zero (a fine-tune starts as the model was)."""

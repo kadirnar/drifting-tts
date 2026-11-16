@@ -188,9 +188,11 @@ def main() -> None:
     ap.add_argument("--split", default="train")
     ap.add_argument("--out", required=True)
     ap.add_argument("--maps", nargs="+", default=["patch", "frame", "detail"], type=map_name)
-    ap.add_argument("--loss", choices=("kyutai", "energy", "both"), default="kyutai",
+    ap.add_argument("--loss", choices=("kyutai", "energy", "both", "flow"), default="kyutai",
                     help="the drifting field with a learned temperature per map (the training's), the energy score "
-                         "(a proper scoring rule: drifting_tts.drift.energy_score), or their sum")
+                         "(a proper scoring rule: drifting_tts.drift.energy_score), or their sum; flow: a "
+                         "multi-step flow-matching head on the same states, started from the model's head (#98: "
+                         "the teacher of drift.teacher.head)")
     ap.add_argument("--tile-bins", type=int, default=10)
     ap.add_argument("--mae", default=None, help="a Mel-MAE (train-mae, model.type 2d) for the `mae` maps")
     ap.add_argument("--context", type=int, default=1, help="recorded patches kept before every row (the MAE's window)")
@@ -244,13 +246,19 @@ def main() -> None:
     print(f"{N} rows ({N * k / 93.75 / 3600:.1f} h of patches); maps: {' '.join(args.maps)}", flush=True)
 
     head = model.head
+    if args.loss == "flow":  # a velocity field over the patch residual, with the trained head's body to start from
+        from drifting_tts.models.ar import FlowHead
+
+        head = FlowHead(model.x_in.out_features, model.head.out.out_features, model.head.inp.out_features,
+                        len(model.head.blocks)).to(dev)
+        head.body.load_state_dict(model.head.state_dict())
     for p in model.parameters():
         p.requires_grad_(False)
     for p in head.parameters():
         p.requires_grad_(True)
     head.train()
     ema = copy.deepcopy(head).eval()
-    maps = tuple(args.maps)
+    maps = () if args.loss == "flow" else tuple(args.maps)
     scale = residual_scale(head, rows, k, C, G, dev) if "wdct" in maps or "wpatch" in maps else None
     if scale is not None:
         share = scale.pow(2).sum(1) / scale.pow(2).sum()
@@ -274,6 +282,12 @@ def main() -> None:
         for _ in range(args.accum):
             idx = torch.randint(N, (R,), generator=gc)
             s, target, base, prev = (rows[n][idx].to(dev).float() for n in ("state", "target", "base", "prev"))
+            if args.loss == "flow":  # G points of the noise-to-data path per state
+                with amp:
+                    loss = head.loss(s.repeat_interleave(G, 0), (target - base).repeat_interleave(G, 0), g)
+                info, x = {}, None
+                (loss / args.accum).backward()
+                continue
             z = torch.randn(R * G, head.noise_dim, device=dev, generator=g)
             with amp:
                 res = head(s.repeat_interleave(G, 0), z)
@@ -299,8 +313,9 @@ def main() -> None:
                 t.clamp_(min=1e-3)
             for pe, pm in zip(ema.parameters(), head.parameters()):
                 pe.lerp_(pm, 1 - args.ema)
-            m = {"loss": loss.detach(), "grad_norm": gnorm,
-                 "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean()}
+            m = {"loss": loss.detach(), "grad_norm": gnorm}
+            if x is not None:
+                m.update(centroid_mse=((x.mean(1) - target) ** 2).mean(), sample_std=x.std(1).mean())
             if "tau_loss" in info:
                 m["drift"] = loss.detach() - info["tau_loss"] - info.get("energy", 0.0)
                 m.update({f"tau/{name}": t.detach() for name, t in taus.items()})
@@ -315,6 +330,7 @@ def main() -> None:
                   + f" ({100 / (time.time() - t0):.1f} it/s)", flush=True)
             agg, t0 = {}, time.time()
     torch.save({"head": ema.state_dict(), "maps": names, "steps": args.steps,
+                "kind": "flow" if args.loss == "flow" else "drift",
                 "taus": {name: float(t.detach()) for name, t in taus.items()}, "args": vars(args)},
                out / "head.pt")
     (out / "log.json").write_text(json.dumps(log))
