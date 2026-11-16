@@ -95,6 +95,9 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.5)
     ap.add_argument("--seconds", type=float, default=6.0, help="the prompt: this much of the recording's beginning")
     ap.add_argument("--reference-seconds", type=float, default=10.0, help="what the reference encoder reads")
+    ap.add_argument("--reference-from", default="prompt", choices=("prompt", "other"),
+                    help="what the reference encoder reads: the prompt recording, or another recording of the "
+                         "speaker (the next target's: a reference is another utterance in training, #96)")
     ap.add_argument("--f0", action="store_true", help="F0 spread of every utterance (WORLD harvest, on the CPU)")
     ap.add_argument("--cfg", type=float, default=1.0, help="guidance scale of the generated systems (#99)")
     ap.add_argument("--guide", default="text", choices=("text", "voice", "both"),
@@ -136,9 +139,21 @@ def main() -> None:
         prompt_path = root / entry["prompt"]["file"]
         ref_emb = sv(load16(prompt_path)).float().cpu()
         near = None if table is None else int((table @ ref_emb).argmax())
-        refs = {s: synth.reference(prompt_path, seconds=args.seconds, mode=None if synth.model.ref_enc is None
-                                   else MODES[s], reference_seconds=args.reference_seconds)
-                for s in args.systems if s in MODES}
+        def voice(system: str, t: int):
+            """The voice of target ``t``: the prompt recording, and for the reference encoder with
+            ``--reference-from other`` the recording of the speaker's next target (never the one spoken)."""
+            mode = None if synth.model.ref_enc is None else MODES[system]
+            if args.reference_from == "prompt" or mode in (None, "prefix"):
+                return synth.reference(prompt_path, seconds=args.seconds, mode=mode,
+                                       reference_seconds=args.reference_seconds)
+            other_file = root / entry["targets"][(t + 1) % len(entry["targets"])]["file"]
+            ref = synth.reference(other_file, mode="reference", reference_seconds=args.reference_seconds)
+            if mode == "both":  # the prompt recording in front of the output, the other one through the encoder
+                ref.mel = synth.reference_mel(prompt_path, seconds=args.seconds)
+            return ref
+
+        fixed = args.reference_from == "prompt"
+        refs = {s: voice(s, 0) for s in args.systems if s in MODES} if fixed else {}
         prompt_mel = synth.reference_mel(prompt_path, seconds=args.seconds) if "prefix" in args.systems else None
         other = manifest[speakers[(n + 1) % len(speakers)]]
         for t, target in enumerate(entry["targets"]):
@@ -158,8 +173,8 @@ def main() -> None:
                             wav = continue_prompt(synth, prompt_mel, entry["prompt"]["text"], target["text"], near,
                                                   args.temperature, seed)
                         else:
-                            wav = synth(target["text"], ref_audio=refs[system], temperature=args.temperature,
-                                        seed=seed, cfg_scale=args.cfg)[0]
+                            wav = synth(target["text"], ref_audio=refs[system] if fixed else voice(system, t),
+                                        temperature=args.temperature, seed=seed, cfg_scale=args.cfg)[0]
                     wav = wav.float().cpu().flatten()
                     if n < args.save_wavs:
                         sf.write(args.out / f"{system}_{spk}_{t}.wav", wav.numpy(), synth.sample_rate)
@@ -179,6 +194,7 @@ def main() -> None:
     summary = {s: summarize([r for r in rows if r["system"] == s]) for s in dict.fromkeys(r["system"] for r in rows)}
     (args.out / "summary.json").write_text(json.dumps({"model": args.model, "manifest": args.manifest,
                                                        "seconds": args.seconds, "cfg": args.cfg,
+                                                       "reference_from": args.reference_from,
                                                        "guide": args.guide, "systems": summary}, indent=1))
     lines = ["| system | SIM-o | 95% | WER | 95% | F0 std (st) | items |", "|---|---|---|---|---|---|---|"]
     for s, r in summary.items():

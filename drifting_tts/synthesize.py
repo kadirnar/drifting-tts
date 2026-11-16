@@ -534,7 +534,8 @@ class Synthesizer:
 
         self.acoustic = None
         if getattr(self.model, "generator", None) is None:  # an ARDrift model: one CUDA graph per generation step
-            self.model.enable_fast()
+            patches = getattr(getattr(self.model, "ref_enc", None), "kind", None) == "patches"
+            self.model.enable_fast(max_steps=768 if patches else 512)  # room for a reference's patches (#96)
             return
         if not graphable(self.prosody, self.prosody_spread) or self.prosody_pitch is not None:
             warnings.warn("this prosody predictor runs eagerly: only the vocoder windows use CUDA graphs", stacklevel=3)
@@ -901,7 +902,8 @@ class Synthesizer:
                 yield silence(pause, previous, rng, self.sample_rate)
             previous = sentence
             tokens = None if ref is None else ref.tokens
-            if not gen.fits(t, 0 if pc is None else pc.shape[-1]):  # longer than the caches: whole sentence
+            lead = None if tokens is None else tokens.shape[1]
+            if not gen.fits(t, 0 if pc is None else pc.shape[-1], lead):  # longer than the caches: whole sentence
                 mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
                                  tokens=tokens, guide=getattr(self, "guidance", "text"))
                 if history is not None:

@@ -246,6 +246,19 @@ def test_train_ar_with_references_and_the_synthesizers_modes(tmp_path):
     main(["train-ar", "--workdir", str(work), f"data.root={data}", *TINY, "train.steps=2", "train.save_every=2",
           f"train.init_from={base / 'model_ema.pt'}", *OVER[2:], *prompts, "drift.reference.min_seconds=0.3",
           "drift.reference.max_seconds=1.0"])
+    _synthesizer_modes(tmp_path, base, work, tokens=3)
+    work = tmp_path / "patches"  # the same with the reference's own patches as its tokens
+    main(["train-ar", "--workdir", str(work), f"data.root={data}", *TINY, "train.steps=2", "train.save_every=2",
+          f"train.init_from={base / 'model_ema.pt'}", *OVER_P[2:], *prompts, "drift.reference.min_seconds=0.3",
+          "drift.reference.max_seconds=1.0"])
+    _synthesizer_modes(tmp_path, base, work, tokens=None)
+
+
+def _synthesizer_modes(tmp_path, base, work, tokens):
+    import soundfile as sf
+
+    from drifting_tts.synthesize import Synthesizer
+
     synth = Synthesizer(work / "model_ema.pt", "cpu", vocoder="griffin-lim")
     synth.vocoder.model.n_iter = 2
     assert synth.model.ref_enc is not None and synth.model.spk.num_embeddings == 4  # no second extra row
@@ -259,7 +272,9 @@ def test_train_ar_with_references_and_the_synthesizers_modes(tmp_path):
     refs = {mode: synth.reference(tmp_path / "a.wav", seconds=0.5, mode=mode) for mode in ("prefix", "reference",
                                                                                            "both")}
     assert refs["prefix"].tokens is None and refs["reference"].mel is None
-    assert refs["both"].mel is not None and refs["both"].tokens.shape == (1, 3, 32)
+    assert refs["both"].mel is not None
+    assert refs["both"].tokens.shape == ((1, 3, 32) if tokens else (1, refs["both"].tokens.shape[1], 32))
+    assert tokens or refs["both"].tokens.shape[1] > 20  # a patch reference: one token per patch of the recording
     assert torch.equal(refs["both"].vector, refs["reference"].vector)
     out = {mode: synth(text, ref_audio=r, seed=1)[0] for mode, r in refs.items()}
     assert all(torch.isfinite(w).all() for w in out.values())
@@ -280,3 +295,91 @@ def test_train_ar_with_references_and_the_synthesizers_modes(tmp_path):
 def _contains(mel: torch.Tensor, crop: torch.Tensor) -> bool:
     n = crop.shape[1]
     return any(torch.equal(mel[:, s: s + n], crop) for s in range(mel.shape[1] - n + 1))
+
+
+# ------------------------------------------------- kind: patches (the reference's own patches as its tokens)
+
+PATCHES = {**CFG, "ar": {**CFG["ar"], "reference": {"kind": "patches", "dim": 16, "layers": 1, "heads": 2,
+                                                    "null_tokens": 2}}}
+OVER_P = OVER[:3] + ["model.ar.reference.kind=patches", "model.ar.reference.dim=16", "model.ar.reference.layers=1",
+                     "model.ar.reference.heads=2", "model.ar.reference.null_tokens=2"]
+
+
+def _patch_model(seed: int = 0, noise: float = 0.05) -> ARDriftTTS:
+    torch.manual_seed(seed)
+    m = ARDriftTTS(Config(PATCHES), num_speakers=3, n_mels=100).eval()
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(torch.randn_like(p) * noise)
+    return m
+
+
+def test_patch_references_start_as_what_a_prompt_looks_like():
+    m = _patch_model(noise=0.0)  # as initialised: the encoder's correction and the segment embedding are zero
+    with torch.no_grad():
+        m.c_in.bias.add_(0.1)
+        m.ref_enc.null.add_(0.3)
+    ref = torch.randn(2, 100, 24)
+    tokens, vec = m.reference_tokens(ref, torch.tensor([24, 12]))
+    assert tokens.shape == (2, 6, 32) and vec.shape == (2, 8)
+    p = patchify(ref, 4)
+    like_prompt = m.x_in(p) + m.c_in.bias + m.spk.weight[m.prompt_row]
+    torch.testing.assert_close(tokens[0], like_prompt[0], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(tokens[1, 3:], like_prompt[1, :3], atol=1e-6, rtol=1e-5)  # right-aligned ...
+    assert torch.allclose(tokens[1, :3], m.ref_enc.null.expand(3, -1))  # ... behind the null token
+    torch.testing.assert_close(vec, m.prompt_vector(ref, torch.tensor([24, 12])), atol=1e-6, rtol=1e-5)
+    none, _ = m.reference_tokens(ref, torch.tensor([24, 24]), torch.tensor([False, True]))
+    assert torch.allclose(none[0], m.ref_enc.null.expand(6, -1)) and torch.equal(none[1], tokens[0] * 0 + none[1])
+    assert m.reference_tokens(None, batch=2)[0].shape == (2, 2, 32)  # no reference at all: the null tokens
+    assert m._tokens(None, 3).shape == (3, 2, 32)
+    m2 = _patch_model()  # trained weights: the correction is there, and the padding does not change a row
+    a, va = m2.reference_tokens(ref, torch.tensor([24, 12]))
+    b, vb = m2.reference_tokens(ref[1:, :, :12])
+    torch.testing.assert_close(a[1, 3:], b[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(va[1], vb[0], atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(a[0], m2.x_in(p)[0] + m2.c_in.bias + m2.spk.weight[m2.prompt_row], atol=1e-3)
+
+
+def test_patch_references_in_generation_and_the_fast_generator():
+    m = _patch_model()
+    cond, spk = torch.randn(2, 116, 29), torch.tensor([0, 3])
+    tokens, _ = m.reference_tokens(torch.randn(2, 100, 24), torch.tensor([24, 16]))
+    mel = m.generate(cond, spk, temperature=0.0, tokens=tokens)
+    padded = m.pad_frames(cond)
+    s = m.teacher_forced(padded, m.pad_frames(mel), spk, tokens=tokens)
+    assert s.shape[1] == 8
+    again = patchify(padded[:, :100], 4) + m.head(s.flatten(0, 1), torch.zeros(16, 400)).view(2, 8, -1)
+    torch.testing.assert_close(unpatchify(again, 4, 100)[..., :29], mel, atol=1e-4, rtol=1e-4)
+    fast = ARGenerator(m, max_steps=16, graphs=False)
+    assert fast.lead == 2 and fast.fits(8 * 4, lead=6) and not fast.fits(11 * 4, lead=6) and fast.fits(11 * 4)
+    prefix, pc = torch.randn(2, 100, 8), torch.zeros(2, 116, 8)
+    for kw in ({}, {"cfg_scale": 1.5}, {"cfg_scale": 1.5, "guide": "both"}, {"prefix": prefix, "prefix_cond": pc}):
+        ref = m.generate(cond, spk, 0.7, torch.Generator().manual_seed(5), tokens=tokens, **kw)
+        for _ in range(2):
+            out = fast(cond, spk, 0.7, torch.Generator().manual_seed(5), tokens=tokens, **kw)
+            torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    null = m.generate(cond, spk, 0.0)  # no reference: the null tokens, in every path
+    torch.testing.assert_close(fast(cond, spk, 0.0), null, atol=1e-4, rtol=1e-4)
+    long = torch.randn(2, 116, 60)  # too long for the caches with these tokens: the slow path, the same draws
+    ref = m.generate(long, spk, 0.7, torch.Generator().manual_seed(5), tokens=tokens)
+    torch.testing.assert_close(fast(long, spk, 0.7, torch.Generator().manual_seed(5), tokens=tokens), ref, atol=1e-4,
+                               rtol=1e-4)
+
+
+def test_training_step_with_patch_references():
+    m = _patch_model().train()
+    no_prompt = [f"drift.prompt.{k}={v}" for k, v in {**PROMPT, "prob": 0.0}.items()]
+    cfg = load_config("configs/ar_tts.yaml", OVER_P + no_prompt + ["drift.reference.prob=1.0",
+                                                                    "drift.reference.id_dropout=1.0"])
+    tau = torch.nn.Parameter(torch.tensor(1.0))
+    torch.manual_seed(0)
+    loss, metrics = training_step(m, _ref_batch(), cfg, "cpu", tau)
+    loss.backward()
+    assert torch.isfinite(loss) and metrics["referenced"] == 0.5 and metrics["ref_only"] == 0.5
+    for p in (m.ref_enc.out.weight, m.ref_enc.vec.weight, m.ref_enc.null, m.ref_enc.segment, m.prompt_enc.out.weight):
+        assert p.grad is not None and p.grad.abs().sum() > 0
+    both = load_config("configs/ar_tts.yaml", OVER_P + [f"drift.prompt.{k}={v}" for k, v in PROMPT.items()]
+                       + ["drift.reference.prob=1.0", "drift.voice_dropout=0.5", "drift.cond_dropout=0.5"])
+    torch.manual_seed(1)
+    assert torch.isfinite(training_step(m, _ref_batch(), both, "cpu", tau)[0])
+    assert torch.isfinite(training_step(m, _batch(), both, "cpu", tau)[0])  # a batch without references
