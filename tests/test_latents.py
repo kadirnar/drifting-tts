@@ -103,6 +103,22 @@ def test_fold_weight_norm():
         assert torch.allclose(plain(x), wn(x), atol=1e-6)
 
 
+def test_fold_parametrized_weight_norm():
+    from drifting_tts.latents.semantic_vae import AttnProjection, Encoder, fold_parametrized
+
+    conv = torch.nn.utils.parametrizations.weight_norm(torch.nn.Conv1d(3, 5, 7))
+    with torch.no_grad():
+        conv.parametrizations.weight.original0.mul_(1.7)
+    folded = fold_parametrized({f"c.{k}": v for k, v in conv.state_dict().items()})
+    assert set(folded) == {"c.bias", "c.weight"}
+    torch.testing.assert_close(folded["c.weight"], conv.weight)
+    enc = Encoder(4, [4, 4, 5, 5])  # 400 samples per frame, 64 channels
+    x = torch.randn(2, 1, 1600)
+    h = enc(x)
+    assert h.shape == (2, 64, 4)
+    assert AttnProjection(64, 8, heads=8)(h.transpose(1, 2)).shape == (2, 4, 8)
+
+
 def test_latent_stats():
     torch.manual_seed(0)
     zs = [torch.randn(3, 50) * torch.tensor([[1.0], [2.0], [0.5]]) + torch.tensor([[0.0], [3.0], [-1.0]]),
@@ -130,7 +146,8 @@ def test_bigvgan_mel_frames():
 WEIGHTS = {"dacvae": (DACVAE_REPO, "weights.pth", DACVAE_REVISION),
            **{name: (repo, "audiovae.pth", revision) for name, (repo, revision) in VOXCPM.items()},
            "bigvgan": ("nvidia/bigvgan_v2_24khz_100band_256x", "bigvgan_generator.pt", None),
-           "mimi": (MIMI_REPO, MIMI_FILE, MIMI_REVISION)}
+           "mimi": (MIMI_REPO, MIMI_FILE, MIMI_REVISION),
+           "semantic-vae": ("zkniu/Semantic-VAE", "semantic_vae/dac/ema_state_dict.pth", None)}
 
 
 @pytest.mark.parametrize("name", BACKENDS)
@@ -148,3 +165,7 @@ def test_released_backend_roundtrip(name):
     y = be.decode(z)
     assert z.shape == (1, be.dim, be.num_frames(len(wav), 24_000)) and y.shape == (1, z.shape[-1] * be.hop_out)
     assert torch.isfinite(y).all() and y.abs().max() > 0.01
+    if hasattr(be, "posterior"):  # the mean is what encode returns; the spread is positive
+        mean, std = be.posterior(wav, 24_000)
+        assert std.shape == z.shape and (std > 0).all()
+        torch.testing.assert_close(mean, z, atol=1e-5, rtol=1e-5)
