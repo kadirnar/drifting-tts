@@ -130,6 +130,23 @@ class DriftHead(nn.Module):
         return self.out(self.norm(x))
 
 
+class LevelEmbedding(nn.Module):
+    """The noise level of the history as an input of the backbone (#101): Fourier features of the level, then an
+    MLP whose output starts at zero (a fine-tune starts as the model was)."""
+
+    def __init__(self, dim: int, bands: int = 8):
+        super().__init__()
+        self.register_buffer("freqs", 2 * math.pi * 2.0 ** torch.arange(bands), persistent=False)
+        self.net = nn.Sequential(nn.Linear(2 * bands, dim), nn.SiLU(), nn.Linear(dim, dim))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, level: Tensor) -> Tensor:
+        """Levels ``[B]`` -> ``[B, dim]``."""
+        a = level.float()[:, None] * self.freqs
+        return self.net(torch.cat([a.sin(), a.cos()], -1).to(self.net[0].weight.dtype))
+
+
 def join_prefix(cond: Tensor, prefix: Tensor | None, prefix_cond: Tensor | None, k: int) -> tuple[Tensor, int]:
     """The condition of a generation with ``prefix`` (see :meth:`ARDriftTTS.generate`) and the number of leading
     frames that are context, not output: ``prefix_cond`` in front of ``cond`` and its length, or ``cond`` and 0."""
@@ -232,6 +249,14 @@ class ReferenceEncoder(nn.Module):
         return self.out(q) + self.segment, self.vec(q.mean(1))
 
 
+def history_generator(generator: torch.Generator | None, device) -> torch.Generator:
+    """The generator of ``history_noise``: its own stream, seeded from the call's, so that the patches' noise is
+    drawn as without it."""
+    g = torch.Generator(device=device)
+    g.manual_seed((generator.initial_seed() if generator is not None else 0) + 7919)
+    return g
+
+
 def patchify(x: Tensor, k: int) -> Tensor:
     """``[B, C, T]`` (T a multiple of ``k``) -> ``[B, T / k, C * k]`` (frame-major inside a patch)."""
     B, C, T = x.shape
@@ -277,6 +302,9 @@ class ARDriftTTS(nn.Module):
                                      for _ in range(int(a.depth))])
         self.norm = RMSNorm(dim)
         self.head = DriftHead(dim, out, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
+        # model.ar.noise_level (#101): the backbone is told how much noise its history carries (training: the level
+        # of drift.input_noise; inference: none, or the level of `history_noise`)
+        self.level_in = LevelEmbedding(dim) if a.get("noise_level", False) else None
         self.prompt_enc = PromptEncoder(k * n_mels, t.spk_dim, int(a.get("prompt_dim", 256))) if self.prompted else None
         self.ref_enc = None
         if rc:
@@ -317,11 +345,15 @@ class ARDriftTTS(nn.Module):
         return torch.cat([p, *ahead], -1)
 
     def backbone(self, x_prev: Tensor, cpatch: Tensor, spk: Tensor, caches: list[dict] | None = None,
-                 tokens: Tensor | None = None) -> Tensor:
+                 tokens: Tensor | None = None, level: Tensor | None = None) -> Tensor:
         """Previous patches ``[B, S, k * n_mels]`` and condition inputs ``[B, S, *]`` -> states ``[B, S, dim]``.
         ``tokens`` ``[B, K, dim]``: positions in front of the sequence (the reference's, #96); with ``caches``,
-        given with the first step only."""
+        given with the first step only. ``level`` ``[B]``: the noise level of ``x_prev`` (``model.ar.noise_level``;
+        default none)."""
         h = self.x_in(x_prev) + self.c_in(cpatch) + self.spk(spk)[:, None]
+        if self.level_in is not None:
+            level = torch.zeros(h.shape[0], device=h.device) if level is None else level
+            h = h + self.level_in(level)[:, None].to(h.dtype)
         n = 0
         if tokens is not None:
             h, n = torch.cat([tokens.to(h.dtype), h], 1), tokens.shape[1]
@@ -395,7 +427,29 @@ class ARDriftTTS(nn.Module):
         cp = self.cond_patches(cond)
         if drop is not None:
             cp = cp * (~drop)[:, None, None].to(cp.dtype)
-        return self.backbone(x_prev, cp, spk, tokens=self._tokens(tokens, yp.shape[0]))
+        return self.backbone(x_prev, cp, spk, tokens=self._tokens(tokens, yp.shape[0]), level=input_noise)
+
+    @torch.no_grad()
+    def rollout(self, cond: Tensor, y: Tensor, spk: Tensor, start: int, steps: int, temperature: float = 1.0,
+                generator: torch.Generator | None = None, tokens: Tensor | None = None) -> Tensor:
+        """``steps`` patches generated free-running from step ``start`` on (#101): the recorded patches before
+        ``start`` are the history (one pass), then every patch is drawn after the model's own ones, as at inference.
+        ``cond`` ``[B, C, T]`` and ``y`` ``[B, n_mels, T]`` in whole patches -> ``[B, steps, k * n_mels]``."""
+        k = self.patch
+        cp, mu = self.cond_patches(cond), patchify(cond[:, : self.n_mels], k)
+        yp = self.squeeze(patchify(y, k))
+        B = yp.shape[0]
+        caches = [{} for _ in self.blocks]
+        x_prev = torch.cat([self.bos.expand(B, 1, -1), yp[:, :start]], 1)  # the inputs of steps 0 .. start
+        s = self.backbone(x_prev, cp[:, : start + 1], spk, caches, self._tokens(tokens, B))[:, -1]
+        out = []
+        for j in range(steps):
+            z = torch.randn(B, self.head.noise_dim, device=cond.device, generator=generator) * temperature
+            x = self.emit(mu[:, start + j], s, z)
+            out.append(x)
+            if j + 1 < steps:
+                s = self.backbone(self.squeeze(x)[:, None], cp[:, start + j + 1: start + j + 2], spk, caches)[:, 0]
+        return torch.stack(out, 1)
 
     @torch.no_grad()
     def gta(self, cond: Tensor, y: Tensor, spk: Tensor, temperature: float = 1.0,
@@ -415,7 +469,7 @@ class ARDriftTTS(nn.Module):
     @torch.no_grad()
     def generate(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
                  prefix: Tensor | None = None, cfg_scale: float = 1.0, prefix_cond: Tensor | None = None,
-                 tokens: Tensor | None = None) -> Tensor:
+                 tokens: Tensor | None = None, history_noise: float = 0.0) -> Tensor:
         """Aligned condition ``[B, C, T]`` -> normalised mel ``[B, n_mels, T]``, one step (patch) at a time with a KV
         cache. ``prefix``: known leading mel frames ``[B, n_mels, Tp]`` (``Tp`` a multiple of ``patch``), kept.
         ``prefix_cond`` ``[B, C, Tp]``: the prefix is then acoustic context that comes *before* ``cond`` (the end of
@@ -423,7 +477,9 @@ class ARDriftTTS(nn.Module):
         continues a longer utterance, no noise is drawn for it, and only the ``T`` frames of ``cond`` are returned.
         ``cfg_scale`` != 1: guidance on the backbone state, ``s_null + cfg_scale * (s - s_null)``, the null state
         from the same history without the text (a model trained with ``drift.cond_dropout``). ``tokens``
-        ``[B, K, dim]``: the reference's (:meth:`reference_tokens`), in front of the sequence."""
+        ``[B, K, dim]``: the reference's (:meth:`reference_tokens`), in front of the sequence. ``history_noise``
+        (#101): Gaussian noise of this level on what the backbone reads of the patches so far, as on the recorded
+        history in training (``drift.input_noise``: a level up to 0.3); the output patches stay clean."""
         cond, lead = join_prefix(cond, prefix, prefix_cond, self.patch)
         T = cond.shape[-1]
         cond = self.pad_frames(cond)
@@ -443,9 +499,14 @@ class ARDriftTTS(nn.Module):
         tokens = self._tokens(tokens, B)
         if tokens is not None and guided:
             tokens = torch.cat([tokens, tokens])
+        hg, level = history_generator(generator, cond.device) if history_noise else None, None
+        if history_noise and self.level_in is not None:
+            level = torch.full((spk_b.shape[0],), float(history_noise), device=cond.device)
         for t in range(S):
+            if history_noise and t:  # the beginning-of-sequence patch is not audio
+                prev = prev + history_noise * torch.randn(prev.shape, device=prev.device, generator=hg)
             s = self.backbone(torch.cat([prev, prev]) if guided else prev, cp[:, t: t + 1], spk_b, caches,
-                              tokens if t == 0 else None)[:, 0]
+                              tokens if t == 0 else None, level)[:, 0]
             if guided:
                 s = s[B:] + cfg_scale * (s[:B] - s[B:])
             if t < n_pre:
@@ -459,14 +520,17 @@ class ARDriftTTS(nn.Module):
         return mel[..., lead:T]
 
     def step_static(self, prev: Tensor, cpatch: Tensor, spk: Tensor, pos: Tensor, caches: list[tuple[Tensor, Tensor]],
-                    mu: Tensor, z: Tensor, cfg: Tensor | None = None) -> Tensor:
+                    mu: Tensor, z: Tensor, cfg: Tensor | None = None, level: Tensor | None = None) -> Tensor:
         """One generation step with fixed shapes (:class:`ARGenerator`): the previous patch ``[B, k * n_mels]``, this
         step's condition input ``[B, *]``, the position ``pos`` ``[1]``, per-layer caches, the prior-mean patch ``mu``
         and the (scaled) noise ``z`` -> the next patch ``[B, k * n_mels]``. ``cfg`` ``[1]``: guidance; ``cpatch``,
         ``spk`` and the caches then have ``2 B`` rows (the conditional ones, then the null ones)."""
         if cfg is not None:
             prev = torch.cat([prev, prev])
-        h = (self.x_in(self.squeeze(prev)) + self.c_in(cpatch) + self.spk(spk))[:, None]
+        h = self.x_in(self.squeeze(prev)) + self.c_in(cpatch) + self.spk(spk)
+        if self.level_in is not None:  # ``level`` [rows]: the noise level of ``prev`` (zeros: none)
+            h = h + self.level_in(level).to(h.dtype)
+        h = h[:, None]
         smax = caches[0][0].shape[2]
         mask = (torch.arange(smax, device=prev.device) <= pos)[None, None, None]
         for blk, (kc, vc) in zip(self.blocks, caches):
@@ -551,13 +615,14 @@ class ARGenerator:
               "pos": torch.zeros(1, dtype=torch.long, device=dev),
               "mu": torch.zeros(B, m.patch * m.n_mels, device=dev, dtype=dt),
               "z": torch.zeros(B, m.head.noise_dim, device=dev, dtype=dt),
+              "level": torch.zeros(R, device=dev, dtype=dt),
               "caches": [(torch.zeros(R, heads, self.max_steps, dim // heads, device=dev, dtype=dt),
                           torch.zeros(R, heads, self.max_steps, dim // heads, device=dev, dtype=dt))
                          for _ in m.blocks]}
 
         def run():
             return m.step_static(st["prev"], st["cp"], st["spk"], st["pos"], st["caches"], st["mu"], st["z"],
-                                 st["cfg"])
+                                 st["cfg"], st["level"])
 
         if self.graphs:
             s = torch.cuda.Stream()
@@ -588,19 +653,22 @@ class ARGenerator:
     @torch.no_grad()
     def __call__(self, cond: Tensor, spk: Tensor, temperature: float = 1.0,
                  generator: torch.Generator | None = None, cfg_scale: float = 1.0, prefix: Tensor | None = None,
-                 prefix_cond: Tensor | None = None, tokens: Tensor | None = None) -> Tensor:
+                 prefix_cond: Tensor | None = None, tokens: Tensor | None = None,
+                 history_noise: float = 0.0) -> Tensor:
         """As :meth:`ARDriftTTS.generate`: aligned condition ``[B, C, T]`` -> mel ``[B, n_mels, T]``."""
         m = self.model
         T = cond.shape[-1]
         if not self.fits(T, 0 if prefix_cond is None else prefix_cond.shape[-1]):
-            return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond, tokens)
-        out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond, tokens))
+            return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond, tokens,
+                              history_noise)
+        out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond, tokens,
+                              history_noise))
         return unpatchify(torch.stack(out, 1), m.patch, m.n_mels)[..., :T]
 
     @torch.no_grad()
     def steps(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
               cfg_scale: float = 1.0, prefix: Tensor | None = None, prefix_cond: Tensor | None = None,
-              tokens: Tensor | None = None):
+              tokens: Tensor | None = None, history_noise: float = 0.0):
         """Yield the patches ``[B, k * n_mels]`` of ``cond`` one step at a time (streaming); at most ``max_steps``
         with the prefix. ``prefix`` / ``prefix_cond``: as :meth:`ARDriftTTS.generate` (kept leading frames are
         yielded as they are; the steps of a context before ``cond`` run, to fill the caches, but are not yielded).
@@ -633,10 +701,15 @@ class ARGenerator:
             st["cfg"].fill_(cfg_scale)
         else:
             st["spk"].copy_(spk)
+        hg = history_generator(generator, cond.device) if history_noise else None
+        st["level"].fill_(float(history_noise))
         for t in range(S):
             st["cp"].copy_(cp[:, t])
             st["mu"].copy_(mu[:, t])
             st["pos"].fill_(K + t)
+            if history_noise and t:  # noise on what the backbone reads of the patch before (as generate)
+                noise = torch.randn(B, 1, m.x_in.in_features, device=cond.device, generator=hg)[:, 0]
+                st["prev"].add_(m.spread(history_noise * noise))
             if t >= n_pre:  # a known patch draws no noise (its step only fills the caches)
                 st["z"].copy_(torch.randn(B, m.head.noise_dim, device=cond.device, generator=generator) * temperature)
             if self.graphs:

@@ -20,6 +20,11 @@ One step:
 latent frame per step, copied over the patch. ``drift.target_noise`` trains on samples of the codec's posterior
 instead of its mean (:func:`sample_targets`).
 
+``drift.rollout`` (#101): with probability ``prob`` a batch has ``steps`` (4 to 16) patches of its history drawn
+free-running by the model (:meth:`~drifting_tts.models.ar.ARDriftTTS.rollout`), where ``drift.self_history`` has
+patches drawn one step after the recording. The targets stay the recording's. ``model.ar.noise_level`` tells the
+backbone the level of ``drift.input_noise``.
+
 ``drift.loss: energy`` replaces the drifting field by the energy score (:func:`~drifting_tts.drift.energy_score`, a
 proper scoring rule without a temperature; docs/HEAD_REALISM.md). ``drift.window`` adds kernel maps over a window
 (#97): the recorded patches before a step and the step's patch through a frozen 2-D Mel-MAE
@@ -58,7 +63,7 @@ from .data import MelDataset, collate
 from .drift import feature_drift_loss, feature_energy_loss
 from .latents import VAE_BACKENDS
 from .loop_eval import AudioEval, build_emas, heldout_metrics, load_emas, other_emas, record
-from .models.ar import ARDriftTTS, ar_features, history_patches, patchify, window_features
+from .models.ar import ARDriftTTS, ar_features, history_patches, patchify, unpatchify, window_features
 from .models.text_encoder import align, duration_loss, expand, prior_loss
 from .text import BLANK_ID, PAD_ID, frontend
 from .train import build_loader, dataset_stats, grow_speakers
@@ -242,6 +247,19 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         swap = (torch.rand(B, device=device) < share)[:, None, None]
         swap = swap & (torch.arange(y.shape[-1], device=device)[None, None] >= lead[:, None, None])  # not a prompt
         hist = torch.where(swap, own, y)
+    rolled = 0
+    rc = dc.get("rollout")
+    if rc and float(torch.rand(())) < float(rc.get("prob", 0.5)):  # several free-running patches as history (#101)
+        lo, hi = (int(v) for v in rc.get("steps", [4, 16]))
+        first, last = int(lead.max()) // k + 1, int((lead + y_len).min()) // k  # steps every utterance has
+        n = min(int(torch.randint(lo, hi + 1, ())), last - first)
+        if n >= 1:
+            t0 = int(torch.randint(first, last - n + 1, ()))
+            with amp:
+                roll = model.rollout(cond, y, spk_in, t0, n, float(rc.get("temperature", 0.5)), tokens=tokens)
+            hist = hist.clone()
+            hist[..., t0 * k: (t0 + n) * k] = unpatchify(roll.float(), k, C)
+            rolled = n
     with amp:
         s = model.teacher_forced(cond, hist, spk_in, noise, drop, tokens)  # [B, S, dim]
     S = s.shape[1]
@@ -296,6 +314,8 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                 metrics[name] = torch.stack(vals).mean()
         if "window" in info:
             metrics["window"] = info["window"]
+        if rc:
+            metrics["rollout"] = float(rolled)
         if prompting or referencing:
             metrics["prompted"] = (lead > 0).float().mean()
             metrics["id_dropped"] = dropped.float().mean()

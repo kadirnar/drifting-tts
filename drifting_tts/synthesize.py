@@ -439,11 +439,13 @@ class Synthesizer:
         m = self.model
         pc, pm = (None, None) if history is None else history.prefix(cond.shape[-1])
         tokens = getattr(getattr(history, "reference", None), "tokens", None)  # a reference's (#96)
+        hn = float(getattr(self, "history_noise", 0.0))  # noise on the model's own history (#101; default none)
         if m.fast_generator is not None:
-            mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens)
+            mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens,
+                                   history_noise=hn)
         else:
             mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
-                             tokens=tokens)
+                             tokens=tokens, history_noise=hn)
         if history is not None:
             history.update(cond, mel)
         return mel
