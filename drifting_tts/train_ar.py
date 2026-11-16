@@ -23,6 +23,12 @@ sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`driftin
 is cut at a word boundary, the frames before the cut are history without a text condition, the words after it are
 the text, and the loss is taken after the cut (:func:`cut_prompts`). For a share of them the speaker row is the
 "prompted" one, so the voice has to come from the prompt.
+
+``model.ar.reference`` with ``drift.reference`` trains voices from a reference (#96): a crop of *another* utterance
+of the speaker (the loader's ``ref``), read by the reference encoder, whose tokens stand in front of the backbone's
+sequence. ``drift.reference.prob`` of the utterances that have one use it, the others get the null tokens (no
+reference: the speaker row alone, a prompt alone, or no voice at all, the null branch of voice guidance); the
+speaker row is dropped as for a prompt (``drift.reference.id_dropout``). Both paths train together.
 """
 
 from __future__ import annotations
@@ -130,19 +136,38 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     B = y.shape[0]
     unknown = spk < 0  # voices without a speaker row (a corpus streamed with `speakers: prompt`, #104)
     if unknown.any():
-        if not model.prompted:
-            raise ValueError("utterances without a speaker row need a model trained with prompts (model.ar.prompt)")
+        if not model.prompted and model.ref_enc is None:
+            raise ValueError("utterances without a speaker row need a model trained with prompts or references "
+                             "(model.ar.prompt, model.ar.reference)")
         spk = torch.where(unknown, torch.full_like(spk, model.prompt_row), spk)  # without a prompt: the null voice
     lead, spk_emb, spk_in = torch.zeros_like(y_len), None, spk  # prompt frames, the encoder's and the backbone's voice
     prompting = model.prompted and dc.get("prompt")
+    referencing = model.ref_enc is not None
+    dropped = torch.zeros(B, dtype=torch.bool, device=device)  # the speaker row is the prompted one
+    has_ref, tokens, ref_vec = dropped, None, None
+    if referencing and batch.get("ref") is not None:  # voices from a reference (#96): another utterance's crop
+        rc = dc.get("reference") or {}
+        ref, ref_len = batch["ref"].to(device, non_blocking=True), batch["ref_len"].to(device, non_blocking=True)
+        has_ref = (ref_len > 0) & (torch.rand(B, device=device) < float(rc.get("prob", 0.8)))
+        with amp:
+            tokens, ref_vec = model.reference_tokens(ref, ref_len, has_ref)
     if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
         cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
                           frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown)
         text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
-        with amp:
-            vec = model.prompt_vector(cut["prompt"], lead)
-        spk_emb = torch.where(cut["dropped"][:, None], vec.float(), model.encoder.spk(spk))
-        spk_in = torch.where(cut["dropped"], torch.full_like(spk, model.prompt_row), spk)
+        dropped = cut["dropped"]
+    if has_ref.any():  # a reference alone: its own draw of the speaker-ID dropout
+        p_id = float((dc.get("reference") or {}).get("id_dropout", 0.5))
+        dropped = dropped | (has_ref & (lead == 0) & ((torch.rand(B, device=device) < p_id) | unknown))
+    if prompting or referencing:
+        spk_emb = model.encoder.spk(spk)
+        if prompting:
+            with amp:
+                vec = model.prompt_vector(cut["prompt"], lead)
+            spk_emb = torch.where((dropped & (lead > 0))[:, None], vec.float(), spk_emb)
+        if ref_vec is not None:  # with both, the text encoder's voice is the reference's
+            spk_emb = torch.where((dropped & has_ref)[:, None], ref_vec.float(), spk_emb)
+        spk_in = torch.where(dropped, torch.full_like(spk, model.prompt_row), spk)
     y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
     with amp:
         h, mu, logw, x_mask = model.encoder(text, text_len, spk, spk_emb)
@@ -162,12 +187,12 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     hist, share = y, float(dc.get("self_history", 0.0))
     if share > 0:  # the model's own one-step patches as the history of a share of the utterances
         with amp:
-            own = model.gta(cond, y, spk_in, float(dc.get("self_history_temperature", 0.5))).float()
+            own = model.gta(cond, y, spk_in, float(dc.get("self_history_temperature", 0.5)), tokens=tokens).float()
         swap = (torch.rand(B, device=device) < share)[:, None, None]
         swap = swap & (torch.arange(y.shape[-1], device=device)[None, None] >= lead[:, None, None])  # not a prompt
         hist = torch.where(swap, own, y)
     with amp:
-        s = model.teacher_forced(cond, hist, spk_in, noise, drop)  # [B, S, dim]
+        s = model.teacher_forced(cond, hist, spk_in, noise, drop, tokens)  # [B, S, dim]
     S = s.shape[1]
     pos = torch.arange(S, device=device)[None] * k
     valid = (pos >= lead[:, None]) & (pos < (lead + y_len)[:, None])  # steps that start inside the utterance
@@ -199,10 +224,13 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                    "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean(),
                    "rows": float(R), "tau": tau.detach().reshape(()),
                    "p_data": torch.stack([v for kk, v in info.items() if kk.startswith("p_data/")]).mean()}
-        if prompting:
+        if prompting or referencing:
             metrics["prompted"] = (lead > 0).float().mean()
-            metrics["id_dropped"] = cut["dropped"].float().mean()
+            metrics["id_dropped"] = dropped.float().mean()
             metrics["no_row"] = unknown.float().mean()
+        if referencing:
+            metrics["referenced"] = has_ref.float().mean()
+            metrics["no_voice"] = (unknown & ~has_ref & (lead == 0)).float().mean()
         if detail:
             metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
     return loss, metrics

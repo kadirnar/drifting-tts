@@ -102,6 +102,22 @@ class MelStats:
         return {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
 
 
+def reference_frames(rc) -> tuple[int, int] | None:
+    """``drift.reference`` -> the shortest and the longest reference in frames (``min_seconds``, ``max_seconds``:
+    3 to 10 s), or ``None`` without it."""
+    if not rc:
+        return None
+    return int(float(rc.get("min_seconds", 3.0)) * FRAME_RATE), int(float(rc.get("max_seconds", 10.0)) * FRAME_RATE)
+
+
+def crop_reference(mel: torch.Tensor, lo: int, hi: int, rng=random) -> torch.Tensor:
+    """A reference (#96): a random crop of ``lo`` to ``hi`` frames of the normalised mel ``[n_mels, T]`` of another
+    utterance (``T >= lo``; all of it when it is shorter than the drawn length)."""
+    n = min(rng.randint(lo, hi), mel.shape[1])
+    start = rng.randint(0, mel.shape[1] - n)
+    return mel[:, start: start + n]
+
+
 class MelDataset(Dataset):
     """Items: interspersed symbol ids, normalised log-mel ``[n_mels, T]`` and the speaker id.
 
@@ -120,6 +136,7 @@ class MelDataset(Dataset):
         with_f0: bool = False,
         with_audio: bool = False,
         filters: dict | None = None,
+        reference: tuple[int, int] | None = None,
     ):
         root = Path(root)
         self.stats = MelStats.load(root)
@@ -163,6 +180,13 @@ class MelDataset(Dataset):
             print(f"data.filters ({split}): {failed}/{total} utterances fail; "
                   + (f"kept {len(self.items)} ({hours:.1f} h)" if drop else "not filtered (apply_to_val: false)"))
         self.num_speakers = len(json.loads((root / "speakers.json").read_text()))
+        # reference (#96): every item also holds "ref", a crop of another utterance of its speaker (None: the
+        # speaker has no other utterance that is long enough)
+        self.reference, self.by_speaker = reference, {}
+        if reference:
+            for n, e in enumerate(self.items):
+                if e["frames"] >= reference[0]:
+                    self.by_speaker.setdefault(e["spk_id"], []).append(n)
         self._mels_path = root / "mels.bin"
         self._mels: np.ndarray | None = None  # opened lazily (once per dataloader worker)
 
@@ -190,16 +214,23 @@ class MelDataset(Dataset):
     def frames(self, i: int) -> int:
         return self.items[i]["frames"]
 
-    def __getitem__(self, i: int) -> dict:
+    def _mel(self, i: int) -> torch.Tensor:
         e = self.items[i]
         mel = torch.from_numpy(np.array(self.mels[e["offset"]: e["offset"] + e["frames"]], dtype=np.float32))
+        return self.stats.normalize(mel.T.contiguous())
+
+    def __getitem__(self, i: int) -> dict:
+        e = self.items[i]
         item = {
             "text": torch.tensor(frontend(self.language).text_to_ids(e["norm_text"], normalized=True),
                                  dtype=torch.long),
-            "mel": self.stats.normalize(mel.T.contiguous()),
+            "mel": self._mel(i),
             "spk": e["spk_id"],
             "index": i,
         }
+        if self.reference:
+            others = [j for j in self.by_speaker.get(e["spk_id"], ()) if j != i]
+            item["ref"] = crop_reference(self._mel(random.choice(others)), *self.reference) if others else None
         if self.with_audio:
             a = self.audio[e["audio_offset"]: e["audio_offset"] + e["audio_samples"]]
             item["audio"] = torch.from_numpy(np.array(a, dtype=np.float32))
@@ -220,6 +251,14 @@ def collate(batch: list[dict]) -> dict:
         mel[i, :, : mel_len[i]] = b["mel"]
     out = {"text": text, "text_len": text_len, "mel": mel, "mel_len": mel_len,
            "spk": torch.tensor([b["spk"] for b in batch]), "index": torch.tensor([b["index"] for b in batch])}
+    if any("ref" in b for b in batch):  # references (#96): [B, n_mels, R], 0 frames where there is none
+        refs = [b.get("ref") for b in batch]
+        ref_len = torch.tensor([0 if r is None else r.shape[1] for r in refs])
+        ref = torch.zeros(B, mel.shape[1], max(int(ref_len.max()), 1))
+        for i, r in enumerate(refs):
+            if r is not None:
+                ref[i, :, : ref_len[i]] = r
+        out["ref"], out["ref_len"] = ref, ref_len
     if "audio" in batch[0]:
         n = max(b["audio"].numel() for b in batch)
         audio = torch.zeros(B, n)

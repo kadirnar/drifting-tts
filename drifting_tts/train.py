@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 
 from .alignment import sequence_mask
 from .config import Config, load_config, save_config
-from .data import BucketBatchSampler, MelDataset, collate
+from .data import BucketBatchSampler, MelDataset, collate, reference_frames
 from .drift import feature_drift_loss
 from .latents import VAE_BACKENDS
 from .loop_eval import AudioEval, build_emas, load_emas, other_emas, record
@@ -141,7 +141,7 @@ def build_loader(cfg: Config, split: str = "train") -> tuple[MelDataset, DataLoa
     d, t = cfg.data, cfg.train
     ds = MelDataset(d.root, split, min_quality=d.min_quality, min_frames=cfg.drift.crop_frames,
                     max_frames=d.max_frames, with_f0=pitch_enabled(cfg), with_audio=needs_audio(cfg),
-                    filters=d.get("filters"))
+                    filters=d.get("filters"), reference=reference_frames(cfg.drift.get("reference")))
     sampler = BucketBatchSampler([ds.frames(i) for i in range(len(ds))], max_frames=t.batch_frames,
                                  max_batch=t.batch_size, seed=t.seed)
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate, num_workers=t.num_workers,

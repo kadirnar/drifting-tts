@@ -22,6 +22,11 @@ corpus (``data.root``), so a streamed model is used like any other. Config::
             share: 0.25
             speakers: prompt     # its speakers have no row of the table: their voices come from prompts
                                  # (model.ar.prompt, #95); without it, rows of unknown speakers are skipped
+
+With ``drift.reference`` (a model with a reference encoder, #96) every utterance also gets ``ref``: a crop of another
+utterance of its speaker. A shard of the 10,000 h corpus holds one or two utterances per speaker, so each worker
+keeps one utterance of every speaker it has read (up to 10 s, half precision: about 190 kB a speaker) and pairs
+across shards; the first shards of a run have few pairs.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import json
 import os
 import random
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -38,7 +44,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 
 from .audio import make_logmel, prepare_waveform
-from .data import MelDataset, MelStats, collate
+from .data import MelDataset, MelStats, collate, crop_reference, reference_frames
 from .text import frontend
 
 
@@ -55,7 +61,8 @@ class ParquetStream(IterableDataset):
 
     def __init__(self, files: list[str], root: str | Path, speaker_column: str = "speaker", text_column: str = "text",
                  min_frames: int = 64, max_frames: int = 1500, batch_frames: int = 24000, max_batch: int = 24,
-                 seed: int = 0, cache: str | Path | None = None, trim: bool = True, extra: list[dict] | None = None):
+                 seed: int = 0, cache: str | Path | None = None, trim: bool = True, extra: list[dict] | None = None,
+                 reference: tuple[int, int] | None = None, max_voices: int = 20000):
         root = Path(root)
         st = json.loads((root / "stats.json").read_text())
         self.backend, self.language = st.get("backend", "vocos"), st.get("language", "tr")
@@ -76,6 +83,7 @@ class ParquetStream(IterableDataset):
         self.min_frames, self.max_frames, self.batch_frames, self.max_batch = min_frames, max_frames, batch_frames, \
             max_batch
         self.seed, self.trim, self.epoch = seed, trim, 0
+        self.reference, self.max_voices = reference, max_voices  # (shortest, longest) reference in frames, or None
         self.cache = Path(cache) if cache else root / "stream_cache"
 
     def _cycle(self, files: list[str], worker: int, workers: int, salt: int):
@@ -137,11 +145,37 @@ class ParquetStream(IterableDataset):
                         or len(ids) > mel.shape[1]:
                     continue
                 items.append({"text": torch.tensor(ids, dtype=torch.long), "mel": self.stats.normalize(mel),
-                              "spk": spk, "index": -1})
+                              "spk": spk, "index": -1, "voice": (source, row[speaker_column])})
         if unknown:  # they used to vanish without a word (#104)
             print(f"[stream] {Path(path).name}: {unknown} rows of speakers that are not in the speaker table were "
                   f"skipped (`speakers: prompt` trains them through prompts)", flush=True)
         return items
+
+    def _pair(self, items: list[dict], kept: OrderedDict, rng: random.Random) -> None:
+        """References (#96): every utterance gets ``ref``, a crop of another utterance of its speaker: one of this
+        shard, or the one ``kept`` from an earlier shard (``None`` when there is neither). Then one utterance per
+        speaker of this shard is kept for the shards to come."""
+        lo, hi = self.reference
+        groups: dict = {}
+        for n, it in enumerate(items):
+            if it["mel"].shape[1] >= lo:
+                groups.setdefault(it["voice"], []).append(n)
+        for n, it in enumerate(items):
+            here = [m for m in groups.get(it["voice"], ()) if m != n]
+            old = kept.get(it["voice"])
+            if not here and old is None:
+                it["ref"] = None
+                continue
+            pick = rng.randrange(len(here) + (old is not None))
+            src = items[here[pick]]["mel"] if pick < len(here) else old.float()
+            it["ref"] = crop_reference(src, lo, hi, rng)
+        for voice, members in groups.items():
+            mel = items[rng.choice(members)]["mel"]
+            start = rng.randint(0, max(mel.shape[1] - hi, 0))
+            kept[voice] = mel[:, start: start + hi].half().clone()
+            kept.move_to_end(voice)
+        while len(kept) > self.max_voices:
+            kept.popitem(last=False)
 
     def _batches(self, items: list[dict], rng: random.Random) -> list[list[dict]]:
         """A shard's utterances in batches of similar length within the frame budget (as BucketBatchSampler)."""
@@ -162,6 +196,7 @@ class ParquetStream(IterableDataset):
         mel_fn, text = make_logmel(self.backend), frontend(self.language)
         rng = random.Random(self.seed + 7919 * worker + self.epoch)
         shards = self._shards(worker, workers)
+        kept: OrderedDict = OrderedDict()  # one utterance per speaker read so far, for references
         with ThreadPoolExecutor(1) as pool:
             f, source = next(shards)
             ahead = pool.submit(self._fetch, f, worker)
@@ -174,6 +209,8 @@ class ParquetStream(IterableDataset):
                 items = self._items(path, mel_fn, text, current)
                 if temporary:
                     os.remove(path)
+                if self.reference:
+                    self._pair(items, kept, rng)
                 for batch in self._batches(items, rng):
                     yield collate(batch)
 
@@ -196,7 +233,8 @@ def stream_loader(cfg) -> tuple[MelDataset, DataLoader]:
     stream = ParquetStream(files, d.root, speaker_column=s.get("speaker_column", "speaker"),
                            text_column=s.get("text_column", "text"), min_frames=cfg.drift.crop_frames,
                            max_frames=d.max_frames, batch_frames=t.batch_frames, max_batch=t.batch_size, seed=t.seed,
-                           cache=s.get("cache"), extra=extra)
+                           cache=s.get("cache"), extra=extra,
+                           reference=reference_frames(cfg.drift.get("reference")))
     workers = int(s.get("workers", 8))
     loader = DataLoader(stream, batch_size=None, num_workers=workers, pin_memory=True, persistent_workers=workers > 0,
                         prefetch_factor=4 if workers > 0 else None)

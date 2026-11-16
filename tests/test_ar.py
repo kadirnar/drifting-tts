@@ -248,7 +248,7 @@ def test_training_step_with_band_energies_and_own_history():
     # self_history: the backbone sees the head's own one-step patches as the history, not the recording
     seen = []
     orig = m.teacher_forced
-    m.teacher_forced = lambda cond, y, *a: seen.append(y) or orig(cond, y, *a)
+    m.teacher_forced = lambda cond, y, *a, **kw: seen.append(y) or orig(cond, y, *a, **kw)
     training_step(m, batch, cfg, "cpu", tau, mel_std=2.4)
     hist = seen[-1]
     assert hist.shape[-1] == 40 and not torch.allclose(hist, batch["mel"][:, :, :40])

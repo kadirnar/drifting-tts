@@ -158,6 +158,80 @@ class PromptEncoder(nn.Module):
         return self.out(h.sum(1) / mask.sum(1, keepdim=True).clamp_min(1))
 
 
+class RefAttention(nn.Module):
+    """Attention of the reference encoder: over the reference's own patches (rotary positions), or from the queries
+    to them (``context``); ``mask`` ``[B, L]`` marks the patches that are not padding."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.heads = heads
+        self.q, self.kv, self.proj = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
+        self.q_norm, self.k_norm = RMSNorm(dim // heads), RMSNorm(dim // heads)
+
+    def forward(self, x: Tensor, mask: Tensor, context: Tensor | None = None) -> Tensor:
+        B, L, D = x.shape
+        src = x if context is None else context
+        q = self.q_norm(self.q(x).view(B, L, self.heads, -1).transpose(1, 2))
+        k, v = self.kv(src).view(B, src.shape[1], 2, self.heads, -1).permute(2, 0, 3, 1, 4)
+        k = self.k_norm(k)
+        if context is None:
+            q, k = rope(q, 0), rope(k, 0)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None, None].bool())
+        return self.proj(y.transpose(1, 2).reshape(B, L, D))
+
+
+class RefBlock(nn.Module):
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        self.norm1, self.norm2, self.norm_c = RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)
+        self.attn = RefAttention(dim, heads)
+        self.mlp = SwiGLU(dim, (int(2 / 3 * dim * 4) + 31) // 32 * 32)
+
+    def forward(self, x: Tensor, mask: Tensor, context: Tensor | None = None) -> Tensor:
+        x = x + self.attn(self.norm1(x), mask, None if context is None else self.norm_c(context))
+        return x + self.mlp(self.norm2(x))
+
+
+class ReferenceEncoder(nn.Module):
+    """The voice of a reference recording: another utterance of the speaker, no transcript (#96). ``layers``
+    transformer layers over the reference's mel patches, then ``tokens`` learned queries that attend to them (a
+    Perceiver resampler, the conditioning encoder of XTTS): the same number of tokens for 3 s as for 10 s. The
+    tokens go in front of the backbone's sequence with a segment embedding; their mean, projected, stands in for the
+    speaker row of the text encoder and the duration predictor. A voice without a reference has the ``null``
+    tokens there (also the null branch of voice guidance)."""
+
+    def __init__(self, patch_dim: int, dim: int, spk_dim: int, width: int = 512, layers: int = 4, heads: int = 8,
+                 tokens: int = 32, query_layers: int = 2):
+        super().__init__()
+        self.inp = nn.Linear(patch_dim, width)
+        self.blocks = nn.ModuleList([RefBlock(width, heads) for _ in range(layers)])
+        self.queries = nn.Parameter(torch.randn(tokens, width) * 0.02)
+        self.readout = nn.ModuleList([RefBlock(width, heads) for _ in range(query_layers)])
+        self.norm = RMSNorm(width)
+        self.out, self.vec = nn.Linear(width, dim), nn.Linear(width, spk_dim)
+        self.segment = nn.Parameter(torch.zeros(dim))
+        self.null = nn.Parameter(torch.zeros(tokens, dim))
+
+    @property
+    def tokens(self) -> int:
+        return self.queries.shape[0]
+
+    def null_tokens(self, batch: int) -> Tensor:
+        return (self.null + self.segment).expand(batch, -1, -1)
+
+    def forward(self, patches: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        """Patches ``[B, S, patch_dim]`` and their mask ``[B, S]`` (every row has a patch) -> the tokens
+        ``[B, tokens, dim]`` and the speaker vectors ``[B, spk_dim]``."""
+        x = self.inp(patches)
+        for blk in self.blocks:
+            x = blk(x, mask)
+        q = self.queries.expand(x.shape[0], -1, -1)
+        for blk in self.readout:
+            q = blk(q, mask, x)
+        q = self.norm(q)
+        return self.out(q) + self.segment, self.vec(q.mean(1))
+
+
 def patchify(x: Tensor, k: int) -> Tensor:
     """``[B, C, T]`` (T a multiple of ``k``) -> ``[B, T / k, C * k]`` (frame-major inside a patch)."""
     B, C, T = x.shape
@@ -179,8 +253,11 @@ class ARDriftTTS(nn.Module):
         vocab = len(frontend(t.get("language")).SYMBOLS)  # model.text.language: the frontend (default Turkish)
         # model.ar.prompt (#95): a voice can also come from a recording. One more speaker row, the last, stands for
         # "the voice is in the prompt"; the text encoder then gets a vector pooled from the prompt (prompt_vector)
+        # model.ar.reference (#96): a voice can also come from another recording of the speaker, read by a reference
+        # encoder whose tokens stand in front of the backbone's sequence. The same extra row stands for both
         self.prompted = bool(a.get("prompt", False))
-        num_speakers += int(self.prompted)
+        rc = a.get("reference")
+        num_speakers += int(self.prompted or bool(rc))
         self.encoder = TextEncoder(vocab, n_mels=n_mels, d=t.d, heads=t.heads, layers=t.layers, ffn=t.ffn,
                                    dropout=t.dropout, num_speakers=num_speakers, spk_dim=t.spk_dim)
         self.n_mels, self.patch, self.lookahead = n_mels, int(a.patch), int(a.get("lookahead", 2))
@@ -196,6 +273,12 @@ class ARDriftTTS(nn.Module):
         self.norm = RMSNorm(dim)
         self.head = DriftHead(dim, k * n_mels, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
         self.prompt_enc = PromptEncoder(k * n_mels, t.spk_dim, int(a.get("prompt_dim", 256))) if self.prompted else None
+        self.ref_enc = None
+        if rc:
+            rc = {} if rc is True else dict(rc)
+            self.ref_enc = ReferenceEncoder(k * n_mels, dim, t.spk_dim, int(rc.get("dim", 512)),
+                                            int(rc.get("layers", 4)), int(rc.get("heads", 8)),
+                                            int(rc.get("tokens", 32)), int(rc.get("query_layers", 2)))
         self.duration_scale, self.duration_scales, self.temperature = 1.0, {}, None
         self.fast_generator: ARGenerator | None = None  # set by :meth:`enable_fast`
 
@@ -213,12 +296,18 @@ class ARDriftTTS(nn.Module):
         ahead = [F.pad(p[:, i:], (0, 0, 0, i)) for i in range(1, self.lookahead + 1)]
         return torch.cat([p, *ahead], -1)
 
-    def backbone(self, x_prev: Tensor, cpatch: Tensor, spk: Tensor, caches: list[dict] | None = None) -> Tensor:
-        """Previous patches ``[B, S, k * n_mels]`` and condition inputs ``[B, S, *]`` -> states ``[B, S, dim]``."""
+    def backbone(self, x_prev: Tensor, cpatch: Tensor, spk: Tensor, caches: list[dict] | None = None,
+                 tokens: Tensor | None = None) -> Tensor:
+        """Previous patches ``[B, S, k * n_mels]`` and condition inputs ``[B, S, *]`` -> states ``[B, S, dim]``.
+        ``tokens`` ``[B, K, dim]``: positions in front of the sequence (the reference's, #96); with ``caches``,
+        given with the first step only."""
         h = self.x_in(x_prev) + self.c_in(cpatch) + self.spk(spk)[:, None]
+        n = 0
+        if tokens is not None:
+            h, n = torch.cat([tokens.to(h.dtype), h], 1), tokens.shape[1]
         for i, blk in enumerate(self.blocks):
             h = blk(h, None if caches is None else caches[i])
-        return self.norm(h)
+        return self.norm(h[:, n:])
 
     def text(self, text: Tensor, text_len: Tensor, spk: Tensor, spk_emb: Tensor | None = None):
         return self.encoder(text, text_len, spk, spk_emb)
@@ -227,9 +316,33 @@ class ARDriftTTS(nn.Module):
     @property
     def prompt_row(self) -> int:
         """The speaker row of a voice given by a prompt (``model.ar.prompt``)."""
-        if not self.prompted:
-            raise ValueError("this model was not trained with voice prompts (model.ar.prompt)")
+        if not self.prompted and self.ref_enc is None:
+            raise ValueError("this model was not trained with voice prompts (model.ar.prompt, model.ar.reference)")
         return self.spk.num_embeddings - 1
+
+    def reference_tokens(self, ref: Tensor | None, ref_len: Tensor | None = None, use: Tensor | None = None,
+                         batch: int | None = None) -> tuple[Tensor, Tensor | None]:
+        """Normalised reference mels ``[B, n_mels, R]`` (``ref_len`` ``[B]``: their frames, default all; ``use``
+        ``[B]``: the rows that have one) -> the tokens in front of the backbone's sequence ``[B, K, dim]`` (the null
+        tokens where there is no reference) and the text encoder's speaker vectors ``[B, spk_dim]`` (``None``
+        without ``ref``; meaningless where there is no reference)."""
+        if ref is None or ref.shape[-1] < self.patch:  # a batch in which no utterance has a reference
+            return self.ref_enc.null_tokens(batch if ref is None else ref.shape[0]), None
+        p = patchify(ref[..., : ref.shape[-1] // self.patch * self.patch], self.patch)
+        if ref_len is None:
+            ref_len = torch.full((p.shape[0],), p.shape[1] * self.patch, device=p.device)
+        mask = torch.arange(p.shape[1], device=p.device)[None] * self.patch < ref_len[:, None]
+        use = mask[:, 0] if use is None else use & mask[:, 0]
+        mask = mask | ~use[:, None]  # a row without a reference attends to padding: its tokens are not used
+        tokens, vec = self.ref_enc(p, mask)
+        return torch.where(use[:, None, None], tokens, self.ref_enc.null_tokens(p.shape[0]).to(tokens.dtype)), vec
+
+    def _tokens(self, tokens: Tensor | None, batch: int) -> Tensor | None:
+        """The positions in front of the sequence: ``tokens``, or the null ones of a model with a reference encoder
+        (a voice from the speaker table, or from a prompt alone)."""
+        if tokens is None and self.ref_enc is not None:
+            return self.ref_enc.null_tokens(batch)
+        return tokens
 
     def prompt_vector(self, prompt: Tensor, prompt_len: Tensor | None = None) -> Tensor:
         """Normalised prompt mels ``[B, n_mels, P]`` (``P`` a multiple of ``patch``; ``prompt_len`` ``[B]``: their
@@ -250,10 +363,11 @@ class ARDriftTTS(nn.Module):
 
     # -------------------------------------------------------------------------------------------------- training
     def teacher_forced(self, cond: Tensor, y: Tensor, spk: Tensor, input_noise: Tensor | None = None,
-                       drop: Tensor | None = None) -> Tensor:
+                       drop: Tensor | None = None, tokens: Tensor | None = None) -> Tensor:
         """States ``[B, S, dim]`` for every step, the previous target patches as input (plus ``input_noise`` ``[B]``
         times unit noise: robustness to the model's own, imperfect patches at inference). ``drop`` ``[B]`` (bool):
-        utterances whose text condition the backbone does not see (the null condition of guidance)."""
+        utterances whose text condition the backbone does not see (the null condition of guidance). ``tokens``
+        ``[B, K, dim]``: the reference's (:meth:`reference_tokens`)."""
         yp = patchify(y, self.patch)
         x_prev = torch.cat([self.bos.expand(yp.shape[0], 1, -1), yp[:, :-1]], 1)
         if input_noise is not None:
@@ -261,17 +375,17 @@ class ARDriftTTS(nn.Module):
         cp = self.cond_patches(cond)
         if drop is not None:
             cp = cp * (~drop)[:, None, None].to(cp.dtype)
-        return self.backbone(x_prev, cp, spk)
+        return self.backbone(x_prev, cp, spk, tokens=self._tokens(tokens, yp.shape[0]))
 
     @torch.no_grad()
     def gta(self, cond: Tensor, y: Tensor, spk: Tensor, temperature: float = 1.0,
-            generator: torch.Generator | None = None) -> Tensor:
+            generator: torch.Generator | None = None, tokens: Tensor | None = None) -> Tensor:
         """Ground-truth-aligned ("GTA") generation: every patch drawn by the head (noise at ``temperature``) from the
         state after the *recorded* previous patches, in one teacher-forced pass. ``cond`` ``[B, C, T]`` aligned to
         ``y`` ``[B, n_mels, T]`` -> ``[B, n_mels, T]``, frame for frame with the recording (``finetune-vocoder``)."""
         T, k = y.shape[-1], self.patch
         cond, y = self.pad_frames(cond), self.pad_frames(y)
-        s = self.teacher_forced(cond, y, spk)  # [B, S, dim]
+        s = self.teacher_forced(cond, y, spk, tokens=tokens)  # [B, S, dim]
         mu = patchify(cond[:, : self.n_mels], k)
         z = torch.randn(*s.shape[:2], self.head.noise_dim, device=s.device, generator=generator) * temperature
         x = mu + self.head(s.flatten(0, 1), z.flatten(0, 1)).view_as(mu)
@@ -280,14 +394,16 @@ class ARDriftTTS(nn.Module):
     # ------------------------------------------------------------------------------------------------- inference
     @torch.no_grad()
     def generate(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
-                 prefix: Tensor | None = None, cfg_scale: float = 1.0, prefix_cond: Tensor | None = None) -> Tensor:
+                 prefix: Tensor | None = None, cfg_scale: float = 1.0, prefix_cond: Tensor | None = None,
+                 tokens: Tensor | None = None) -> Tensor:
         """Aligned condition ``[B, C, T]`` -> normalised mel ``[B, n_mels, T]``, one step (patch) at a time with a KV
         cache. ``prefix``: known leading mel frames ``[B, n_mels, Tp]`` (``Tp`` a multiple of ``patch``), kept.
         ``prefix_cond`` ``[B, C, Tp]``: the prefix is then acoustic context that comes *before* ``cond`` (the end of
         the previous utterance and the condition it was generated under): the model continues from it as it
         continues a longer utterance, no noise is drawn for it, and only the ``T`` frames of ``cond`` are returned.
         ``cfg_scale`` != 1: guidance on the backbone state, ``s_null + cfg_scale * (s - s_null)``, the null state
-        from the same history without the text (a model trained with ``drift.cond_dropout``)."""
+        from the same history without the text (a model trained with ``drift.cond_dropout``). ``tokens``
+        ``[B, K, dim]``: the reference's (:meth:`reference_tokens`), in front of the sequence."""
         cond, lead = join_prefix(cond, prefix, prefix_cond, self.patch)
         T = cond.shape[-1]
         cond = self.pad_frames(cond)
@@ -304,8 +420,12 @@ class ARDriftTTS(nn.Module):
         out = []
         n_pre = 0 if prefix is None else prefix.shape[-1] // k
         pre = None if prefix is None else patchify(prefix, k)
+        tokens = self._tokens(tokens, B)
+        if tokens is not None and guided:
+            tokens = torch.cat([tokens, tokens])
         for t in range(S):
-            s = self.backbone(torch.cat([prev, prev]) if guided else prev, cp[:, t: t + 1], spk_b, caches)[:, 0]
+            s = self.backbone(torch.cat([prev, prev]) if guided else prev, cp[:, t: t + 1], spk_b, caches,
+                              tokens if t == 0 else None)[:, 0]
             if guided:
                 s = s[B:] + cfg_scale * (s[:B] - s[B:])
             if t < n_pre:
@@ -358,27 +478,32 @@ class ARDriftTTS(nn.Module):
                    temperature: float = 1.0, length_scale: float = 1.0, noise_labels: Tensor | None = None,
                    generator: torch.Generator | None = None, attn_window: int | None = None,
                    pitch_shift: float = 0.0, steps: int | None = None, durations: Tensor | None = None,
-                   pitch: Tensor | None = None, context: int = 0, prompt: Tensor | None = None
-                   ) -> tuple[Tensor, Tensor]:
+                   pitch: Tensor | None = None, context: int = 0, prompt: Tensor | None = None,
+                   reference: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """As :meth:`DriftingTTS.synthesize` (the DiT's own arguments are accepted and ignored): normalised mels
         ``[B, n_mels, T]`` and their lengths. Durations from the duration predictor (``length_scale``) or given;
         ``cfg_scale``: guidance on the backbone state (:meth:`generate`). ``prompt`` (``model.ar.prompt``, #95):
         normalised mels ``[B, n_mels, P]`` of recordings whose voices the model continues in; ``spk`` is then
-        ignored, and no transcript of the prompt is needed."""
-        spk_emb = prefix = prefix_cond = None
+        ignored, and no transcript of the prompt is needed. ``reference`` (``model.ar.reference``, #96): normalised
+        mels ``[B, n_mels, R]`` of recordings of the voices, read by the reference encoder; with or without a
+        ``prompt``."""
+        spk_emb = prefix = prefix_cond = tokens = None
         if prompt is not None:
             prompt = prompt[..., : prompt.shape[-1] // self.patch * self.patch]
             spk, spk_emb = torch.full_like(spk, self.prompt_row), self.prompt_vector(prompt)
+        if reference is not None:
+            tokens, spk_emb = self.reference_tokens(reference)
+            spk = torch.full_like(spk, self.prompt_row)
         cond, y_len = self.aligned_condition(text, text_len, spk, length_scale, pitch_shift, durations, pitch, context,
                                              spk_emb)
         if prompt is not None:  # the prompt is history without a text condition
             prefix, prefix_cond = prompt, cond.new_zeros(cond.shape[0], cond.shape[1], prompt.shape[-1])
         if self.fast_generator is not None:
             mel = self.fast_generator(cond, spk, temperature, generator, cfg_scale, prefix=prefix,
-                                      prefix_cond=prefix_cond)
+                                      prefix_cond=prefix_cond, tokens=tokens)
         else:
             mel = self.generate(cond, spk, temperature, generator, prefix=prefix, cfg_scale=cfg_scale,
-                                prefix_cond=prefix_cond)
+                                prefix_cond=prefix_cond, tokens=tokens)
         return mel * sequence_mask(y_len, mel.shape[-1])[:, None], y_len
 
 
@@ -429,29 +554,37 @@ class ARGenerator:
         self._state[(B, guided)] = st
         return st
 
+    @property
+    def lead(self) -> int:
+        """Positions in front of every sequence: the reference encoder's tokens (#96)."""
+        return 0 if self.model.ref_enc is None else self.model.ref_enc.tokens
+
     @torch.no_grad()
     def fits(self, frames: int, prefix_frames: int = 0) -> bool:
         """Whether ``frames`` frames after ``prefix_frames`` of context fit the caches."""
-        return (prefix_frames + frames + (-frames) % self.model.patch) // self.model.patch <= self.max_steps
+        steps = (prefix_frames + frames + (-frames) % self.model.patch) // self.model.patch
+        return steps + self.lead <= self.max_steps
 
     @torch.no_grad()
     def __call__(self, cond: Tensor, spk: Tensor, temperature: float = 1.0,
                  generator: torch.Generator | None = None, cfg_scale: float = 1.0, prefix: Tensor | None = None,
-                 prefix_cond: Tensor | None = None) -> Tensor:
+                 prefix_cond: Tensor | None = None, tokens: Tensor | None = None) -> Tensor:
         """As :meth:`ARDriftTTS.generate`: aligned condition ``[B, C, T]`` -> mel ``[B, n_mels, T]``."""
         m = self.model
         T = cond.shape[-1]
         if not self.fits(T, 0 if prefix_cond is None else prefix_cond.shape[-1]):
-            return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond)
-        out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond))
+            return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond, tokens)
+        out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond, tokens))
         return unpatchify(torch.stack(out, 1), m.patch, m.n_mels)[..., :T]
 
     @torch.no_grad()
     def steps(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
-              cfg_scale: float = 1.0, prefix: Tensor | None = None, prefix_cond: Tensor | None = None):
+              cfg_scale: float = 1.0, prefix: Tensor | None = None, prefix_cond: Tensor | None = None,
+              tokens: Tensor | None = None):
         """Yield the patches ``[B, k * n_mels]`` of ``cond`` one step at a time (streaming); at most ``max_steps``
         with the prefix. ``prefix`` / ``prefix_cond``: as :meth:`ARDriftTTS.generate` (kept leading frames are
-        yielded as they are; the steps of a context before ``cond`` run, to fill the caches, but are not yielded)."""
+        yielded as they are; the steps of a context before ``cond`` run, to fill the caches, but are not yielded).
+        ``tokens``: the reference's; they take the first positions of the caches, written in one pass."""
         m = self.model
         cond, lead = join_prefix(cond, prefix, prefix_cond, m.patch)
         pre = None if prefix is None else patchify(prefix, m.patch)
@@ -459,11 +592,20 @@ class ARGenerator:
         cond = m.pad_frames(cond)
         cp = m.cond_patches(cond)
         B, S = cp.shape[:2]
-        if S > self.max_steps:
-            raise ValueError(f"{S} steps: longer than the caches ({self.max_steps})")
+        K = self.lead
+        if S + K > self.max_steps:
+            raise ValueError(f"{S + K} steps: longer than the caches ({self.max_steps})")
         mu = patchify(cond[:, : m.n_mels], m.patch)
         guided = cfg_scale != 1.0
         st = self._buffers(B, cp.shape[-1], guided)
+        if K:  # the reference's tokens: positions 0 .. K - 1 of every layer's cache
+            h = m._tokens(tokens, B).to(st["prev"].dtype)
+            h = torch.cat([h, h]) if guided else h
+            for blk, (kc, vc) in zip(m.blocks, st["caches"]):
+                cache: dict = {}
+                h = blk(h, cache)
+                kc[:, :, :K].copy_(cache["k"])
+                vc[:, :, :K].copy_(cache["v"])
         st["prev"].copy_(m.bos.expand(B, -1))
         if guided:
             cp = torch.cat([cp, torch.zeros_like(cp)])
@@ -474,7 +616,7 @@ class ARGenerator:
         for t in range(S):
             st["cp"].copy_(cp[:, t])
             st["mu"].copy_(mu[:, t])
-            st["pos"].fill_(t)
+            st["pos"].fill_(K + t)
             if t >= n_pre:  # a known patch draws no noise (its step only fills the caches)
                 st["z"].copy_(torch.randn(B, m.head.noise_dim, device=cond.device, generator=generator) * temperature)
             if self.graphs:
