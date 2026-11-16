@@ -15,7 +15,14 @@ net:
 loss:
   voiced: 0.0              # no voicing to learn
 
+eval_temperatures: [1.0, 0.5]
+
+train:
+  steps: 10000             # on 6 h of audio the held-out CRPS stops falling at 6,000 steps
+  batch_size: 4            # 4 x 4 utterances per step: the corpus's utterances are long (16 at once need > 7 GB)
+  accum: 4
+
 calibrate:
   speakers: all            # one factor for every speaker
   temperature: 0.5         # the operating point (docs/ENGLISH.md): the pauses sampled at 0.5, ...
-  durations: pauses        # ... the letters the model's own: sampled letters cost words (WER 2.4% -> 4.0%)
+  durations: pauses        # ... the letters the model's own: letters sampled at 1 cost words (WER 2.4% -> 4.9%)

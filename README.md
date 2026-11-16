@@ -50,7 +50,9 @@ streamed from the Hub while training, with an English character frontend: WER 1.
 intelligible as the recordings through the same vocoder (1.57%), UTMOSv2 2.93; 3.25 with BigVGAN-v2 fine-tuned
 on its mels. Its duration predictor, re-fitted to the mean duration, pauses at punctuation as long as the recordings
 do: 1.09 s per sentence against 1.19 s, where the log-duration regressor paused 0.45 s
-([docs/ENGLISH.md](docs/ENGLISH.md)). Released for non-commercial use (CC BY-NC-SA 4.0, as its training data's
+([docs/ENGLISH.md](docs/ENGLISH.md)). A duration sampler trained with drifting (not released yet) gives each seed
+other pauses, as many and as long as the recordings'
+([details](docs/ENGLISH.md#sampled-durations-and-pauses-100)). Released for non-commercial use (CC BY-NC-SA 4.0, as its training data's
 generator): [Vyvo/drifting-tts-en](https://huggingface.co/Vyvo/drifting-tts-en), demo
 [Vyvo/drifting-tts-en-demo](https://huggingface.co/spaces/Vyvo/drifting-tts-en-demo).
 
