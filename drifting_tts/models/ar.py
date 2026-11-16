@@ -142,6 +142,22 @@ def join_prefix(cond: Tensor, prefix: Tensor | None, prefix_cond: Tensor | None,
     return torch.cat([prefix_cond.to(cond.dtype), cond], -1), prefix_cond.shape[-1]
 
 
+class PromptEncoder(nn.Module):
+    """The speaker vector of a voice given by a prompt (#95): a projection of the prompt's mel patches, averaged
+    over the prompt. It stands in for the speaker row of the text encoder and the duration predictor; the backbone
+    reads the prompt itself, as its history."""
+
+    def __init__(self, patch_dim: int, spk_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(patch_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU())
+        self.out = nn.Linear(hidden, spk_dim)
+
+    def forward(self, patches: Tensor, mask: Tensor) -> Tensor:
+        """Patches ``[B, S, patch_dim]`` and their mask ``[B, S]`` -> ``[B, spk_dim]``."""
+        h = self.net(patches) * mask[..., None]
+        return self.out(h.sum(1) / mask.sum(1, keepdim=True).clamp_min(1))
+
+
 def patchify(x: Tensor, k: int) -> Tensor:
     """``[B, C, T]`` (T a multiple of ``k``) -> ``[B, T / k, C * k]`` (frame-major inside a patch)."""
     B, C, T = x.shape
@@ -161,6 +177,10 @@ class ARDriftTTS(nn.Module):
         super().__init__()
         t, a = cfg.text, cfg.ar
         vocab = len(frontend(t.get("language")).SYMBOLS)  # model.text.language: the frontend (default Turkish)
+        # model.ar.prompt (#95): a voice can also come from a recording. One more speaker row, the last, stands for
+        # "the voice is in the prompt"; the text encoder then gets a vector pooled from the prompt (prompt_vector)
+        self.prompted = bool(a.get("prompt", False))
+        num_speakers += int(self.prompted)
         self.encoder = TextEncoder(vocab, n_mels=n_mels, d=t.d, heads=t.heads, layers=t.layers, ffn=t.ffn,
                                    dropout=t.dropout, num_speakers=num_speakers, spk_dim=t.spk_dim)
         self.n_mels, self.patch, self.lookahead = n_mels, int(a.patch), int(a.get("lookahead", 2))
@@ -175,6 +195,7 @@ class ARDriftTTS(nn.Module):
                                      for _ in range(int(a.depth))])
         self.norm = RMSNorm(dim)
         self.head = DriftHead(dim, k * n_mels, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
+        self.prompt_enc = PromptEncoder(k * n_mels, t.spk_dim, int(a.get("prompt_dim", 256))) if self.prompted else None
         self.duration_scale, self.duration_scales, self.temperature = 1.0, {}, None
         self.fast_generator: ARGenerator | None = None  # set by :meth:`enable_fast`
 
@@ -199,8 +220,26 @@ class ARDriftTTS(nn.Module):
             h = blk(h, None if caches is None else caches[i])
         return self.norm(h)
 
-    def text(self, text: Tensor, text_len: Tensor, spk: Tensor):
-        return self.encoder(text, text_len, spk)
+    def text(self, text: Tensor, text_len: Tensor, spk: Tensor, spk_emb: Tensor | None = None):
+        return self.encoder(text, text_len, spk, spk_emb)
+
+    # ------------------------------------------------------------------------------------------- prompted voices
+    @property
+    def prompt_row(self) -> int:
+        """The speaker row of a voice given by a prompt (``model.ar.prompt``)."""
+        if not self.prompted:
+            raise ValueError("this model was not trained with voice prompts (model.ar.prompt)")
+        return self.spk.num_embeddings - 1
+
+    def prompt_vector(self, prompt: Tensor, prompt_len: Tensor | None = None) -> Tensor:
+        """Normalised prompt mels ``[B, n_mels, P]`` (``P`` a multiple of ``patch``; ``prompt_len`` ``[B]``: their
+        frames, default all) -> the text encoder's speaker vectors ``[B, spk_dim]``."""
+        p = patchify(prompt, self.patch)
+        if prompt_len is None:
+            mask = torch.ones(p.shape[:2], device=p.device)
+        else:
+            mask = torch.arange(p.shape[1], device=p.device)[None] * self.patch < prompt_len[:, None]
+        return self.prompt_enc(p, mask.to(p.dtype))
 
     @staticmethod
     def frame_condition(h: Tensor, mu: Tensor, attn: Tensor) -> Tensor:
@@ -301,10 +340,10 @@ class ARDriftTTS(nn.Module):
     @torch.no_grad()
     def aligned_condition(self, text: Tensor, text_len: Tensor, spk: Tensor, length_scale: float = 1.0,
                           pitch_shift: float = 0.0, durations: Tensor | None = None, pitch: Tensor | None = None,
-                          context: int = 0) -> tuple[Tensor, Tensor]:
+                          context: int = 0, spk_emb: Tensor | None = None) -> tuple[Tensor, Tensor]:
         if pitch is not None or pitch_shift:
             raise ValueError("ARDrift models generate their own intonation: no token pitch or pitch shift")
-        h, mu, logw, x_mask = self.text(text, text_len, spk)
+        h, mu, logw, x_mask = self.text(text, text_len, spk, spk_emb)
         if context:
             h, mu, logw, x_mask = (t[..., context:] for t in (h, mu, logw, x_mask))
             durations = None if durations is None else durations[:, context:]
@@ -319,15 +358,27 @@ class ARDriftTTS(nn.Module):
                    temperature: float = 1.0, length_scale: float = 1.0, noise_labels: Tensor | None = None,
                    generator: torch.Generator | None = None, attn_window: int | None = None,
                    pitch_shift: float = 0.0, steps: int | None = None, durations: Tensor | None = None,
-                   pitch: Tensor | None = None, context: int = 0) -> tuple[Tensor, Tensor]:
+                   pitch: Tensor | None = None, context: int = 0, prompt: Tensor | None = None
+                   ) -> tuple[Tensor, Tensor]:
         """As :meth:`DriftingTTS.synthesize` (the DiT's own arguments are accepted and ignored): normalised mels
         ``[B, n_mels, T]`` and their lengths. Durations from the duration predictor (``length_scale``) or given;
-        ``cfg_scale``: guidance on the backbone state (:meth:`generate`)."""
-        cond, y_len = self.aligned_condition(text, text_len, spk, length_scale, pitch_shift, durations, pitch, context)
+        ``cfg_scale``: guidance on the backbone state (:meth:`generate`). ``prompt`` (``model.ar.prompt``, #95):
+        normalised mels ``[B, n_mels, P]`` of recordings whose voices the model continues in; ``spk`` is then
+        ignored, and no transcript of the prompt is needed."""
+        spk_emb = prefix = prefix_cond = None
+        if prompt is not None:
+            prompt = prompt[..., : prompt.shape[-1] // self.patch * self.patch]
+            spk, spk_emb = torch.full_like(spk, self.prompt_row), self.prompt_vector(prompt)
+        cond, y_len = self.aligned_condition(text, text_len, spk, length_scale, pitch_shift, durations, pitch, context,
+                                             spk_emb)
+        if prompt is not None:  # the prompt is history without a text condition
+            prefix, prefix_cond = prompt, cond.new_zeros(cond.shape[0], cond.shape[1], prompt.shape[-1])
         if self.fast_generator is not None:
-            mel = self.fast_generator(cond, spk, temperature, generator, cfg_scale)
+            mel = self.fast_generator(cond, spk, temperature, generator, cfg_scale, prefix=prefix,
+                                      prefix_cond=prefix_cond)
         else:
-            mel = self.generate(cond, spk, temperature, generator, cfg_scale=cfg_scale)
+            mel = self.generate(cond, spk, temperature, generator, prefix=prefix, cfg_scale=cfg_scale,
+                                prefix_cond=prefix_cond)
         return mel * sequence_mask(y_len, mel.shape[-1])[:, None], y_len
 
 

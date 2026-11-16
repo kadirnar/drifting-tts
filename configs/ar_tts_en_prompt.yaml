@@ -1,0 +1,28 @@
+# Issue #95: zero-shot voices for the English ARDrift. The released model is fine-tuned so that the beginning of a
+# recording, given as a prompt, sets the voice (Kyutai's Pocket TTS recipe on mel patches): an utterance is cut at
+# a word boundary, the frames before the cut are history without a text condition, the words after it are the
+# text, and for half of them the speaker row is the "prompted" one (drifting_tts/train_ar.py: cut_prompts).
+#   drifting-tts train-ar --config configs/ar_tts_en_prompt.yaml --workdir runs/ar_en_prompt
+#   tts = Synthesizer("runs/ar_en_prompt/model_ema.pt", "cuda", vocoder=...); tts(text, ref_audio="voice.wav")
+#   python scripts/clone_eval.py --model runs/ar_en_prompt/model_ema.pt --manifest <manifest.json> --out <dir>
+base: ar_tts_en_10k.yaml
+
+model:
+  ar:
+    prompt: true           # one more speaker row ("the voice is in the prompt") and the prompt encoder
+
+drift:
+  tau_init: 0.06           # the released checkpoint does not hold its learned temperature. This is what its samples
+                           # ask for: tau alone, optimised on its loss with the model frozen, settles at 0.056-0.065
+  prompt:
+    prob: 0.85             # share of the utterances that are long enough and get a prompt (the rest: as before)
+    id_dropout: 0.5        # share of the prompted utterances whose speaker row is the prompted one
+    min_seconds: 2.0       # the cut: where a word starts, between min and max seconds ...
+    max_seconds: 6.0
+    min_target: 1.5        # ... and at least this long before the utterance's end
+    max_trim: 0.5          # the prompt's end is trimmed by up to this much (a reference is never contiguous)
+
+train:
+  init_from: runs/en_dur/model_poisson.pt   # the released model (speaker tables grown by the prompted row)
+  steps: 40000
+  warmup: 1000

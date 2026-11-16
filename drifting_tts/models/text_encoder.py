@@ -97,10 +97,13 @@ class TextEncoder(nn.Module):
         self.proj_mu = nn.Conv1d(d, n_mels, 1)
         self.duration = DurationPredictor(d + spk_dim, dropout=dropout)
 
-    def forward(self, text: Tensor, text_len: Tensor, spk: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Returns hidden ``h`` [B, d, N], prior mean ``mu`` [B, n_mels, N], log-durations [B, 1, N], mask [B, 1, N]."""
+    def forward(self, text: Tensor, text_len: Tensor, spk: Tensor,
+                spk_emb: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Returns hidden ``h`` [B, d, N], prior mean ``mu`` [B, n_mels, N], log-durations [B, 1, N], mask [B, 1, N].
+        ``spk_emb`` ``[B, spk_dim]``: speaker vectors used instead of the table's rows (a voice given by a prompt:
+        :meth:`drifting_tts.models.ar.ARDriftTTS.prompt_vector`)."""
         mask = sequence_mask(text_len, text.shape[1])[:, :, None].float()  # [B, N, 1]
-        s = self.spk(spk)
+        s = self.spk(spk) if spk_emb is None else spk_emb
         x = self.emb(text) * math.sqrt(self.d) + self.spk_proj(s)[:, None]
         for conv, norm in zip(self.prenet, self.prenet_norms):  # residual conv prenet
             x = x + norm(F.relu(conv((x * mask).transpose(1, 2)).transpose(1, 2)))
