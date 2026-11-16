@@ -16,6 +16,10 @@ One step:
    patch and pushes them apart, in the kernel space of :func:`~drifting_tts.models.ar.ar_features` (the whole patch,
    each frame, each frame's harmonic detail and, with ``drift.energy_bands``, each frame's band energies).
 
+``model.ar.tied`` (#92, latents stored ``patch`` times for the alignment): the backbone reads and the head draws one
+latent frame per step, copied over the patch. ``drift.target_noise`` trains on samples of the codec's posterior
+instead of its mean (:func:`sample_targets`).
+
 ``train.eval_every`` evaluates every EMA inside the loop, on the held-out objective and on synthesised held-out
 sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`drifting_tts.loop_eval`).
 
@@ -97,6 +101,8 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
         cand = ok[b].nonzero()[:, 0]
         j = int(cand[torch.randint(len(cand), (1,), device=dev)]) if len(cand) else 0
         f0 = int(start[b, j]) if len(cand) else 0
+        if model.tied:  # the copies of a latent frame stay in one patch (the alignment after the cut absorbs it)
+            f0 = f0 // k * k
         p = max(f0 - int(torch.randint(trim + 1, (1,), device=dev)), 0) // k * k if len(cand) else 0
         texts.append(text[b, j: int(text_len[b])])
         mels.append(y[b, :, f0: int(y_len[b])].T)
@@ -109,6 +115,28 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
             "mel_len": torch.tensor([m.shape[0] for m in mels], device=dev),
             "prompt": pad_sequence(prompts, batch_first=True).transpose(1, 2), "prompt_len": prompt_len,
             "dropped": dropped}
+
+
+def sample_targets(y: torch.Tensor, y_len: torch.Tensor, noise, group: int = 1,
+                   std: torch.Tensor | None = None) -> torch.Tensor:
+    """Sampled targets (#92): the frames ``[B, C, T]`` plus Gaussian noise, so that the model learns the codec's
+    posterior and not its mean (SALAD: UTMOS 4.28 against 3.47, CER 0.74 against 1.89, for a model trained on
+    samples instead of means). ``noise``: a standard deviation in normalised units, or ``"posterior"``: the
+    posterior's own ``std`` ``[B, C, T]`` (``extract-latents --save-std``). ``group``: frames that are copies of
+    one latent frame share a draw (``model.ar.tied``). Everything downstream sees the sample: the alignment, the
+    history and the target."""
+    B, C, T = y.shape
+    eps = torch.randn(B, C, -(-T // group), device=y.device, dtype=y.dtype)
+    if group > 1:
+        eps = eps.repeat_interleave(group, -1)[..., :T]
+    if noise == "posterior":
+        if std is None:
+            raise ValueError("drift.target_noise: posterior needs the posterior's standard deviations in the batch "
+                             "(a dataset of `extract-latents --save-std`)")
+        scale = std.to(y.dtype)
+    else:
+        scale = float(noise)
+    return torch.where(sequence_mask(y_len, T)[:, None], y + scale * eps, y)
 
 
 def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, prompt: torch.Tensor,
@@ -134,6 +162,10 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
     amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
     B = y.shape[0]
+    if dc.get("target_noise"):  # a sample of the codec's posterior instead of its mean (#92)
+        std = batch.get("mel_std")
+        y = sample_targets(y, y_len, dc.target_noise, model.patch if model.tied else 1,
+                           None if std is None else std.to(device, non_blocking=True))
     unknown = spk < 0  # voices without a speaker row (a corpus streamed with `speakers: prompt`, #104)
     if unknown.any():
         if not model.prompted and model.ref_enc is None:
@@ -200,8 +232,9 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     if idx.numel() > dc.max_rows:  # a random subset of the steps (rows) keeps the head's batch bounded
         idx = idx[torch.randperm(idx.numel(), device=device)[: dc.max_rows]]
     rows = s.flatten(0, 1)[idx]  # [R, dim]
-    target = patchify(y, k).flatten(0, 1)[idx]  # [R, k * C]
-    base = patchify(cond[:, :C], k).flatten(0, 1)[idx]  # the aligned prior mean: the head predicts a residual
+    # what the head draws: the patch, or one frame for all of it (model.ar.tied, #92)
+    target = model.squeeze(patchify(y, k).flatten(0, 1)[idx])  # [R, k * C] (tied: [R, C])
+    base = model.squeeze(patchify(cond[:, :C], k).flatten(0, 1)[idx])  # the aligned prior mean: the head's residual
     R, G = rows.shape[0], int(dc.gen_per_cond)
     z = torch.randn(R * G, model.head.noise_dim, device=device)
     with amp:
@@ -212,9 +245,10 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         if mel_std is None:
             raise ValueError("drift.energy_bands needs the scalar std of the mel statistics (log-mel data)")
         opts["energy_scale"] = 2.0 * float(mel_std)
-    f_gen = ar_features(x, k, C, **opts)
+    kf = 1 if model.tied else k  # frames in what the head draws
+    f_gen = ar_features(x, kf, C, **opts)
     with torch.no_grad():
-        f_pos = ar_features(target[:, None], k, C, **opts)
+        f_pos = ar_features(target[:, None], kf, C, **opts)
     l_drift, info = feature_drift_loss(f_gen, f_pos, None, taus=tau, reduce="mean",
                                        key_weights=dc.get("key_weights"))
     loss = lc.drift * l_drift + lc.prior * l_prior + lc.duration * l_dur

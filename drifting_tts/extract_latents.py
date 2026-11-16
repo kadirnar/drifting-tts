@@ -57,6 +57,12 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--backend", required=True, help="dacvae, voxcpm2, voxcpm1.5 or mimi")
     p.add_argument("--out", required=True)
     p.add_argument("--repeat", type=int, default=4, help="copies of every latent frame (alignment resolution)")
+    p.add_argument("--native", action="store_true",
+                   help="store every latent frame once (a quarter of the disk with --repeat 4); the data loader "
+                        "makes the copies. For a model that ties them (model.ar.tied, #92)")
+    p.add_argument("--save-std", action="store_true",
+                   help="also stds.bin: the posterior's standard deviation, for training on posterior samples "
+                        "(drift.target_noise: posterior, #92); a backend with a posterior")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--audio-rate", type=int, default=None,
                    help="rate of the audio given to the encoder (default: its input rate if that is above 24 kHz and "
@@ -90,8 +96,9 @@ def source_rate(be, requested: int | None, hires: int | None = None) -> int:
     return be.input_rate if hires is None else hires
 
 
-def encode_batch(be, wavs: list[np.ndarray], sr: int) -> list[torch.Tensor]:
-    """The latents ``[dim, T_k]`` of waveforms of different lengths, encoded as one right-padded batch.
+def encode_batch(be, wavs: list[np.ndarray], sr: int, with_std: bool = False) -> list:
+    """The latents ``[dim, T_k]`` of waveforms of different lengths, encoded as one right-padded batch; with
+    ``with_std`` pairs of the posterior's mean and standard deviation.
 
     Zeros after an utterance do not reach the frames of a causal encoder that zero-pads to whole frames (VoxCPM,
     Mimi), so its rows are what it returns for each utterance alone. An encoder that reflect-pads to whole frames
@@ -112,8 +119,22 @@ def encode_batch(be, wavs: list[np.ndarray], sr: int) -> list[torch.Tensor]:
                 x[k, n:end] = x[k, 2 * n - end - 1: n - 1].flip(0)  # F.pad(..., "reflect")
             x[k, end:] = 0  # incl. the resampler's ringing past the utterance
         sr = be.input_rate
+    if with_std:
+        z, std = (t.float() for t in be.posterior(x, sr))
+        return [(z[k, :, :t], std[k, :, :t]) for k, t in enumerate(frames)]
     z = be.encode(x, sr).float()
     return [z[k, :, :t] for k, t in enumerate(frames)]
+
+
+def frame_bytes(z: torch.Tensor, copies: int) -> bytes:
+    """Frames ``[dim, T]`` as they are stored: frame-major float16, every frame ``copies`` times."""
+    z = z.repeat_interleave(copies, dim=1) if copies > 1 else z
+    return z.T.contiguous().cpu().numpy().astype(np.float16).tobytes()
+
+
+def check_posterior(be, args) -> None:
+    if args.save_std and not hasattr(be, "posterior"):
+        raise SystemExit(f"--save-std: the {args.backend} backend has no posterior (its encoder gives one latent)")
 
 
 def resample_f0(f0: np.ndarray, src_rate: float, frames: int, rate: float) -> np.ndarray:
@@ -122,6 +143,16 @@ def resample_f0(f0: np.ndarray, src_rate: float, frames: int, rate: float) -> np
     centres = (np.arange(frames) + 0.5) / rate
     idx = np.clip(np.floor(centres * src_rate).astype(np.int64), 0, max(len(f0) - 1, 0))
     return f0[idx] if len(f0) else np.zeros(frames, f0.dtype)
+
+
+def storage_stats(args, sd, n_native: int, std: np.ndarray) -> dict:
+    """``stats.json`` entries of ``--native`` and ``--save-std``: how the frames are stored, and the posterior's
+    mean standard deviation relative to each channel's spread (what a posterior sample adds, in normalised units)."""
+    out = {"stored_repeat": 1 if args.native else args.repeat}
+    if sd is not None:
+        rel = (sd / n_native).cpu().numpy() / np.maximum(std, 1e-3)
+        out.update(posterior_std=True, posterior_rel=float(rel.mean()))
+    return out
 
 
 @torch.inference_mode()
@@ -152,27 +183,34 @@ def run(args) -> None:
         print(f"the {args.backend} encoder takes {be.input_rate} Hz audio and gets {sr} Hz audio (nothing above "
               f"{sr // 2000} kHz): `prepare --save-audio --hires-rate {be.input_rate}` stores it", flush=True)
 
+    check_posterior(be, args)
+    copies = 1 if args.native else args.repeat  # stored frames per latent frame
     total, done = 0, {}  # (audio offset, samples) -> (offset, frames): merged roots repeat entries
-    s = ss = None
+    s = ss = sd = None
     n_native = 0
-    with open(out / "mels.bin", "wb") as fm, open(out / "f0.bin", "wb") as ff:
+    with open(out / "mels.bin", "wb") as fm, open(out / "f0.bin", "wb") as ff, \
+            open(out / "stds.bin" if args.save_std else os.devnull, "wb") as fs:
         for e in tqdm(index, desc=f"extract {args.backend}"):
             key = (e[k_off], e[k_len])
             if key not in done:
                 wav = torch.from_numpy(np.array(audio[key[0]: key[0] + key[1]], dtype=np.float32))
-                z = be.encode(wav.to(args.device), sr)[0].float()  # [dim, T]
+                if args.save_std:
+                    z, std = (t[0].float() for t in be.posterior(wav.to(args.device), sr))
+                    fs.write(frame_bytes(std, copies))
+                    sd = std.double().sum(1) if sd is None else sd + std.double().sum(1)
+                else:
+                    z = be.encode(wav.to(args.device), sr)[0].float()  # [dim, T]
                 zs = z.double()
                 s = zs.sum(1) if s is None else s + zs.sum(1)
                 ss = (zs * zs).sum(1) if ss is None else ss + (zs * zs).sum(1)
                 n_native += z.shape[1]
                 frames = z.shape[1] * args.repeat
-                fm.write(z.repeat_interleave(args.repeat, dim=1).T.contiguous().cpu().numpy()
-                         .astype(np.float16).tobytes())
-                if f0_src is not None:
+                fm.write(frame_bytes(z, copies))
+                if f0_src is not None and not args.native:  # per stored frame: not with one frame per latent
                     f0 = np.array(f0_src[e["offset"]: e["offset"] + e["frames"]], dtype=np.float32)
                     ff.write(resample_f0(f0, src_rate, frames, rate).astype(np.float16).tobytes())
                 done[key] = (total, frames)
-                total += frames
+                total += z.shape[1] * copies
             e["offset"], e["frames"] = done[key]
     with open(out / "index.jsonl", "w") as f:
         for e in index:
@@ -182,8 +220,8 @@ def run(args) -> None:
     std = np.sqrt(np.maximum((ss / n_native).cpu().numpy() - mean**2, 0.0))
     stats = {"backend": args.backend, "dim": int(be.dim), "frame_rate": rate, "latent_repeat": args.repeat,
              "latent_rate": be.frame_rate, "output_rate": be.output_rate, "audio_rate": sr, "mean": mean.tolist(),
-             "std": std.tolist(), "frames": int(total), "utterances": len(index)}
-    stats.update({k: st_src[k] for k in ("f0_method", "lf0_mean", "lf0_std") if k in st_src})
+             "std": std.tolist(), "frames": int(total), "utterances": len(index), **storage_stats(args, sd, n_native, std)}
+    stats.update({k: st_src[k] for k in ("f0_method", "lf0_mean", "lf0_std", "language") if k in st_src})
     (out / "stats.json").write_text(json.dumps(stats, indent=1))
     for name in ("speakers.json", "scores.jsonl"):
         if (src / name).exists():
@@ -283,22 +321,27 @@ def run_parquet(args) -> None:
     be = load_backend(args.backend, args.device)
     rate = be.frame_rate * args.repeat
     sr = source_rate(be, getattr(args, "audio_rate", None))
+    check_posterior(be, args)
+    copies = 1 if args.native else args.repeat  # stored frames per latent frame
     index: list[dict] = []
-    s = ss = None
+    s = ss = sd = None
     n_native = total = skipped = 0
     buffer: list[tuple[dict, np.ndarray]] = []
 
     def encode(batch: list[tuple[dict, np.ndarray]]) -> None:
-        nonlocal s, ss, n_native, total
-        for (meta, _), zk in zip(batch, encode_batch(be, [w for _, w in batch], sr)):
+        nonlocal s, ss, sd, n_native, total
+        for (meta, _), zk in zip(batch, encode_batch(be, [w for _, w in batch], sr, args.save_std)):
+            if args.save_std:
+                zk, std = zk
+                fs.write(frame_bytes(std, copies))
+                sd = std.double().sum(1) if sd is None else sd + std.double().sum(1)
             zs = zk.double()
             s = zs.sum(1) if s is None else s + zs.sum(1)
             ss = (zs * zs).sum(1) if ss is None else ss + (zs * zs).sum(1)
             n_native += zk.shape[1]
-            frames = zk.shape[1] * args.repeat
-            fm.write(zk.repeat_interleave(args.repeat, dim=1).T.contiguous().cpu().numpy().astype(np.float16).tobytes())
-            index.append({**meta, "offset": total, "frames": frames})
-            total += frames
+            fm.write(frame_bytes(zk, copies))
+            index.append({**meta, "offset": total, "frames": zk.shape[1] * args.repeat})
+            total += zk.shape[1] * copies
 
     def flush(final: bool = False) -> None:
         """Encode the buffer in batches of similar length (each within --batch-seconds of padded audio)."""
@@ -325,8 +368,8 @@ def run_parquet(args) -> None:
             yield row
 
     rows = _shard_rows(files, held_out, args.speaker_column, args.prefetch, out / "_shards")
-    with open(out / "mels.bin", "wb") as fm, Pool(args.workers, initializer=_init_worker,
-                                                  initargs=(args.language, sr)) as pool:
+    with open(out / "mels.bin", "wb") as fm, open(out / "stds.bin" if args.save_std else os.devnull, "wb") as fs, \
+            Pool(args.workers, initializer=_init_worker, initargs=(args.language, sr)) as pool:
         for res in tqdm(pool.imap(_prepare_row, throttled(rows), chunksize=8), desc=f"extract {args.backend}"):
             pending.release()
             if res is None or len(res[1]) > args.max_seconds * sr:
@@ -352,7 +395,8 @@ def run_parquet(args) -> None:
     stats = {"backend": args.backend, "language": args.language, "dim": int(be.dim), "frame_rate": rate,
              "latent_repeat": args.repeat, "latent_rate": be.frame_rate, "output_rate": be.output_rate,
              "audio_rate": sr, "mean": mean.tolist(), "std": std.tolist(), "frames": int(total),
-             "utterances": len(index), "speakers": len(speakers), "skipped": skipped}
+             "utterances": len(index), "speakers": len(speakers), "skipped": skipped,
+             **storage_stats(args, sd, n_native, std)}
     (out / "stats.json").write_text(json.dumps(stats, indent=1))
     shutil.rmtree(out / "_shards", ignore_errors=True)
     print(f"{len(index)} utterances ({n_native / be.frame_rate / 3600:.1f} h of latents at {be.frame_rate:g} Hz, "

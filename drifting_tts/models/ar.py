@@ -262,16 +262,21 @@ class ARDriftTTS(nn.Module):
                                    dropout=t.dropout, num_speakers=num_speakers, spk_dim=t.spk_dim)
         self.n_mels, self.patch, self.lookahead = n_mels, int(a.patch), int(a.get("lookahead", 2))
         self.pitch_enabled = False  # the intonation is the autoregressive model's own
+        # model.ar.tied (#92): the frames of a patch are copies of one codec frame (a latent stored `patch` times
+        # for the alignment). The backbone then reads one frame per step and the head draws one frame, which is
+        # copied over the patch: the model cannot make the copies disagree. The text condition keeps the fine grid
+        self.tied = bool(a.get("tied", False))
         k, cond_ch, dim = self.patch, n_mels + t.d, int(a.dim)
-        self.x_in = nn.Linear(k * n_mels, dim)
+        out = n_mels if self.tied else k * n_mels  # what the backbone reads and the head draws per step
+        self.x_in = nn.Linear(out, dim)
         self.c_in = nn.Linear(k * cond_ch * (1 + self.lookahead), dim)
         self.spk = nn.Embedding(num_speakers, dim)
         nn.init.normal_(self.spk.weight, std=0.02)
-        self.bos = nn.Parameter(torch.zeros(k * n_mels))
+        self.bos = nn.Parameter(torch.zeros(out))
         self.blocks = nn.ModuleList([Block(dim, int(a.heads), float(a.get("mlp_ratio", 4.0)))
                                      for _ in range(int(a.depth))])
         self.norm = RMSNorm(dim)
-        self.head = DriftHead(dim, k * n_mels, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
+        self.head = DriftHead(dim, out, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
         self.prompt_enc = PromptEncoder(k * n_mels, t.spk_dim, int(a.get("prompt_dim", 256))) if self.prompted else None
         self.ref_enc = None
         if rc:
@@ -285,6 +290,21 @@ class ARDriftTTS(nn.Module):
     def enable_fast(self, max_steps: int = 512, graphs: bool = True) -> None:
         """Generate with :class:`ARGenerator` (preallocated caches, CUDA graphs) from now on."""
         self.fast_generator = ARGenerator(self, max_steps, graphs)
+
+    # ------------------------------------------------------------------------------------------ one frame per step
+    def squeeze(self, p: Tensor) -> Tensor:
+        """Patches ``[..., k * n_mels]`` -> what the backbone reads and the head draws: the patch itself, or with
+        ``model.ar.tied`` the one frame its ``k`` copies stand for (their mean) ``[..., n_mels]``."""
+        return p.unflatten(-1, (self.patch, self.n_mels)).mean(-2) if self.tied else p
+
+    def spread(self, f: Tensor) -> Tensor:
+        """The inverse of :meth:`squeeze`: a tied model's frame ``[..., n_mels]`` copied over its patch."""
+        return f.unsqueeze(-2).expand(*f.shape[:-1], self.patch, f.shape[-1]).flatten(-2) if self.tied else f
+
+    def emit(self, mu: Tensor, s: Tensor, z: Tensor) -> Tensor:
+        """One step's patch ``[N, k * n_mels]``: the prior-mean patch ``mu`` plus the head's residual from the
+        state ``s`` and the noise ``z``."""
+        return self.spread(self.squeeze(mu) + self.head(s, z))
 
     # ----------------------------------------------------------------------------------------------- conditioning
     def cond_patches(self, cond: Tensor) -> Tensor:
@@ -368,7 +388,7 @@ class ARDriftTTS(nn.Module):
         times unit noise: robustness to the model's own, imperfect patches at inference). ``drop`` ``[B]`` (bool):
         utterances whose text condition the backbone does not see (the null condition of guidance). ``tokens``
         ``[B, K, dim]``: the reference's (:meth:`reference_tokens`)."""
-        yp = patchify(y, self.patch)
+        yp = self.squeeze(patchify(y, self.patch))
         x_prev = torch.cat([self.bos.expand(yp.shape[0], 1, -1), yp[:, :-1]], 1)
         if input_noise is not None:
             x_prev = x_prev + input_noise[:, None, None] * torch.randn_like(x_prev)
@@ -388,7 +408,7 @@ class ARDriftTTS(nn.Module):
         s = self.teacher_forced(cond, y, spk, tokens=tokens)  # [B, S, dim]
         mu = patchify(cond[:, : self.n_mels], k)
         z = torch.randn(*s.shape[:2], self.head.noise_dim, device=s.device, generator=generator) * temperature
-        x = mu + self.head(s.flatten(0, 1), z.flatten(0, 1)).view_as(mu)
+        x = self.emit(mu.flatten(0, 1), s.flatten(0, 1), z.flatten(0, 1)).view_as(mu)
         return unpatchify(x, k, self.n_mels)[..., :T]
 
     # ------------------------------------------------------------------------------------------------- inference
@@ -432,9 +452,9 @@ class ARDriftTTS(nn.Module):
                 x = pre[:, t]
             else:
                 z = torch.randn(B, self.head.noise_dim, device=cond.device, generator=generator) * temperature
-                x = mu[:, t] + self.head(s, z)
+                x = self.emit(mu[:, t], s, z)
             out.append(x)
-            prev = x[:, None]
+            prev = self.squeeze(x)[:, None]
         mel = unpatchify(torch.stack(out, 1), k, self.n_mels)
         return mel[..., lead:T]
 
@@ -446,7 +466,7 @@ class ARDriftTTS(nn.Module):
         ``spk`` and the caches then have ``2 B`` rows (the conditional ones, then the null ones)."""
         if cfg is not None:
             prev = torch.cat([prev, prev])
-        h = (self.x_in(prev) + self.c_in(cpatch) + self.spk(spk))[:, None]
+        h = (self.x_in(self.squeeze(prev)) + self.c_in(cpatch) + self.spk(spk))[:, None]
         smax = caches[0][0].shape[2]
         mask = (torch.arange(smax, device=prev.device) <= pos)[None, None, None]
         for blk, (kc, vc) in zip(self.blocks, caches):
@@ -455,7 +475,7 @@ class ARDriftTTS(nn.Module):
         if cfg is not None:
             B = s.shape[0] // 2
             s = s[B:] + cfg * (s[:B] - s[B:])
-        return mu + self.head(s, z)
+        return self.emit(mu, s, z)
 
     @torch.no_grad()
     def aligned_condition(self, text: Tensor, text_len: Tensor, spk: Tensor, length_scale: float = 1.0,
@@ -606,7 +626,7 @@ class ARGenerator:
                 h = blk(h, cache)
                 kc[:, :, :K].copy_(cache["k"])
                 vc[:, :, :K].copy_(cache["v"])
-        st["prev"].copy_(m.bos.expand(B, -1))
+        st["prev"].copy_(m.spread(m.bos).expand(B, -1))
         if guided:
             cp = torch.cat([cp, torch.zeros_like(cp)])
             st["spk"].copy_(torch.cat([spk, spk]))
@@ -650,7 +670,9 @@ def ar_features(x: Tensor, k: int, n_mels: int, detail: bool = True, energy_band
 
     R, S, _ = x.shape
     frames = x.view(R, S, k, n_mels)
-    out = {"patch": x[:, :, None], "frame": frames}
+    out = {"patch": x[:, :, None]}
+    if k > 1:  # a patch of one frame (model.ar.tied) is its own frame map
+        out["frame"] = frames
     if detail:
         d = spectral_detail(frames.reshape(R * S, k, n_mels).transpose(1, 2)).transpose(1, 2)
         out["detail"] = d.reshape(R, S, k, n_mels)

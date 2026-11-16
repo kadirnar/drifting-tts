@@ -11,6 +11,7 @@ the frames the model predicts and the decoder that turns them into audio change.
 - [Why the Mimi model sounds worse](#why-the-mimi-model-sounds-worse)
 - [Fine-tuning Mimi's decoder](#fine-tuning-mimis-decoder)
 - [Conclusions](#conclusions)
+- [A second attempt: the code (#92)](#a-second-attempt-the-code-92)
 - [Commands](#commands)
 
 ## The codec
@@ -242,9 +243,45 @@ The loss falls only a little over 20k steps: on GTA latents from 1.40 to ~1.34, 
     `$DRIFTING_TTS_MIMI_WEIGHTS`. The Space needs no Hub token for the gated repo.
   - The fine-tuned decoders are not published.
 
+## A second attempt: the code (#92)
+
+The run above differs from Kyutai's recipe and from the published continuous-latent models in three things. The
+code for each is in the repository and tested on tiny models; **none of it has been run on Mimi**: the Mimi weights
+are gated, and neither they, the 10,000 h of latents nor the 150k checkpoint were on the machine this was written
+on.
+
+| difference | then | now |
+|---|---|---|
+| what the head draws | a 128-d patch of four copies of a Mimi frame that nothing ties together; `LatentVocoder` averages them | `model.ar.tied`: the backbone reads one 32-d frame per step, the head draws one, and it is copied over the patch. The text condition keeps its 50 Hz grid |
+| the target | the posterior mean | `drift.target_noise`: Gaussian noise on the latents (0.05–0.1 std), or the codec's own posterior (`extract-latents --save-std`, `target_noise: posterior`). The alignment, the history and the target see the sample |
+| the decoder | fine-tuned on teacher-forced GTA latents (every recipe lowered the round trip) | `configs/vocoder_mimi_decoder_noise.yaml`: noise of up to 0.3 std on the recorded latents and free-running GTA (#90) |
+| the length | 150k steps, UTMOSv2 flat from 60k | `configs/ar_tts_en_mimi_v2.yaml`: 300k steps with the evaluation in the loop and a second EMA (#102) |
+
+- **Why the copies matter.** `scripts/latent_smoothness.py` measures after the averaging, so disagreement between
+  the copies has never been seen. `scripts/codec_gate.py --model` now takes an ARDrift model: per position in the
+  group, the squared deviation from the group mean; with the judges it also decodes the generated latents twice,
+  from the mean of the copies and from the first copy alone. If one copy scores above their mean, the averaging has
+  been hiding a head that cannot make four values agree; if the copies agree, tying them changes little, and what
+  remains is the per-frame error.
+- **A tied model is a smaller problem for the kernel**: 32 dimensions per step instead of 128, the layout of
+  Kyutai's head. Its kernel has one map (the frame); the patch and frame maps of the mel model coincide.
+- **Prompts** (#95) on a tied model are cut on the grid of the copies, so a patch never holds two latent frames.
+- **Storage**: `extract-latents --native` writes every frame once (29 GB instead of 115 GB for the 10,000 h); the
+  data loader makes the copies. The first model's data (`data/en_mimi`) works unchanged.
+- **What #90 says about step 4**: on mels, free-running GTA batches did not help the English vocoder (UTMOS22 4.10
+  / 4.04 / 4.01 for 0 / 50 / 100% of them at 2,500 steps), and recipe 3 above already trained with latent noise of
+  0.3. Run a teacher-forced control beside the free-running decoder.
+
 ## Commands
 
 ```bash
+# the second attempt (#92): first the copies of the 150k model, then the tied model on sampled targets
+python scripts/codec_gate.py --data data/en_mimi_ft --backends mimi --skip native tolerance phonetic \
+    --model runs/ar_en_mimi/model_ema.pt --cfg 1 --temperature 0.5 --out outputs/mimi_copies
+drifting-tts train-ar --config configs/ar_tts_en_mimi_v2.yaml --workdir runs/ar_en_mimi_v2
+drifting-tts finetune-vocoder --config configs/vocoder_mimi_decoder_noise.yaml --workdir runs/mimi_decoder_noise \
+    data.root=data/en_mimi_ft
+
 pip install "drifting-tts[mimi]"   # pocket-tts; accept the terms of kyutai/pocket-tts on the Hub once
 drifting-tts extract-latents --parquet-glob "hf://datasets/VoiceHub/echo-clones-10kh-en/data/*.parquet" \
     --val-glob "hf://datasets/SynDataLab-EN/echo-clones-4m-en/data/train-07960.parquet" --backend mimi \

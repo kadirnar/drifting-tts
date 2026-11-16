@@ -137,6 +137,7 @@ class MelDataset(Dataset):
         with_audio: bool = False,
         filters: dict | None = None,
         reference: tuple[int, int] | None = None,
+        with_std: bool = False,
     ):
         root = Path(root)
         self.stats = MelStats.load(root)
@@ -146,6 +147,14 @@ class MelDataset(Dataset):
         # features per frame and frames per second: 100 log-mel bins at 93.75 Hz, or VAE latents (extract-latents)
         self.dim, self.frame_rate = int(st.get("dim", N_MELS)), float(st.get("frame_rate", FRAME_RATE))
         self.latent_repeat = int(st.get("latent_repeat", 1))  # extract-latents: copies of every VAE frame
+        # ... and how many of them are on the disk (extract-latents --native: 1, the copies are made on reading)
+        self.copies = self.latent_repeat // int(st.get("stored_repeat", self.latent_repeat))
+        # the posterior's standard deviations (extract-latents --save-std), as "mel_std" in normalised units
+        self.with_std, self._stds_path, self._stds = with_std, root / "stds.bin", None
+        if with_std and not self._stds_path.exists():
+            raise FileNotFoundError(f"{self._stds_path} missing: run `drifting-tts extract-latents --save-std`")
+        if with_f0 and self.copies > 1:
+            raise ValueError(f"{root} stores every latent frame once (extract-latents --native): no per-frame F0")
         self.with_f0 = with_f0
         self._f0_path = root / "f0.bin"
         if with_f0 and not self._f0_path.exists():
@@ -214,10 +223,14 @@ class MelDataset(Dataset):
     def frames(self, i: int) -> int:
         return self.items[i]["frames"]
 
-    def _mel(self, i: int) -> torch.Tensor:
+    def _stored(self, array: np.ndarray, i: int) -> torch.Tensor:
+        """The frames ``[dim, T]`` of utterance ``i`` from ``mels.bin`` / ``stds.bin`` (copies made if needed)."""
         e = self.items[i]
-        mel = torch.from_numpy(np.array(self.mels[e["offset"]: e["offset"] + e["frames"]], dtype=np.float32))
-        return self.stats.normalize(mel.T.contiguous())
+        x = np.array(array[e["offset"]: e["offset"] + e["frames"] // self.copies], dtype=np.float32)
+        return torch.from_numpy(x.repeat(self.copies, 0) if self.copies > 1 else x).T.contiguous()
+
+    def _mel(self, i: int) -> torch.Tensor:
+        return self.stats.normalize(self._stored(self.mels, i))
 
     def __getitem__(self, i: int) -> dict:
         e = self.items[i]
@@ -228,6 +241,11 @@ class MelDataset(Dataset):
             "spk": e["spk_id"],
             "index": i,
         }
+        if self.with_std:
+            if self._stds is None:
+                self._stds = np.memmap(self._stds_path, dtype=np.float16, mode="r").reshape(-1, self.dim)
+            std = self._stored(self._stds, i)
+            item["mel_std"] = std / self.stats.std  # normalised units, as the frames
         if self.reference:
             others = [j for j in self.by_speaker.get(e["spk_id"], ()) if j != i]
             item["ref"] = crop_reference(self._mel(random.choice(others)), *self.reference) if others else None
@@ -259,6 +277,11 @@ def collate(batch: list[dict]) -> dict:
             if r is not None:
                 ref[i, :, : ref_len[i]] = r
         out["ref"], out["ref_len"] = ref, ref_len
+    if "mel_std" in batch[0]:  # the posterior's standard deviations, padded with zeros
+        std = torch.zeros_like(mel)
+        for i, b in enumerate(batch):
+            std[i, :, : mel_len[i]] = b["mel_std"]
+        out["mel_std"] = std
     if "audio" in batch[0]:
         n = max(b["audio"].numel() for b in batch)
         audio = torch.zeros(B, n)
