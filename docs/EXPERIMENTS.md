@@ -409,6 +409,15 @@ both 0.555 (control: 0.538). Against a recording of the speaker that the model w
 prompt's SIM-o is the recording's conditions, and a second recording adds voice. Lesson: a new conditioning path
 into a pretrained autoregressive backbone has to start from something the backbone already reads.
 
+**Exposure bias of ARDrift (#101, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#training-on-the-models-own-history-101)).**
+On the released English model, noise on the free-running history at inference does not help (every measure moves
+away from the recordings as it grows; no judge hears 0.15 of it). Three fine-tunes of 5,000 steps against a control:
+the noise level as an input of the backbone, 4–16 free-running patches as history in half of the batches, and the
+one-step own history. None moves the free-running distance to the recording (4.33–4.38 dB; control 4.34) or the
+pause energy (+1.4 to +1.6 dB), and no judge moves. Most of that distance is another reading of the sentence, not
+an error: two teacher-forced draws are already 1.6 dB apart. The corpus is clean; the podcast voices, where the
+one-step history took 2.3 dB off, are where rollouts remain to be tried.
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**
