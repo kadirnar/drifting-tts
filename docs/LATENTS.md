@@ -14,6 +14,8 @@ involved.
 | `dacvae` | [`facebook/dacvae-watermarked`](https://huggingface.co/facebook/dacvae-watermarked) (Apache-2.0) | 48 kHz | 48 kHz | 25 Hz | 128 | 1920 → 1920 | non-causal, watermarked |
 | `voxcpm2` | [`openbmb/VoxCPM2`](https://huggingface.co/openbmb/VoxCPM2) AudioVAE (Apache-2.0) | 16 kHz | 48 kHz | 25 Hz | 64 | 640 → 1920 | causal |
 | `voxcpm1.5` | [`openbmb/VoxCPM1.5`](https://huggingface.co/openbmb/VoxCPM1.5) AudioVAE (Apache-2.0) | 44.1 kHz | 44.1 kHz | 25 Hz | 64 | 1764 → 1764 | causal |
+| `mimi` | Kyutai's Pocket TTS Mimi (CC BY 4.0, gated; [MIMI.md](MIMI.md)) | 24 kHz | 24 kHz | 12.5 Hz | 32 | 1920 → 1920 | causal |
+| `semantic-vae` | [`zkniu/Semantic-VAE`](https://huggingface.co/zkniu/Semantic-VAE) (code MIT; [#93](#semantic-vae-a-wavlm-aligned-latent-93)) | 16 kHz | 16 kHz | 40 Hz | 64 (36 used) | 400 → 400 | non-causal |
 
 ```python
 from drifting_tts.latents import LatentStats, load_backend, stream_decode
@@ -196,9 +198,9 @@ in fp32 without TF32, so it isolates the receptive field; the number of frames i
 ## Codec gate (#91)
 
 `scripts/codec_gate.py` asks every representation (the mel + vocoder pairs and the audio VAEs) the three questions a
-generative target must pass, and one more of a model trained on latents. **No numbers yet:** the script has only run
-on the CPU with tiny random codecs and stub judges (`tests/test_codec_gate.py`); the table below is filled by the
-first GPU run.
+generative target must pass, and one more of a model trained on latents. The first run with the judges is the
+English one for Semantic-VAE ([below](#semantic-vae-a-wavlm-aligned-latent-93)); the Turkish table of every backend
+is still to be run.
 
 ```bash
 # the 24 kHz recordings, and the hi-res ones for the 44.1 / 48 kHz codecs
@@ -243,12 +245,65 @@ python scripts/codec_gate.py --data data/train --backends voxcpm2 --skip toleran
 
 | backend | 24 kHz: WER | UTMOSv2 | SIM | PESQ | STOI | mel L1 | LSD 8–12 kHz | native: WER | UTMOSv2 | LSD 8–12 / 12–20 kHz | noise for −0.2 UTMOSv2 | Δ at 0.2 std | Δ smoothing | ABX error | probe (majority) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| *pending the first GPU run* | | | | | | | | | | | | | | | |
+| *Turkish recordings, every backend: pending* | | | | | | | | | | | | | | | |
 
 **Gate.** A representation is a candidate target if its 24 kHz round trip loses at most `--max-roundtrip-loss`
 UTMOSv2 against the recordings, and noise of 0.2 standard deviations costs at most `--max-noise-loss`. With both
 flags the table gets a pass / fail column. The thresholds are not set: #91 fixes them after the first table, before
 any TTS run on a new codec.
+
+### Semantic-VAE, a WavLM-aligned latent (#93)
+
+The drifting kernel is an L2 distance, and Deng et al. could not make drifting work on ImageNet without a feature
+encoder. [Semantic-VAE](https://arxiv.org/abs/2509.22167) pulls its latent towards WavLM features with a cosine
+loss while it learns to reconstruct, and F5-TTS on it reads better than on the plain VAE (WER 2.10% against 2.65%).
+`semantic-vae` is the backend (`drifting_tts/latents/semantic_vae.py`: the released `semantic_vae` checkpoint, a
+DAC encoder with an attention projection and a BigVGAN-v2 decoder; 16 kHz, so this tests the hypothesis and not
+the final audio band).
+
+**36 of the 64 channels carry the audio.** On 500 held-out English utterances the other 28 have a posterior as
+wide as the prior: its standard deviation is 0.67–0.69 where the channel's mean varies by 0.06–0.30 over the data.
+In the 36 used ones the posterior is 0.03–0.15 wide against a spread of 0.65–2.4 (a median of 5% of the spread).
+
+- **Why it matters for a generative target.** Divided by their own small spread, the 28 unused channels would
+  carry 44% of every L2 distance of the kernel and hold only the VAE's sampling noise.
+- **What the code does.** `extract-latents` writes `active` to `stats.json` for a codec with a posterior (the
+  channels whose spread exceeds the posterior's standard deviation). An inactive channel is 0 in the normalised
+  frames and its mean after `denormalize` (`MelStats`), so the model neither learns it nor is scored on it. The
+  gate counts and measures the active channels the same way.
+- **Sampled targets** (#92): `extract-latents --save-std` and `drift.target_noise: posterior` train on the VAE's
+  own posterior; 5% of a channel's spread is within the 0.05–0.1 the issue names.
+
+**The gate** on the first 100 held-out English recordings (5,831 aligned characters; `outputs` of
+`scripts/codec_gate.py --backends mel:bigvgan-v2 bigvgan semantic-vae`):
+
+| representation | frames | WER | UTMOSv2 | SIM | Δ noise 0.1 std | Δ noise 0.2 std | noise for −0.2 | Δ smoothing | ABX error | probe (majority 11%) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recording | – | 2.57% | 3.258 | – | – | – | – | – | – | – |
+| log-mel, NVIDIA's BigVGAN-v2 | 93.75 Hz × 100 | 2.51% | 3.296 | 0.979 | −1.21 | −1.76 | 0.02 std | −0.58 | 34.5% | 28.3% |
+| log-mel, the released BigVGAN-v2 (fine-tuned on the model's mels) | 93.75 Hz × 100 | 2.37% | 3.317 | 0.968 | −0.14 | −1.07 | 0.11 std | −0.30 | 34.5% | 28.3% |
+| **Semantic-VAE** | 40 Hz × 36 of 64 | 2.51% | **3.330** | 0.976 | **−0.09** | **−0.41** | **0.13 std** | −1.17 | 37.8% | 31.5% |
+| Mimi ([MIMI.md](MIMI.md), another 60 utterances) | 12.5 Hz × 32 | 3.28% | 3.13 | – | −0.21 | −0.67 | – | −1.32 | – | – |
+
+- **The round trip is the best of the table**: above the recordings on UTMOSv2 (+0.07, inside the interval), the
+  recordings' word errors, speaker similarity 0.976.
+- **Its decoder forgives latent error.** Noise of 0.2 standard deviations costs 0.41 UTMOSv2, where it costs Mimi
+  0.67 and a mel vocoder 1.1–1.8. The VAE was trained on posterior samples; Mimi's decoder was not.
+  White noise on a log-mel is not what a model's mel looks like, so the mel rows say more about the vocoders than
+  about the mel: the vocoder that has seen the model's mels takes five times the noise of the one that has not.
+- **It does not forgive smoothing**: a (¼ ½ ¼) filter over its 25 ms frames costs 1.17 (mel, 11 ms frames: 0.30–0.58).
+  Over-smooth latents are what the DAC-VAE and VoxCPM2 pilots generated ([below](#tts-pilots-17)).
+- **Its L2 distance is not more phonetic than the mel's.** ABX error on character segments 37.8% against 34.5%
+  (intervals ±0.4); a linear probe from one frame reads the character better (31.5% against 28.3%). Characters are
+  a poor proxy for English phonemes, and these numbers rank this table only. They do not show the advantage the
+  hypothesis needs.
+- **The smallest target**: 36 values × 40 Hz = 1,440 a second, against the mel's 9,375.
+
+**What this decides.** The gate passes Semantic-VAE on the round trip and on tolerance; the phonetic structure of
+its distance promises nothing over the mel. Step 2 of #93, ARDrift on these latents at the steps of the mel run,
+is `configs/ar_tts_en_svae.yaml`: two frames per step (50 ms), the frames stored once, targets sampled from the
+posterior. Extracting the 10,000 h takes about 185 GB; the run is 200k steps of 48 utterances (11 h on an RTX 5090
+for the mel model). It was not run on the A10 these measurements were made on (about 60 h there).
 
 ## Which latent space for the TTS pilot (#17)
 

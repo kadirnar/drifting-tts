@@ -310,6 +310,21 @@ Details: [LATENTS.md](LATENTS.md).
   faster.
 - Generator-side work is open in #27.
 
+**Semantic-VAE, a WavLM-aligned latent (#93, [LATENTS.md](LATENTS.md#semantic-vae-a-wavlm-aligned-latent-93)).** A
+backend for the public Semantic-VAE (16 kHz, 40 Hz × 64) and the first judged run of the codec gate, on 100 held-out
+English recordings. Round trip UTMOSv2 3.33 (recordings 3.26, the mel through the released vocoder 3.32); noise of
+0.2 standard deviations on the latents costs 0.41 (Mimi 0.67, the mel vocoders 1.1–1.8), a temporal smoothing 1.17.
+Its L2 distance is not more phonetic than the mel's (character ABX error 37.8% against 34.5%; linear probe 31.5%
+against 28.3%). 36 of its 64 channels carry the audio: in the other 28 the posterior is wider than the channel's
+spread over the data, and per-channel normalisation would have given them 44% of the kernel's distance
+(`stats.json` now names the active channels, and the unused ones are left out). The ARDrift run on these latents
+(`configs/ar_tts_en_svae.yaml`) is not done: about 60 h on the A10 the gate ran on.
+
+**Latent ARDrift, second attempt (#92, [MIMI.md](MIMI.md#a-second-attempt-the-code-92)).** Code only: one codec
+frame per step (`model.ar.tied`), targets sampled from the posterior or with Gaussian noise (`drift.target_noise`),
+latents stored once (`extract-latents --native`), the copies of a latent model's frames decoded one by one in the
+gate. Mimi's weights are gated and its latents were not on the machine, so nothing was trained.
+
 ## 5. "Robotic" prosody: diagnosis and research
 
 Listening feedback: the voices sound robotic. Measured on Prosody-40 (harvest F0, semitones):

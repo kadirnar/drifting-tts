@@ -278,7 +278,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/ENGLISH.md](docs/ENGLISH.md) | ARDrift in English: the character frontend, training streamed from 10,000 h on the Hub, results |
 | [docs/HEAD_REALISM.md](docs/HEAD_REALISM.md) | why ARDrift sounds robotic at the recordings' UTMOSv2: the head's calibration, mel texture and prosody against held-out recordings, a classifier two-sample test that tells one generated patch from a recorded one, why the one-positive field leaves the head too smooth in time, and head-only fine-tunes with the energy score |
 | [docs/MIMI.md](docs/MIMI.md) | the English ARDrift on Kyutai's Mimi latents (Pocket TTS's codec): extraction from parquet shards, results against the mel model, the decoder's sensitivity, three decoder fine-tunes |
-| [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM): the backends, their resynthesis ceiling, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
+| [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM, Semantic-VAE): the backends, their resynthesis ceiling, the codec gate, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
 | [docs/POCKET_TTS_GATE.md](docs/POCKET_TTS_GATE.md) | a Turkish Pocket TTS (autoregressive, Mimi latents) on Freya-100 with our judges and prosody metrics, and the Mimi codec gate (#42) |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
 | [space_test/](space_test/) | the private test Space: the models under test, one tab each (`scripts/deploy_test_space.sh`) |
