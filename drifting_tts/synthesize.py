@@ -440,12 +440,13 @@ class Synthesizer:
         pc, pm = (None, None) if history is None else history.prefix(cond.shape[-1])
         tokens = getattr(getattr(history, "reference", None), "tokens", None)  # a reference's (#96)
         hn = float(getattr(self, "history_noise", 0.0))  # noise on the model's own history (#101; default none)
+        guide = getattr(self, "guidance", "text")  # what the null branch of cfg_scale is without (#99)
         if m.fast_generator is not None:
             mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens,
-                                   history_noise=hn)
+                                   history_noise=hn, guide=guide)
         else:
             mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
-                             tokens=tokens, history_noise=hn)
+                             tokens=tokens, history_noise=hn, guide=guide)
         if history is not None:
             history.update(cond, mel)
         return mel
@@ -902,14 +903,15 @@ class Synthesizer:
             tokens = None if ref is None else ref.tokens
             if not gen.fits(t, 0 if pc is None else pc.shape[-1]):  # longer than the caches: whole sentence
                 mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
-                                 tokens=tokens)
+                                 tokens=tokens, guide=getattr(self, "guidance", "text"))
                 if history is not None:
                     history.update(cond, mel)
                 for piece in stream_vocoder(voc, self.stats.denormalize(mel), first=first, chunk=chunk, context=ctx,
                                             graphs=self.vocoder_graphs):
                     yield piece.cpu()
                 continue
-            steps = gen.steps(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens)
+            steps = gen.steps(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens,
+                              guide=getattr(self, "guidance", "text"))
             mel = torch.zeros(1, m.n_mels, m.pad_frames(cond).shape[-1], device=self.device)
             done = 0
             for a, b, start, n in stream_windows(t, first, chunk, ctx):

@@ -503,7 +503,7 @@ class ARDriftTTS(nn.Module):
     @torch.no_grad()
     def generate(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
                  prefix: Tensor | None = None, cfg_scale: float = 1.0, prefix_cond: Tensor | None = None,
-                 tokens: Tensor | None = None, history_noise: float = 0.0) -> Tensor:
+                 tokens: Tensor | None = None, history_noise: float = 0.0, guide: str = "text") -> Tensor:
         """Aligned condition ``[B, C, T]`` -> normalised mel ``[B, n_mels, T]``, one step (patch) at a time with a KV
         cache. ``prefix``: known leading mel frames ``[B, n_mels, Tp]`` (``Tp`` a multiple of ``patch``), kept.
         ``prefix_cond`` ``[B, C, Tp]``: the prefix is then acoustic context that comes *before* ``cond`` (the end of
@@ -513,7 +513,9 @@ class ARDriftTTS(nn.Module):
         from the same history without the text (a model trained with ``drift.cond_dropout``). ``tokens``
         ``[B, K, dim]``: the reference's (:meth:`reference_tokens`), in front of the sequence. ``history_noise``
         (#101): Gaussian noise of this level on what the backbone reads of the patches so far, as on the recorded
-        history in training (``drift.input_noise``: a level up to 0.3); the output patches stay clean."""
+        history in training (``drift.input_noise``: a level up to 0.3); the output patches stay clean. ``guide``
+        (#99): what the null branch of the guidance is without: the ``text``, the ``voice`` (the speaker row and the
+        reference's tokens; a model trained with ``drift.voice_dropout``) or ``both``."""
         cond, lead = join_prefix(cond, prefix, prefix_cond, self.patch)
         T = cond.shape[-1]
         cond = self.pad_frames(cond)
@@ -521,8 +523,9 @@ class ARDriftTTS(nn.Module):
         B, S = cp.shape[:2]
         k, mu = self.patch, patchify(cond[:, : self.n_mels], self.patch)
         guided = cfg_scale != 1.0
+        tokens = self._tokens(tokens, B)
         if guided:  # the conditional and the null rows as one batch
-            cp, spk_b = torch.cat([cp, torch.zeros_like(cp)]), torch.cat([spk, spk])
+            cp, spk_b, tokens = self.null_branch(cp, spk, tokens, guide)
         else:
             spk_b = spk
         caches = [{} for _ in self.blocks]
@@ -530,9 +533,6 @@ class ARDriftTTS(nn.Module):
         out = []
         n_pre = 0 if prefix is None else prefix.shape[-1] // k
         pre = None if prefix is None else patchify(prefix, k)
-        tokens = self._tokens(tokens, B)
-        if tokens is not None and guided:
-            tokens = torch.cat([tokens, tokens])
         hg, level = history_generator(generator, cond.device) if history_noise else None, None
         if history_noise and self.level_in is not None:
             level = torch.full((spk_b.shape[0],), float(history_noise), device=cond.device)
@@ -552,6 +552,22 @@ class ARDriftTTS(nn.Module):
             prev = self.squeeze(x)[:, None]
         mel = unpatchify(torch.stack(out, 1), k, self.n_mels)
         return mel[..., lead:T]
+
+    def null_branch(self, cp: Tensor, spk: Tensor, tokens: Tensor | None, guide: str = "text"
+                    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """The inputs of a guided generation, the conditional rows and then the null ones: the condition inputs
+        ``[2 B, S, *]``, the speaker rows ``[2 B]`` and the tokens ``[2 B, K, dim]`` (``None`` without a reference
+        encoder). The null rows are without what ``guide`` names: ``text`` (a zero condition), ``voice`` (the
+        prompted row and the null tokens: no voice) or ``both``."""
+        if guide not in ("text", "voice", "both"):
+            raise ValueError(f"guide: {guide!r} (text, voice or both)")
+        cp_null = cp if guide == "voice" else torch.zeros_like(cp)
+        spk_null, tok_null = spk, tokens
+        if guide != "text":
+            spk_null = torch.full_like(spk, self.prompt_row)
+            tok_null = None if tokens is None else self.ref_enc.null_tokens(tokens.shape[0]).to(tokens.dtype)
+        return (torch.cat([cp, cp_null]), torch.cat([spk, spk_null]),
+                None if tokens is None else torch.cat([tokens, tok_null]))
 
     def step_static(self, prev: Tensor, cpatch: Tensor, spk: Tensor, pos: Tensor, caches: list[tuple[Tensor, Tensor]],
                     mu: Tensor, z: Tensor, cfg: Tensor | None = None, level: Tensor | None = None) -> Tensor:
@@ -688,21 +704,21 @@ class ARGenerator:
     def __call__(self, cond: Tensor, spk: Tensor, temperature: float = 1.0,
                  generator: torch.Generator | None = None, cfg_scale: float = 1.0, prefix: Tensor | None = None,
                  prefix_cond: Tensor | None = None, tokens: Tensor | None = None,
-                 history_noise: float = 0.0) -> Tensor:
+                 history_noise: float = 0.0, guide: str = "text") -> Tensor:
         """As :meth:`ARDriftTTS.generate`: aligned condition ``[B, C, T]`` -> mel ``[B, n_mels, T]``."""
         m = self.model
         T = cond.shape[-1]
         if not self.fits(T, 0 if prefix_cond is None else prefix_cond.shape[-1]):
             return m.generate(cond, spk, temperature, generator, prefix, cfg_scale, prefix_cond, tokens,
-                              history_noise)
+                              history_noise, guide)
         out = list(self.steps(cond, spk, temperature, generator, cfg_scale, prefix, prefix_cond, tokens,
-                              history_noise))
+                              history_noise, guide))
         return unpatchify(torch.stack(out, 1), m.patch, m.n_mels)[..., :T]
 
     @torch.no_grad()
     def steps(self, cond: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
               cfg_scale: float = 1.0, prefix: Tensor | None = None, prefix_cond: Tensor | None = None,
-              tokens: Tensor | None = None, history_noise: float = 0.0):
+              tokens: Tensor | None = None, history_noise: float = 0.0, guide: str = "text"):
         """Yield the patches ``[B, k * n_mels]`` of ``cond`` one step at a time (streaming); at most ``max_steps``
         with the prefix. ``prefix`` / ``prefix_cond``: as :meth:`ARDriftTTS.generate` (kept leading frames are
         yielded as they are; the steps of a context before ``cond`` run, to fill the caches, but are not yielded).
@@ -720,9 +736,11 @@ class ARGenerator:
         mu = patchify(cond[:, : m.n_mels], m.patch)
         guided = cfg_scale != 1.0
         st = self._buffers(B, cp.shape[-1], guided)
+        tokens = m._tokens(tokens, B)
+        if guided:
+            cp, spk_b, tokens = m.null_branch(cp, spk, tokens, guide)
         if K:  # the reference's tokens: positions 0 .. K - 1 of every layer's cache
-            h = m._tokens(tokens, B).to(st["prev"].dtype)
-            h = torch.cat([h, h]) if guided else h
+            h = tokens.to(st["prev"].dtype)
             for blk, (kc, vc) in zip(m.blocks, st["caches"]):
                 cache: dict = {}
                 h = blk(h, cache)
@@ -730,8 +748,7 @@ class ARGenerator:
                 vc[:, :, :K].copy_(cache["v"])
         st["prev"].copy_(m.spread(m.bos).expand(B, -1))
         if guided:
-            cp = torch.cat([cp, torch.zeros_like(cp)])
-            st["spk"].copy_(torch.cat([spk, spk]))
+            st["spk"].copy_(spk_b)
             st["cfg"].fill_(cfg_scale)
         else:
             st["spk"].copy_(spk)
