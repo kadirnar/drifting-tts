@@ -141,6 +141,16 @@ def test_training_step_with_references_trains_the_reference_path():
     assert m.prompt_enc.out.weight.grad.abs().sum() > 0 and m.ref_enc.vec.weight.grad.abs().sum() > 0
     plain = training_step(m, _batch(), both, "cpu", tau)[1]
     assert plain["referenced"] == 0.0 and torch.isfinite(plain["loss"])
+    # a voice without a row: cut whenever it can be when it has no reference; with one, the prompt is drawn as for
+    # any voice, so that the reference alone is trained on those voices too
+    b = _ref_batch()
+    b["spk"] = torch.tensor([-1, -1])
+    half = both.to_dict()
+    half["drift"]["prompt"]["prob"] = 0.0
+    torch.manual_seed(0)
+    metrics = training_step(m, b, Config(half), "cpu", tau)[1]
+    assert metrics["prompted"] == 0.5 and metrics["referenced"] == 0.5 and metrics["ref_only"] == 0.5
+    assert metrics["id_dropped"] == 1.0 and metrics["no_voice"] == 0.0
 
 
 def test_synthesis_from_a_reference_and_from_both():

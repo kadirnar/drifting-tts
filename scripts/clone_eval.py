@@ -96,6 +96,9 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=6.0, help="the prompt: this much of the recording's beginning")
     ap.add_argument("--reference-seconds", type=float, default=10.0, help="what the reference encoder reads")
     ap.add_argument("--f0", action="store_true", help="F0 spread of every utterance (WORLD harvest, on the CPU)")
+    ap.add_argument("--cfg", type=float, default=1.0, help="guidance scale of the generated systems (#99)")
+    ap.add_argument("--guide", default="text", choices=("text", "voice", "both"),
+                    help="what the null branch of --cfg is without (a model trained with drift.voice_dropout)")
     ap.add_argument("--num", type=int, default=0, help="first N speakers (0: all)")
     ap.add_argument("--save-wavs", type=int, default=0, help="keep the audio of the first N speakers")
     ap.add_argument("--device", default="cuda")
@@ -113,6 +116,7 @@ def main() -> None:
     manifest = json.loads(Path(args.manifest).read_text())
     speakers = list(manifest)[: args.num or None]
     synth = Synthesizer(args.model, args.device, vocoder=args.vocoder)
+    synth.guidance = args.guide
     sv = SpeakerEmbedder("wavlm-large-ecapa", args.device)
     asr = WhisperASR("large-v3", args.device, language=synth.language or "tr")
     table = None
@@ -148,13 +152,14 @@ def main() -> None:
                     with torch.no_grad():
                         if system in ("nearest", "id"):
                             row = near if system == "nearest" else int(entry["speaker_id"])
-                            wav = synth(target["text"], speaker=row, temperature=args.temperature, seed=seed)[0]
+                            wav = synth(target["text"], speaker=row, temperature=args.temperature, seed=seed,
+                                        cfg_scale=args.cfg)[0]
                         elif system == "prefix":
                             wav = continue_prompt(synth, prompt_mel, entry["prompt"]["text"], target["text"], near,
                                                   args.temperature, seed)
                         else:
                             wav = synth(target["text"], ref_audio=refs[system], temperature=args.temperature,
-                                        seed=seed)[0]
+                                        seed=seed, cfg_scale=args.cfg)[0]
                     wav = wav.float().cpu().flatten()
                     if n < args.save_wavs:
                         sf.write(args.out / f"{system}_{spk}_{t}.wav", wav.numpy(), synth.sample_rate)
@@ -173,7 +178,8 @@ def main() -> None:
     rows = [r for r in rows if r["speaker"] in speakers]
     summary = {s: summarize([r for r in rows if r["system"] == s]) for s in dict.fromkeys(r["system"] for r in rows)}
     (args.out / "summary.json").write_text(json.dumps({"model": args.model, "manifest": args.manifest,
-                                                       "seconds": args.seconds, "systems": summary}, indent=1))
+                                                       "seconds": args.seconds, "cfg": args.cfg,
+                                                       "guide": args.guide, "systems": summary}, indent=1))
     lines = ["| system | SIM-o | 95% | WER | 95% | F0 std (st) | items |", "|---|---|---|---|---|---|---|"]
     for s, r in summary.items():
         f0 = f"{r['f0_std']:.2f}" if "f0_std" in r else "–"

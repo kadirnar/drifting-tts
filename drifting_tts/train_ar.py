@@ -307,15 +307,17 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         with amp:
             tokens, ref_vec = model.reference_tokens(ref, ref_len, has_ref)
     if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
+        # a voice without a row is cut whenever it can be, unless it has a reference: then the reference alone
+        # is one of its conditions too (with a prompt always, the reference would never be read without one)
         cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
-                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown, no_voice)
+                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown & ~has_ref, no_voice)
         text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
         dropped = cut["dropped"]
     if has_ref.any():  # a reference alone: its own draw of the speaker-ID dropout
         p_id = float((dc.get("reference") or {}).get("id_dropout", 0.5))
-        dropped = dropped | (has_ref & (lead == 0) & ((torch.rand(B, device=device) < p_id) | unknown))
+        dropped = dropped | (has_ref & (lead == 0) & (torch.rand(B, device=device) < p_id))
     if prompting or referencing:
-        dropped = dropped | no_voice
+        dropped = dropped | (unknown & ((lead > 0) | has_ref)) | no_voice  # a voice without a row never keeps one
         spk_emb = model.encoder.spk(torch.where(no_voice, torch.full_like(spk, model.prompt_row), spk))
         if prompting:
             with amp:
@@ -431,6 +433,7 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
             metrics["no_row"] = unknown.float().mean()
         if referencing:
             metrics["referenced"] = has_ref.float().mean()
+            metrics["ref_only"] = (has_ref & (lead == 0) & dropped).float().mean()  # the reference is the voice
             metrics["no_voice"] = ((unknown | no_voice) & ~has_ref & (lead == 0)).float().mean()
         if detail:
             metrics.update({kk: v for kk, v in info.items()
