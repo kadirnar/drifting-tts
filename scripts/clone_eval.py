@@ -108,9 +108,14 @@ def main() -> None:
             ap.error("nearest / prefix need --speaker-embeddings")
         table = torch.load(args.speaker_embeddings).float()
     args.out.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
+    saved = args.out / "rows.json"
+    rows: list[dict] = json.loads(saved.read_text()) if saved.exists() else []  # an interrupted run goes on
+    done = {(r["system"], r["speaker"], r["target"]) for r in rows}
     for n, spk in enumerate(speakers):
         entry = manifest[spk]
+        if all((s, spk, t) in done for s in args.systems for t in range(len(entry["targets"]))):
+            continue
+        rows = [r for r in rows if r["speaker"] != spk or r["system"] not in args.systems]
         prompt_path = root / entry["prompt"]["file"]
         ref_emb = sv(load16(prompt_path)).float().cpu()
         near = None if table is None else int((table @ ref_emb).argmax())
@@ -144,9 +149,10 @@ def main() -> None:
                 sim = float(sv(w16).float().cpu() @ ref_emb)
                 rows.append({"system": system, "speaker": spk, "target": t, "sim": sim, "nearest": near,
                              **error_counts(ref_text, hyp)})
-        (args.out / "rows.json").write_text(json.dumps(rows))
+        saved.write_text(json.dumps(rows))
         print(f"{n + 1} / {len(speakers)} speakers", flush=True)
-    summary = {s: summarize([r for r in rows if r["system"] == s]) for s in args.systems}
+    rows = [r for r in rows if r["speaker"] in speakers]
+    summary = {s: summarize([r for r in rows if r["system"] == s]) for s in dict.fromkeys(r["system"] for r in rows)}
     (args.out / "summary.json").write_text(json.dumps({"model": args.model, "manifest": args.manifest,
                                                        "seconds": args.seconds, "systems": summary}, indent=1))
     lines = ["| system | SIM-o | 95% | WER | 95% | items |", "|---|---|---|---|---|---|"]

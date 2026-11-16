@@ -367,6 +367,14 @@ utterances the WER is 1.52% against 1.36%, most of the difference Whisper's spel
 to a pause. Letters sampled at temperature 1 cost words (4.94%) and 0.1 to 0.2 on UTMOS22 and SCOREQ. No predicted
 MOS rewards the rhythm; they fall with the length of the silences, in recordings too.
 
+**Voices from a prompt (#95, [ENGLISH.md](ENGLISH.md#voices-from-a-prompt-95)).** Kyutai's recipe on mel patches: an
+utterance is cut at a word, its beginning is history without a text condition, and for half of the prompted
+utterances the speaker row is dropped. A pilot of 8,000 steps from the released English model: for the corpus's
+voices a 6 s recording gives SIM-o 0.68 without the speaker row (0.74 with it); for 36 recorded speakers never heard
+(LibriTTS-R) 0.435, against 0.656 for their own recordings, 0.153 for another speaker's, 0.308 for the nearest
+training speaker and 0.415 for that speaker continuing the prompt under its transcript (at twice the WER). Flat
+after 4,000 steps on unseen voices: the limit is 4,000 synthetic training voices and no recorded speech (#104).
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**

@@ -161,3 +161,15 @@ def test_train_ar_with_prompts_from_a_plain_checkpoint_and_ref_audio(tmp_path):
     plain = Synthesizer(base / "model_ema.pt", "cpu", vocoder="griffin-lim")
     with pytest.raises(ValueError, match="prompts"):
         plain.reference(tmp_path / "a.wav")
+
+    # scripts/clone_eval.py: a model without prompts continues a recording under its transcript (the baseline)
+    from scripts.clone_eval import continue_prompt, summarize
+
+    plain.vocoder.model.n_iter = 2
+    mel = plain.reference_mel(tmp_path / "a.wav")
+    assert mel.shape[-1] % plain.model.patch == 0
+    wav = continue_prompt(plain, mel, "merhaba", "dünya nasılsın", 0, 0.5, seed=1)
+    assert wav.numel() > 0 and torch.isfinite(wav).all()
+    assert torch.equal(continue_prompt(plain, mel, "merhaba", "dünya nasılsın", 0, 0.5, seed=1), wav)
+    r = summarize([{"sim": 0.5, "word_errors": 1, "words": 10}, {"sim": 0.7, "word_errors": 0, "words": 10}])
+    assert r["items"] == 2 and abs(r["sim"] - 0.6) < 1e-9 and r["wer"] == 0.05
