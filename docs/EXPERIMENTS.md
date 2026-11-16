@@ -382,6 +382,18 @@ synthetic voices (0.678 from a prompt, 0.731 by row). Also from #104: `data.filt
 utterance fails) and the stream reports the rows it skips for unknown speakers. Not done here: scoring the 10k-h
 corpus, more Turkish speakers, restoring tr-dataset-12 (no access to the Turkish data).
 
+**A reference from another utterance (#96, [ENGLISH.md](ENGLISH.md#a-reference-from-another-utterance-96)).** A
+second voice path beside the prompt: a crop of another utterance of the speaker in front of the sequence. A
+Perceiver resampler (32 new tokens, as XTTS) did not train in two fine-tunes of 6,000 steps (reference alone:
+SIM-o 0.23 on unseen speakers, with a tenth or with 45% of the utterances depending on it): teacher-forced, the
+backbone reads the voice from the utterance's own history, and new tokens get little gradient. The reference's
+own patches as tokens that start as what a prompt looks like (VoxCPM2's layout, a zero-initialised correction on
+top) give the prompt's similarity before any training and after 6,000 steps: reference alone 0.43, prompt 0.546,
+both 0.555 (control: 0.538). Against a recording of the speaker that the model was never given, the prompt is
+0.462 and the prompt with a reference from another recording 0.483 (+0.021, 95% +0.012 to +0.031): 0.08 of a
+prompt's SIM-o is the recording's conditions, and a second recording adds voice. Lesson: a new conditioning path
+into a pretrained autoregressive backbone has to start from something the backbone already reads.
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**

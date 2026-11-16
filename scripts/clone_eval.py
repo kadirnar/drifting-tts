@@ -22,6 +22,11 @@ Systems (``--systems``):
 
 ``--f0``: the spread of the generated F0 (semitones) beside the similarity and the WER, the guard of #96.
 
+Two similarities. ``SIM-o`` is with the prompt recording, the usual one; a prompt is continued by the model, so it
+also rewards a copy of that recording's conditions. ``SIM (unheard)`` is with a recording of the speaker that the
+model was not given (neither the prompt, nor the reference of ``--reference-from other``, nor the target's own): the
+voice alone. Reported where a speaker has at least three target recordings.
+
     python scripts/clone_eval.py --model runs/ar_en_prompt/model_ema.pt \
         --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt --manifest data/clone_eval/libritts_r/manifest.json \
         --systems recording other prompt --out outputs/clone/prompt
@@ -81,6 +86,9 @@ def summarize(rows: list[dict]) -> dict:
     f0 = [r["f0_std"] for r in rows if r.get("f0_std") is not None and np.isfinite(r["f0_std"])]
     if f0:
         out["f0_std"] = float(np.mean(f0))
+    unheard = [r["sim_spk"] for r in rows if r.get("sim_spk") is not None]
+    if unheard:
+        out["sim_spk"], out["sim_spk_ci"] = float(np.mean(unheard)), bootstrap_ci(unheard)
     return out
 
 
@@ -138,6 +146,8 @@ def main() -> None:
         rows = [r for r in rows if r["speaker"] != spk or r["system"] not in args.systems]
         prompt_path = root / entry["prompt"]["file"]
         ref_emb = sv(load16(prompt_path)).float().cpu()
+        files = [t.get("file") for t in entry["targets"]]  # the speaker's other recordings, for SIM (unheard)
+        heard = {i: sv(load16(root / f)).float().cpu() for i, f in enumerate(files) if f} if len(files) >= 3 else {}
         near = None if table is None else int((table @ ref_emb).argmax())
         def voice(system: str, t: int):
             """The voice of target ``t``: the prompt recording, and for the reference encoder with
@@ -182,9 +192,12 @@ def main() -> None:
                 lang = synth.language or "tr"
                 text = other["targets"][t % len(other["targets"])]["text"] if system == "other" else target["text"]
                 ref_text, hyp = _plain(text, lang), _plain(asr(w16), lang)
-                sim = float(sv(w16).float().cpu() @ ref_emb)
-                row = {"system": system, "speaker": spk, "target": t, "sim": sim, "nearest": near,
+                emb = sv(w16).float().cpu()
+                row = {"system": system, "speaker": spk, "target": t, "sim": float(emb @ ref_emb), "nearest": near,
                        **error_counts(ref_text, hyp)}
+                third = (t + 2) % len(files)  # not the target's recording, not the reference of the next target's
+                if third in heard and system != "other":
+                    row["sim_spk"] = float(emb @ heard[third])
                 if args.f0:
                     row["f0_std"] = f0_statistics(f0_contour(w16.astype(np.float64), 16000)).get("f0_std")
                 rows.append(row)
@@ -196,11 +209,14 @@ def main() -> None:
                                                        "seconds": args.seconds, "cfg": args.cfg,
                                                        "reference_from": args.reference_from,
                                                        "guide": args.guide, "systems": summary}, indent=1))
-    lines = ["| system | SIM-o | 95% | WER | 95% | F0 std (st) | items |", "|---|---|---|---|---|---|---|"]
+    lines = ["| system | SIM-o | 95% | SIM (unheard) | 95% | WER | 95% | F0 std (st) | items |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for s, r in summary.items():
         f0 = f"{r['f0_std']:.2f}" if "f0_std" in r else "–"
-        lines.append(f"| {s} | {r['sim']:.3f} | {r['sim_ci'][0]:.3f}-{r['sim_ci'][1]:.3f} | {100 * r['wer']:.2f}% | "
-                     f"{100 * r['wer_ci'][0]:.2f}-{100 * r['wer_ci'][1]:.2f} | {f0} | {r['items']} |")
+        un = f"{r['sim_spk']:.3f} | {r['sim_spk_ci'][0]:.3f}-{r['sim_spk_ci'][1]:.3f}" if "sim_spk" in r else "– | –"
+        lines.append(f"| {s} | {r['sim']:.3f} | {r['sim_ci'][0]:.3f}-{r['sim_ci'][1]:.3f} | {un} | "
+                     f"{100 * r['wer']:.2f}% | {100 * r['wer_ci'][0]:.2f}-{100 * r['wer_ci'][1]:.2f} | {f0} | "
+                     f"{r['items']} |")
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
