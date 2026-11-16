@@ -16,6 +16,9 @@ predictions. Three training objectives share the network (``kind``):
   (:func:`prosody_features`), one positive (the recording's prosody) and ``G`` samples per utterance;
 * ``mse``: no noise, regression (the deterministic status quo with the same backbone);
 * ``flow``: conditional flow matching on the residual, a few Euler steps at inference.
+
+A model without token pitch (ARDrift generates its own intonation) gets a duration-only sampler (``duration_only``,
+#100): the same network and feature maps with the pitch channel held at zero, so only the rhythm is sampled.
 """
 
 from __future__ import annotations
@@ -27,15 +30,23 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..text import BLANK_ID, PUNCTUATION, SYMBOL_TO_ID, SYMBOLS
+from ..text import BLANK_ID, PUNCTUATION, SYMBOL_TO_ID, frontend
 from .text_encoder import EncoderLayer
 
 KINDS = ("drift", "mse", "flow")
 # what ProsodyPredictor.load reads: a published checkpoint keeps only these (export_checkpoint)
 CHECKPOINT_KEYS = ("ema", "stats", "net_cfg", "cond_dim", "duration_scales", "temperature", "flow_steps",
-                   "tts_fingerprint", "pause_edges", "duration_temperature", "rhythm")
-SPACE_ID = SYMBOL_TO_ID[" "]
+                   "tts_fingerprint", "pause_edges", "duration_temperature", "rhythm", "duration_scale", "language",
+                   "durations")
+SPACE_ID = SYMBOL_TO_ID[" "]  # the Turkish frontend's; another language's: :func:`punctuation_ids`
 PUNCT_IDS = [SYMBOL_TO_ID[c] for c in PUNCTUATION if c != " "]
+
+
+def punctuation_ids(language: str | None = None) -> tuple[int, list[int]]:
+    """The space id and the punctuation ids of a language's frontend (``None``: Turkish). Every frontend has its own
+    letters, so the same character has another id in each."""
+    table = frontend(language).SYMBOL_TO_ID
+    return table[" "], [table[c] for c in PUNCTUATION if c != " "]
 
 
 class ProsodyStats(nn.Module):
@@ -59,11 +70,13 @@ class ProsodyStats(nn.Module):
         return y[..., 0, :] * s[0, 1] + s[0, 0], y[..., 1, :] * s[1, 1] + s[1, 0]
 
 
-def boundary_tokens(ids: Tensor) -> Tensor:
+def boundary_tokens(ids: Tensor, language: str | None = None) -> Tensor:
     """Tokens between words ``[..., N]`` bool: spaces, punctuation and the blanks next to them. A pause between words
-    lives in their durations; the letters' durations (a character and the blank after it) are the articulation."""
-    mark = ids == SPACE_ID
-    for i in PUNCT_IDS:
+    lives in their durations; the letters' durations (a character and the blank after it) are the articulation.
+    ``language``: the frontend the ids come from (:func:`punctuation_ids`)."""
+    space, punct = punctuation_ids(language)
+    mark = ids == space
+    for i in punct:
         mark = mark | (ids == i)
     left, right = F.pad(mark, (1, 0))[..., :-1], F.pad(mark, (0, 1))[..., 1:]
     return mark | ((ids == BLANK_ID) & (left | right))
@@ -76,9 +89,9 @@ def edge_tokens(lengths: Tensor, n: int, first: int = 3, last: int = 2) -> Tenso
     return (pos < first) | ((pos >= lengths[:, None] - last) & (pos < lengths[:, None]))
 
 
-def word_index(ids: Tensor) -> Tensor:
+def word_index(ids: Tensor, language: str | None = None) -> Tensor:
     """Token ids ``[B, N]`` -> word index ``[B, N]`` (words are separated by space tokens)."""
-    return torch.cumsum((ids == SPACE_ID).long(), 1)
+    return torch.cumsum((ids == punctuation_ids(language)[0]).long(), 1)
 
 
 def sentence_tokens(ids: Tensor, lengths: Tensor, boundary: bool = False) -> Tensor:
@@ -100,21 +113,21 @@ def sentence_tokens(ids: Tensor, lengths: Tensor, boundary: bool = False) -> Ten
 
 
 def pause_durations(sampled: Tensor, logw: Tensor, ids: Tensor, x_mask: Tensor,
-                    regressor_scale: float | Tensor) -> Tensor:
+                    regressor_scale: float | Tensor, language: str | None = None) -> Tensor:
     """``prosody_durations="pauses"``: the sampled frames ``[B, N]`` of the tokens between words
     (:func:`boundary_tokens`: the pauses and phrase breaks), the regressors' of the letters,
     ``ceil(exp(logw) * regressor_scale)`` as in :func:`~drifting_tts.models.text_encoder.durations_to_alignment`.
     ``logw`` ``[B, 1, N]``, ``x_mask`` ``[B, 1, N]``."""
     letters = torch.ceil(torch.exp(logw[:, 0]) * regressor_scale)
-    return torch.where(boundary_tokens(ids), sampled, letters) * x_mask[:, 0]
+    return torch.where(boundary_tokens(ids, language), sampled, letters) * x_mask[:, 0]
 
 
 def floor_letters(frames: Tensor, ids: Tensor, min_frames: float = 0.0, rel: float = 0.0,
-                  ref_frames: Tensor | None = None) -> Tensor:
+                  ref_frames: Tensor | None = None, language: str | None = None) -> Tensor:
     """Raise short letters: a letter (a character token and the blank after it) gets at least ``min_frames`` frames
     and at least ``rel`` times its ``ref_frames`` (e.g. the regressors' durations, same shape as ``frames``); the
     missing frames go to the character token. ``frames`` / ``ids`` ``[B, N]``."""
-    table = torch.tensor([len(c) == 1 and c.isalpha() for c in SYMBOLS], device=ids.device)
+    table = torch.tensor([len(c) == 1 and c.isalpha() for c in frontend(language).SYMBOLS], device=ids.device)
     letter = table[ids]
     total = frames + F.pad(frames[:, 1:], (0, 1))
     need = torch.full_like(frames, float(min_frames))
@@ -219,8 +232,12 @@ class ProsodyNet(nn.Module):
     def __init__(self, cond_dim: int, kind: str = "drift", d: int = 256, layers: int = 4, heads: int = 4,
                  ffn: int = 1024, dropout: float = 0.0, noise_tok: int = 16, noise_glob: int = 32,
                  out_init: float = 0.1, word_dim: int = 0, word_model: str | None = None, sent_dim: int = 0,
-                 ctx_pitch_only: bool = False, pitch_layers: int = 2, ctx_boundaries: bool = False):
-        """``word_dim`` / ``sent_dim``: contextual word features (:mod:`drifting_tts.word_features`) and sentence
+                 ctx_pitch_only: bool = False, pitch_layers: int = 2, ctx_boundaries: bool = False,
+                 duration_only: bool = False):
+        """``duration_only``: the pitch residual is held at zero and every token is unvoiced (a TTS model without
+        token pitch; ``drift`` and ``mse`` only).
+
+        ``word_dim`` / ``sent_dim``: contextual word features (:mod:`drifting_tts.word_features`) and sentence
         features (:mod:`drifting_tts.sentence_features`), appended to ``cond`` in that order. ``ctx_pitch_only``:
         they bypass the trunk, which predicts the log-duration alone, and enter ``pitch_layers`` more layers on top
         of it that predict the pitch and the voicing, so the durations do not depend on them. ``ctx_boundaries``
@@ -229,6 +246,9 @@ class ProsodyNet(nn.Module):
         super().__init__()
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+        if duration_only and kind == "flow":
+            raise ValueError("a duration-only prosody predictor is trained with kind drift or mse")
+        self.duration_only = bool(duration_only)
         self.kind, self.noise_tok, self.noise_glob, self.word_dim = kind, noise_tok, noise_glob, word_dim
         self.sent_dim, self.cond_dim = sent_dim, cond_dim
         self.ctx_pitch_only = bool(ctx_pitch_only and word_dim + sent_dim > 0)
@@ -283,7 +303,7 @@ class ProsodyNet(nn.Module):
                 x = x + self.glob[i + 1](g)[:, None] * m
             x = layer(x, m)
         if ctx is None:
-            return (self.out(self.norm(x)) * m).transpose(1, 2)
+            return self._channels((self.out(self.norm(x)) * m).transpose(1, 2))
         xp = x + self.ctx_in(ctx * mask).transpose(1, 2) * m
         for i, layer in enumerate(self.players):
             if g is not None:
@@ -293,7 +313,14 @@ class ProsodyNet(nn.Module):
         if self.ctx_boundaries:  # durations between words from the context branch
             ld = torch.where(ctx[:, -1:].transpose(1, 2) > 0.5, pv[..., :1], ld)
             pv = pv[..., 1:]
-        return (torch.cat([ld, pv], -1) * m).transpose(1, 2)
+        return self._channels((torch.cat([ld, pv], -1) * m).transpose(1, 2))
+
+    def _channels(self, out: Tensor) -> Tensor:
+        """``[B, 3, N]`` as it is, or with ``duration_only`` the log-duration residual alone: no pitch residual, a
+        voicing logit far below zero."""
+        if not self.duration_only:
+            return out
+        return torch.cat([out[:, :1], torch.zeros_like(out[:, 1:2]), torch.full_like(out[:, 2:], -30.0)], 1)
 
 
 class ProsodyPredictor(nn.Module):
@@ -304,7 +331,12 @@ class ProsodyPredictor(nn.Module):
         self.net_cfg = dict(net_cfg)
         self.net = ProsodyNet(cond_dim, **self.net_cfg)
         self.stats = ProsodyStats(self.net.word_dim)
+        self.language: str | None = None  # the frontend of the TTS model it was trained on (None: Turkish)
         self.duration_scales: dict[int, float] = {}
+        self.duration_scale = 1.0  # the factor of a speaker without one of its own (calibrate.speakers: all)
+        # preferred duration source of Synthesizer(prosody_durations=None): sampled | pauses | regressor
+        # (calibrate.durations; None: sampled)
+        self.durations: str | None = None
         self.temperature: float | None = None  # preferred prosody temperature (train-prosody --calibrate-only)
         # preferred noise temperature of the sampled letters' durations (None: the prosody temperature; the pauses keep
         # the prosody temperature either way); train-prosody --calibrate-only calibrate.duration_temperature
@@ -320,6 +352,10 @@ class ProsodyPredictor(nn.Module):
     def kind(self) -> str:
         return self.net.kind
 
+    def scale(self, speaker: int) -> float:
+        """The duration factor of a speaker: recorded / sampled length (``calibrate``), its own or the common one."""
+        return self.duration_scales.get(int(speaker), self.duration_scale)
+
     @staticmethod
     def condition(tts, h: Tensor, x_mask: Tensor, spk: Tensor, logw_det: Tensor, stats: ProsodyStats,
                   word_tok: Tensor | None = None, sent_tok: Tensor | None = None) -> Tensor:
@@ -327,10 +363,14 @@ class ProsodyPredictor(nn.Module):
         ``[B, C, N]``.
 
         ``word_tok``: contextual word features broadcast to the tokens ``[B, word_dim, N]`` (standardised here);
-        ``sent_tok``: sentence features ``[B, sent_dim, N]`` (:meth:`sent_tokens`, used as they are)."""
+        ``sent_tok``: sentence features ``[B, sent_dim, N]`` (:meth:`sent_tokens`, used as they are). A model
+        without a pitch regressor (ARDrift) gives a zero pitch channel."""
         s = tts.encoder.spk(spk)[:, :, None].expand(-1, -1, h.shape[-1])
-        pitch_det = tts.pitch_predictor(torch.cat([h, s], 1), x_mask)
-        base = stats.norm(logw_det[:, 0], pitch_det[:, 0]) * x_mask
+        if getattr(tts, "pitch_enabled", False):
+            pitch_det = tts.pitch_predictor(torch.cat([h, s], 1), x_mask)[:, 0]
+        else:
+            pitch_det = torch.zeros_like(logw_det[:, 0])
+        base = stats.norm(logw_det[:, 0], pitch_det) * x_mask
         parts = [h, s, base]
         if word_tok is not None:
             parts.append((word_tok - stats.wfeat[0, :, None]) / stats.wfeat[1, :, None])
@@ -357,7 +397,7 @@ class ProsodyPredictor(nn.Module):
             self._word_encoder = WordEncoder(self.net_cfg["word_model"], str(text.device))
         texts = [ids_to_text(text[b, : int(text_len[b])].tolist()) for b in range(text.shape[0])]
         feats = self._word_encoder(texts)
-        word = word_index(text)
+        word = word_index(text, self.language)
         out = torch.zeros(text.shape[0], text.shape[1], self.net.word_dim, device=text.device)
         for b, f in enumerate(feats):
             out[b] = f.to(text.device)[word[b].clamp_max(f.shape[0] - 1)]
@@ -469,7 +509,7 @@ class ProsodyPredictor(nn.Module):
         if duration_speaker is not None:
             hd, _, logwd, _ = tts.encoder(text, text_len, duration_speaker)
             dcond = self.condition(tts, hd, x_mask, duration_speaker, logwd, self.stats, words, sents)
-        dmask = ~boundary_tokens(text) if duration_speaker is None else None  # the pauses keep the first row's
+        dmask = ~boundary_tokens(text, self.language) if duration_speaker is None else None  # the pauses keep theirs
         y, vlogit = self.sample(cond, base, x_mask, temperature, generator=generator, spread=spread,
                                 duration_temperature=duration_temperature, duration_cond=dcond, duration_mask=dmask)
         frames, pitch = self.frames_and_pitch(y, vlogit, x_mask, length_scale)
@@ -478,9 +518,9 @@ class ProsodyPredictor(nn.Module):
             frames = torch.where(edge_tokens(text_len, text.shape[1]), own, frames) * x_mask[:, 0]
         if min_letter_frames or rel_letter_floor:
             ref = torch.exp(logw[:, 0]) * length_scale
-            frames = floor_letters(frames, text, min_letter_frames, rel_letter_floor, ref) * x_mask[:, 0]
+            frames = floor_letters(frames, text, min_letter_frames, rel_letter_floor, ref, self.language) * x_mask[:, 0]
         if regressor_scale is not None:
-            frames = pause_durations(frames, logw, text, x_mask, regressor_scale)
+            frames = pause_durations(frames, logw, text, x_mask, regressor_scale, self.language)
         return frames, pitch
 
     @classmethod
@@ -505,6 +545,9 @@ class ProsodyPredictor(nn.Module):
         p.net.load_state_dict(ck["ema"])
         p.stats.load_state_dict(ck["stats"])
         p.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}
+        p.duration_scale = float(ck.get("duration_scale", 1.0))
+        p.language = ck.get("language")
+        p.durations = ck.get("durations")
         p.temperature = ck.get("temperature")
         p.duration_temperature = ck.get("duration_temperature")
         p.rhythm = {int(k): int(v) for k, v in (ck.get("rhythm") or {}).items()}
@@ -515,12 +558,13 @@ class ProsodyPredictor(nn.Module):
 
 def tts_fingerprint(tts) -> str:
     """Short hash of the weights a prosody predictor is conditioned on: the text encoder (with the duration
-    predictor and speaker table) and the token pitch predictor of a :class:`DriftingTTS`."""
+    predictor and speaker table) and, where the model has one, the token pitch predictor."""
     import hashlib
 
     h = hashlib.sha256()
-    state = {**{f"encoder.{k}": v for k, v in tts.encoder.state_dict().items()},
-             **{f"pitch_predictor.{k}": v for k, v in tts.pitch_predictor.state_dict().items()}}
+    state = {f"encoder.{k}": v for k, v in tts.encoder.state_dict().items()}
+    if getattr(tts, "pitch_enabled", False):
+        state.update({f"pitch_predictor.{k}": v for k, v in tts.pitch_predictor.state_dict().items()})
     for name in sorted(state):
         h.update(name.encode())
         h.update(state[name].detach().float().cpu().contiguous().numpy().tobytes())

@@ -320,3 +320,88 @@ def test_pause_durations_sample_only_the_tokens_between_words():
     torch.testing.assert_close(mixed[gap], sampled[gap])
     torch.testing.assert_close(mixed[~gap], torch.ceil(torch.exp(logw[:, 0]) * 0.8)[~gap])
     torch.testing.assert_close(pause_durations(sampled, logw, ids, x_mask, 0.8), mixed)
+
+
+def test_duration_only_sampler_for_a_model_without_token_pitch(tmp_path):
+    """#100: ARDrift has no token pitch. prosody-cache stores its MAS durations alone, train-prosody trains a
+    duration-only predictor on its text encoder, and the Synthesizer samples the rhythm with it: another seed gives
+    other durations, the intonation stays the autoregressive model's own."""
+    import pytest
+
+    from drifting_tts.cli import main
+    from drifting_tts.synthesize import Synthesizer
+    from drifting_tts.train import load_tts
+    from tests.test_data import _fake_parquet
+
+    _fake_parquet(tmp_path / "x.parquet", n=12)
+    data = tmp_path / "prep"
+    main(["prepare", "--parquet-glob", str(tmp_path / "*.parquet"), "--out", str(data), "--workers", "1",
+          "--val-size", "2", "--no-trim", "--backend", "bigvgan"])  # no --f0: nothing reads it
+    work = tmp_path / "ar"
+    main(["train-ar", "--workdir", str(work), f"data.root={data}", "data.filters={}", "train.cpu=true",
+          "train.steps=1", "train.batch_size=3", "train.num_workers=0", "train.log_every=1", "train.save_every=1",
+          "train.sample_every=0", "train.warmup=1", "drift.gen_per_cond=3", "drift.max_rows=16",
+          "model.ar.dim=32", "model.ar.depth=1", "model.ar.heads=2", "model.ar.head_dim=32", "model.ar.head_depth=1",
+          "model.text.d=16", "model.text.layers=1", "model.text.ffn=32", "model.text.spk_dim=8"])
+    tts_path, cache = work / "model_ema.pt", tmp_path / "cache.pt"
+    main(["prosody-cache", "--model", str(tts_path), "--data", str(data), "--out", str(cache), "--num-workers", "0",
+          "--device", "cpu", "--splits", "train", "val"])
+    c = torch.load(cache, weights_only=False)
+    assert c["lf0_stats"] is None and not c["tokens"]["pitch"].any() and not c["tokens"]["voiced"].any()
+    assert all(int(c["tokens"]["dur"][u["start"]: u["start"] + u["n"]].sum()) == u["frames"] for u in c["utts"])
+    main(["train-prosody", "--workdir", str(tmp_path / "dur"), f"tts={tts_path}", f"cache={cache}", "eval_split=val",
+          "net.d=16", "net.layers=1", "net.heads=2", "net.ffn=32", "net.noise_tok=2", "net.noise_glob=2",
+          "net.out_init=1.0", "drift.gen_per_cond=3", "train.batch_size=2", "train.steps=2", "train.log_every=1",
+          "train.warmup=1", "train.eval_every=2", "train.save_every=2", "train.cpu=true", "eval_temperatures=[1.0]",
+          "calibrate.speakers=all", "calibrate.durations=pauses", "calibrate.temperature=0.5", "loss.voiced=0"])
+    tts, _, _ = load_tts(tts_path)
+    pred = ProsodyPredictor.load(tmp_path / "dur" / "prosody_ema.pt", tts=tts)
+    assert pred.net.duration_only and pred.duration_scales == {} and pred.duration_scale > 0
+    assert pred.scale(0) == pred.scale(1) == pred.duration_scale
+    ids, lens, _ = _batch(["merhaba dünya, nasılsın?"])
+    spk = torch.tensor([0])
+    frames, pitch = pred.predict(tts, ids, lens, spk, generator=torch.Generator().manual_seed(0))
+    other, _ = pred.predict(tts, ids, lens, spk, generator=torch.Generator().manual_seed(1))
+    assert frames.min() >= 1 and not pitch.any() and not torch.equal(frames, other)
+    with pytest.raises(ValueError, match="drift or mse"):
+        ProsodyNet(10, kind="flow", duration_only=True)
+
+    assert pred.durations == "pauses" and pred.temperature == 0.5  # calibrate.*: a Synthesizer's defaults with it
+    default = Synthesizer(tts_path, "cpu", vocoder="griffin-lim", prosody=pred)
+    assert default.prosody_durations == "pauses" and default.prosody_temperature == 0.5
+    synth = Synthesizer(tts_path, "cpu", vocoder="griffin-lim", prosody=pred, prosody_temperature=1.0,
+                        prosody_durations="sampled")
+    synth.vocoder.model.n_iter = 2
+    text = "merhaba dünya, nasılsın?"
+    a, b = synth(text, speaker=0, seed=1)[0], synth(text, speaker=0, seed=2)[0]
+    assert torch.isfinite(a).all() and a.numel() != b.numel()  # the rhythm is sampled
+    assert torch.equal(synth(text, speaker=0, seed=1)[0], a)
+    streamed = torch.cat(list(synth.stream(text, speaker=0, seed=1)))  # streaming samples the same rhythm
+    assert streamed.numel() == a.numel() and streamed.numel() != b.numel()
+    fixed = Synthesizer(tts_path, "cpu", vocoder="griffin-lim")  # the regressor: one rhythm for every seed
+    assert fixed(text, speaker=0, seed=1)[0].numel() == fixed(text, speaker=0, seed=2)[0].numel()
+
+
+def test_token_metrics_count_the_gaps_between_words_and_the_pauses():
+    """The gaps between words (a space or punctuation with the blanks around it) are one group each; a gap of at least
+    ``pause_frames`` frames is a pause; a second seed with other gaps shows in ``div_gap``."""
+    from drifting_tts.train_prosody import ProsodyData, gaps, token_metrics
+
+    ids = np.array(text_to_ids("ab, cd e.", normalized=True))
+    grp = gaps(ids)
+    assert grp.max() == 2 and (grp >= 0).sum() >= 3  # ", " / " " / "." : three gaps
+    n = len(ids)
+    dur = np.full(n, 2.0, dtype=np.float32)
+    dur[grp == 0] = 10.0  # the comma's gap (5 tokens) is long in the recording: a pause
+    data = object.__new__(ProsodyData)
+    zeros = np.zeros(n, dtype=np.float32)
+    data.items = [{"ids": ids, "dur": dur, "pitch": zeros, "voiced": zeros > 0, "pcont": zeros}]
+    flat = np.full((2, n), 2.0, dtype=np.float32)  # a regressor-like rhythm: no pause, the same for both seeds
+    sample = {"frames": flat, "pitch": np.zeros((2, n)), "pcont": np.zeros((2, n)), "voiced": np.zeros((2, n))}
+    m = token_metrics([sample], data)
+    assert m["pauses_gt"] == 1.0 and m["pauses"] == 0.0 and m["div_gap"] == 0.0 and m["gap_std_ratio"] < 0.5
+    varied = flat.copy()
+    varied[0, grp == 0] = 10.0  # one seed pauses at the comma
+    m = token_metrics([{**sample, "frames": varied}], data)
+    assert m["pauses"] == 0.5 and m["div_gap"] > 0
+    assert np.isnan(m["w1_pdev"]) and np.isfinite(m["w1_gap"])  # no voiced tokens: the pitch metrics are undefined

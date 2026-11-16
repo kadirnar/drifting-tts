@@ -8,6 +8,9 @@ with the model's ``data.filters``, plus ``val`` / ``dev``). For every utterance 
   0 for unvoiced tokens) and ``voiced``, the number of voiced frames of the token;
 * ``logw_det`` / ``pitch_det``: the deterministic predictions of the model's duration and pitch regressors.
 
+A model without token pitch (ARDrift, which generates its own intonation: #100) gets the durations only: ``pitch``,
+``voiced`` and ``pitch_det`` are stored as zeros and no F0 is read.
+
 Utterances listed several times in the training split (``merge-data --repeat``) are stored once with their
 ``repeat`` count. The output is one ``torch.save`` file of packed arrays plus a per-utterance index.
 """
@@ -74,14 +77,16 @@ def _batches(frames: list[int], budget: int) -> list[list[int]]:
 def build_cache(model, root: str | Path, splits, filters: dict | None, max_frames: int, min_frames: int,
                 device, batch_frames: int = 40000, num_workers: int = 2, limit: int = 0) -> dict:
     """Run the frozen encoder over ``splits`` of ``root``; see the module docstring for the stored fields."""
-    lf0_mean, lf0_std = (float(v) for v in model.lf0_stats)
+    with_pitch = bool(getattr(model, "pitch_enabled", False))
+    lf0_mean, lf0_std = (float(v) for v in model.lf0_stats) if with_pitch else (0.0, 1.0)
     toks = {k: [] for k in ("ids", "dur", "pitch", "voiced", "logw_det", "pitch_det")}
     utts, start = [], 0
     for split in splits:
         if split == "train":
-            ds = MelDataset(root, split, min_frames=min_frames, max_frames=max_frames, with_f0=True, filters=filters)
+            ds = MelDataset(root, split, min_frames=min_frames, max_frames=max_frames, with_f0=with_pitch,
+                            filters=filters)
         else:
-            ds = MelDataset(root, split, min_frames=1, max_frames=10**9, with_f0=True)
+            ds = MelDataset(root, split, min_frames=1, max_frames=10**9, with_f0=with_pitch)
         repeat = Counter(e["offset"] for e in ds.items)
         seen, unique = set(), []
         for i, e in enumerate(ds.items):
@@ -99,12 +104,15 @@ def build_cache(model, root: str | Path, splits, filters: dict | None, max_frame
             h, mu, logw, x_mask = model.encoder(text, text_len, spk)
             y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
             attn, _ = align(mu, x_mask, y, y_mask)
-            f0 = b["f0"].to(device)
-            pitch = token_pitch(f0, attn, lf0_mean, lf0_std)[:, 0]
-            voiced = torch.bmm(attn, (f0 > 0).float()[:, :, None])[:, :, 0]
             dur = attn.sum(-1)
-            s = model.encoder.spk(spk)[:, :, None].expand(-1, -1, h.shape[-1])
-            pitch_det = model.pitch_predictor(torch.cat([h, s], 1), x_mask)[:, 0]
+            if with_pitch:
+                f0 = b["f0"].to(device)
+                pitch = token_pitch(f0, attn, lf0_mean, lf0_std)[:, 0]
+                voiced = torch.bmm(attn, (f0 > 0).float()[:, :, None])[:, :, 0]
+                s = model.encoder.spk(spk)[:, :, None].expand(-1, -1, h.shape[-1])
+                pitch_det = model.pitch_predictor(torch.cat([h, s], 1), x_mask)[:, 0]
+            else:  # durations only
+                pitch = voiced = pitch_det = torch.zeros_like(dur)
             for j in range(text.shape[0]):
                 n = int(text_len[j])
                 rows[int(b["index"][j])] = {
@@ -132,7 +140,7 @@ def build_cache(model, root: str | Path, splits, filters: dict | None, max_frame
         print(f"{split}: {len(sub)} utterances ({sum(repeat[ds.items[i]['offset']] for i in unique)} with repeats)",
               flush=True)
     packed = {k: torch.from_numpy(np.concatenate(v)) for k, v in toks.items()}
-    return {"tokens": packed, "utts": utts, "lf0_stats": [lf0_mean, lf0_std]}
+    return {"tokens": packed, "utts": utts, "lf0_stats": [lf0_mean, lf0_std] if with_pitch else None}
 
 
 @torch.no_grad()
@@ -166,13 +174,13 @@ def run(args) -> None:
 
     torch.backends.cuda.matmul.allow_tf32 = False
     model, cfg, _ = load_tts(args.model, args.device)
-    if not model.pitch_enabled:
-        raise SystemExit("the prosody cache needs a pitch-conditioned model (model.pitch.enabled)")
+    if not getattr(model, "pitch_enabled", False):
+        print("the model has no token pitch: the cache holds durations only", flush=True)
     d = cfg.data
     root = args.data or d.root
-    cache = build_cache(model, root, args.splits, d.get("filters"), d.max_frames, cfg.drift.crop_frames,
+    cache = build_cache(model, root, args.splits, d.get("filters"), d.max_frames, cfg.drift.get("crop_frames", 1),
                         args.device, args.batch_frames, args.num_workers, args.limit)
-    cache.update(model=str(args.model), data=str(root))
+    cache.update(model=str(args.model), data=str(root), language=getattr(model, "language", None))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(cache, args.out)
     n = cache["tokens"]["ids"].numel()

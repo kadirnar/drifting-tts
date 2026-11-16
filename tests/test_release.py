@@ -164,7 +164,7 @@ def test_from_pretrained_and_cli_release_from_a_local_mirror(tmp_path, monkeypat
     a = pipeline_args(p.parse_args(["--release", "v3.2", "--prosody", "none", "--pause", "0.2"]))
     assert a["prosody"] is None and a["pause"] == 0.2 and a["vocoder"] == "vocos-v2"
     a = pipeline_args(p.parse_args(["--model", "m.pt"]))  # no release: the checkpoint's own defaults (None)
-    assert a == {"model_path": "m.pt", "vocoder": None, "prosody": None, "prosody_durations": "sampled", "pause": 0.15,
+    assert a == {"model_path": "m.pt", "vocoder": None, "prosody": None, "prosody_durations": None, "pause": 0.15,
                  "paragraph": None, "context": False, "temperature": None, "cfg_scale": None,
                  "acoustic_context": None}
     assert pipeline_args(p.parse_args(["--model", "m.pt", "--paragraph"]))["paragraph"] == 180
