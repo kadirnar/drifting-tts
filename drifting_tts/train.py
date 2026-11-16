@@ -548,6 +548,10 @@ def load_tts(path: str | Path, device="cpu") -> tuple[DriftingTTS, Config, dict]
         from .models.ar import ARDriftTTS
 
         model = ARDriftTTS(cfg.model, num_speakers=ck["num_speakers"], n_mels=ck.get("n_mels", 100))
+    elif cfg.model.get("kind") == "ar_prefix":  # ARDrift v2 (#103): the text as a prefix
+        from .models.ar_prefix import ARPrefixTTS
+
+        model = ARPrefixTTS(cfg.model, num_speakers=ck["num_speakers"], n_mels=ck.get("n_mels", 100))
     else:
         model = DriftingTTS(cfg.model, num_speakers=ck["num_speakers"], n_mels=ck.get("n_mels", 100))
     model.load_state_dict(ck["ema"])

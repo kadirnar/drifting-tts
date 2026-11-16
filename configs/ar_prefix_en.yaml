@@ -1,0 +1,31 @@
+# Issue #103: ARDrift v2 in English. The text is a prefix of the sequence ([voice] [text] [audio], Kyutai's), not a
+# forced alignment: no aligner, no duration predictor, no prior mean. The autoregressive model decides the timing and
+# the end of the utterance itself, so rhythm, pauses and intonation are sampled by one model that hears its own
+# output (drifting_tts/models/ar_prefix.py, drifting_tts/train_ar_prefix.py; `drifting-tts train-ar`).
+# The same data, backbone size, head and drifting loss as the aligned model (configs/ar_tts_en_10k.yaml), so the two
+# compare what the issue asks: WER, pauses per utterance, duration spread, F0, at equal steps.
+#   drifting-tts train-ar --config configs/ar_prefix_en.yaml --workdir runs/ar_prefix_en
+# Not run to the end: the aligned model took 200k steps of 48 utterances on an RTX 5090 (11 h), and a model without
+# an alignment needs at least as much before it reads (docs/ENGLISH.md has the pilot on an A10).
+base: ar_tts_en_10k.yaml
+
+model:
+  kind: ar_prefix
+  ar:
+    prompt: true           # a crop of another utterance of the speaker as the [voice] prefix, for a share of them
+    max_seconds_per_char: 0.35   # the bound on a generated utterance's length, should the end head not fire
+
+drift:
+  cond_dropout: 0.1        # utterances without their text (the null branch of guidance)
+  reference:               # the voice prompt: the loader's crop of another utterance of the speaker
+    prob: 0.5
+    id_dropout: 0.5        # share of the prompted utterances whose speaker row is the prompted one
+    min_seconds: 3.0
+    max_seconds: 10.0
+
+loss:
+  eos: 0.1                 # the end-of-utterance head's weight (Kyutai: eos_loss_weight 0.1)
+
+train:
+  eval_every: 10000
+  ema_decays: [0.999, 0.9999]

@@ -482,11 +482,21 @@ def run(args) -> None:
     if ds.language != cfg.model.text.get("language", "tr"):
         raise ValueError(f"{cfg.data.root} is {ds.language!r} text (stats.json), the model's text frontend is "
                          f"{cfg.model.text.get('language', 'tr')!r}: set model.text.language")
-    model = ARDriftTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
-    print(f"ARDrift: text encoder {count_params(model.encoder):.2f}M, backbone "
-          f"{count_params(model) - count_params(model.encoder) - count_params(model.head):.2f}M, head "
-          f"{count_params(model.head):.2f}M; "
-          + ("streamed training data" if cfg.data.get("stream") else f"{len(ds)} training utterances"), flush=True)
+    prefix = cfg.model.get("kind") == "ar_prefix"  # ARDrift v2 (#103): the text as a prefix, no alignment
+    data = "streamed training data" if cfg.data.get("stream") else f"{len(ds)} training utterances"
+    if prefix:
+        from .models.ar_prefix import ARPrefixTTS
+        from .train_ar_prefix import training_step as step_fn
+
+        model = ARPrefixTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
+        print(f"ARDrift v2 (text prefix): backbone {count_params(model) - count_params(model.head):.2f}M, head "
+              f"{count_params(model.head):.2f}M; {data}", flush=True)
+    else:
+        step_fn = training_step
+        model = ARDriftTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
+        print(f"ARDrift: text encoder {count_params(model.encoder):.2f}M, backbone "
+              f"{count_params(model) - count_params(model.encoder) - count_params(model.head):.2f}M, head "
+              f"{count_params(model.head):.2f}M; {data}", flush=True)
     tau = torch.nn.Parameter(torch.tensor(float(cfg.drift.get("tau_init", 1.0)), device=device))
     betas = tuple(tc.get("betas", (0.9, 0.999)))
     opt = torch.optim.AdamW([{"params": list(model.parameters())},
@@ -542,6 +552,8 @@ def run(args) -> None:
     if cfg.drift.get("distill"):  # the guided state into the backbone (#99): the encoder and the head stay as they are
         from .train import load_tts
 
+        if prefix:
+            raise ValueError("drift.distill is for the aligned ARDrift model")
         distill = load_tts(cfg.drift.distill.teacher, device)[0].eval().requires_grad_(False)
         model.encoder.requires_grad_(False)
         model.head.requires_grad_(False)
@@ -566,8 +578,8 @@ def run(args) -> None:
     def evaluate(at: int) -> None:  # every EMA on the held-out objective and on synthesised sentences (#102)
         t = time.time()
         for n, (name, e) in enumerate(emas.items()):
-            res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True,
-                                                                     mae=mae, teacher=teacher)[1], heldout)
+            res = heldout_metrics(lambda b, m=e.model: step_fn(m, b, cfg, device, tau, mel_std, detail=True,
+                                                               mae=mae, teacher=teacher)[1], heldout)
             res.update(audio(e.model))
             record(writer, work, at, name, n == 0, res)
         print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
@@ -597,10 +609,10 @@ def run(args) -> None:
         if distill is not None:
             loss, metrics = distill_step(model, distill, next(it), cfg, device)
         else:
-            loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std, mae=mae, teacher=teacher)
+            loss, metrics = step_fn(model, next(it), cfg, device, tau, mel_std, mae=mae, teacher=teacher)
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gnorm_enc = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)
+        gnorm_enc = 0.0 if prefix else torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)
         gnorm = torch.nn.utils.clip_grad_norm_([p for n, p in model.named_parameters()
                                                 if not n.startswith("encoder.")], tc.grad_clip)
         opt.step()

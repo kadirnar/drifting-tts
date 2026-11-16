@@ -45,9 +45,11 @@ class CausalAttention(nn.Module):
         self.k_norm = RMSNorm(dim // heads)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: Tensor, cache: dict | None = None) -> Tensor:
+    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None) -> Tensor:
         """``x`` ``[B, L, D]``. Without ``cache``: causal attention over the sequence. With ``cache`` (a dict per layer,
-        inference): ``x`` are the next ``L`` positions, appended to the cached keys and values."""
+        inference): ``x`` are the next ``L`` positions, appended to the cached keys and values. ``mask``
+        ``[B, 1, L, L]`` (bool, without a cache): which keys every position may read, in place of the causal
+        triangle (a batch whose rows have padding in front, #103)."""
         B, L, D = x.shape
         q, k, v = self.qkv(x).view(B, L, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
         offset = 0 if cache is None else cache.get("n", 0)
@@ -55,7 +57,7 @@ class CausalAttention(nn.Module):
             assert L == 1, "a cached step takes one position at a time"
         q, k = rope(self.q_norm(q), offset), rope(self.k_norm(k), offset)
         if cache is None:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
         else:
             if "k" in cache:
                 k, v = torch.cat([cache["k"], k], 2), torch.cat([cache["v"], v], 2)
@@ -82,8 +84,8 @@ class Block(nn.Module):
         self.attn = CausalAttention(dim, heads)
         self.mlp = SwiGLU(dim, (int(2 / 3 * dim * mlp_ratio) + 31) // 32 * 32)
 
-    def forward(self, x: Tensor, cache: dict | None = None) -> Tensor:
-        x = x + self.attn(self.norm1(x), cache)
+    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None) -> Tensor:
+        x = x + self.attn(self.norm1(x), cache, mask)
         return x + self.mlp(self.norm2(x))
 
     def step_static(self, x: Tensor, pos: Tensor, kc: Tensor, vc: Tensor, mask: Tensor) -> Tensor:
