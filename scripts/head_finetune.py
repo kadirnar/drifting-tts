@@ -56,7 +56,7 @@ import torch
 from drifting_tts.alignment import sequence_mask
 from drifting_tts.data import MelDataset, collate
 from drifting_tts.drift import feature_drift_loss, feature_energy_loss
-from drifting_tts.models.ar import ar_features, patchify
+from drifting_tts.models.ar import ar_features, mae_features, patchify
 from drifting_tts.models.mae import spectral_detail
 from drifting_tts.models.text_encoder import align
 from drifting_tts.train import load_tts
@@ -96,16 +96,6 @@ def residual_scale(head, rows: dict[str, torch.Tensor], k: int, c: int, samples:
         err = dct2(target.view(-1, k, c)) - dct2(x.view(len(part), samples, k, c)).mean(1)
         sq += err.pow(2).sum(0)
     return (sq / len(idx) / (1 + 1 / samples)).sqrt().clamp_min(1e-4)
-
-
-def mae_features(mae, window: torch.Tensor, frames: int) -> dict[str, torch.Tensor]:
-    """Feature maps of a frozen :class:`~drifting_tts.models.mae2d.MelMAE2d` on mel windows ``[N, c, W]`` at the
-    time columns that cover the last ``frames`` frames: ``{mae_<stage>: [N, L, D]}`` (L: frequency rows x columns)."""
-    W, out = window.shape[-1], {}
-    for name, f in mae.encode(window).items():  # [N, D, F', T']
-        cols = max(1, round(frames * f.shape[-1] / W))
-        out[f"mae_{name}"] = f[..., -cols:].flatten(2).transpose(1, 2).float()
-    return out
 
 
 def kernel_features(x: torch.Tensor, prev: torch.Tensor, k: int, c: int, maps: tuple[str, ...],

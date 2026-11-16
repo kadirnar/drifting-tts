@@ -660,6 +660,35 @@ def band_energy(frames: Tensor, scale: float, bands: Sequence[int]) -> Tensor:
     return torch.stack(out, -1) / scale
 
 
+def mae_features(mae, window: Tensor, frames: int) -> dict[str, Tensor]:
+    """Feature maps of a frozen :class:`~drifting_tts.models.mae2d.MelMAE2d` on mel windows ``[N, n_mels, W]`` at the
+    time columns that cover the last ``frames`` frames: ``{mae_<stage>: [N, L, D]}`` (L: frequency rows x columns)."""
+    W, out = window.shape[-1], {}
+    for name, f in mae.encode(window).items():  # [N, D, F', T']
+        cols = max(1, round(frames * f.shape[-1] / W))
+        out[f"mae_{name}"] = f[..., -cols:].flatten(2).transpose(1, 2).float()
+    return out
+
+
+def history_patches(yp: Tensor, context: int) -> Tensor:
+    """For every step of ``yp`` ``[B, S, D]`` the ``context`` patches before it, oldest first: ``[B, S, context,
+    D]``. Before the first patch the first one stands in (an utterance has no audio before it)."""
+    padded = torch.cat([yp[:, :1].expand(-1, context, -1), yp[:, :-1]], 1)  # [B, S + context - 1, D]
+    return padded.unfold(1, context, 1).permute(0, 1, 3, 2)
+
+
+def window_features(mae, hist: Tensor, x: Tensor, k: int, n_mels: int) -> dict[str, Tensor]:
+    """Kernel maps over a window (#97): the recorded patches ``hist`` ``[R, n, k * n_mels]`` before a step, then the
+    step's patches ``x`` ``[R, S, k * n_mels]`` (generated samples, or the recorded patch), through the frozen
+    Mel-MAE; the maps are read where they cover the step's own frames: ``{mae_<stage>: [R, S, L, D]}``. The window
+    lets the kernel see how a patch joins the audio before it and how its frames follow each other; gradients
+    reach only ``x``."""
+    R, S, _ = x.shape
+    frames = torch.cat([hist.reshape(R, 1, -1, n_mels).expand(-1, S, -1, -1), x.view(R, S, k, n_mels)], 2)
+    feats = mae_features(mae, frames.reshape(R * S, -1, n_mels).transpose(1, 2), k)
+    return {name: f.view(R, S, *f.shape[1:]) for name, f in feats.items()}
+
+
 def ar_features(x: Tensor, k: int, n_mels: int, detail: bool = True, energy_bands: Sequence[int] | None = None,
                 energy_scale: float = 1.0) -> dict[str, Tensor]:
     """Drift kernel features of patches ``[R, S, k * n_mels]`` (R rows, S samples): ``patch`` (the whole patch, one

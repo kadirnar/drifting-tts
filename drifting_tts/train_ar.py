@@ -20,6 +20,11 @@ One step:
 latent frame per step, copied over the patch. ``drift.target_noise`` trains on samples of the codec's posterior
 instead of its mean (:func:`sample_targets`).
 
+``drift.loss: energy`` replaces the drifting field by the energy score (:func:`~drifting_tts.drift.energy_score`, a
+proper scoring rule without a temperature; docs/HEAD_REALISM.md). ``drift.window`` adds kernel maps over a window
+(#97): the recorded patches before a step and the step's patch through a frozen 2-D Mel-MAE
+(:func:`~drifting_tts.models.ar.window_features`), on a share of the rows and samples.
+
 ``train.eval_every`` evaluates every EMA inside the loop, on the held-out objective and on synthesised held-out
 sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`drifting_tts.loop_eval`).
 
@@ -50,10 +55,10 @@ from .alignment import sequence_mask
 from .audio import HOP_LENGTH, SAMPLE_RATE
 from .config import Config, load_config, save_config
 from .data import MelDataset, collate
-from .drift import feature_drift_loss
+from .drift import feature_drift_loss, feature_energy_loss
 from .latents import VAE_BACKENDS
 from .loop_eval import AudioEval, build_emas, heldout_metrics, load_emas, other_emas, record
-from .models.ar import ARDriftTTS, ar_features, patchify
+from .models.ar import ARDriftTTS, ar_features, history_patches, patchify, window_features
 from .models.text_encoder import align, duration_loss, expand, prior_loss
 from .text import BLANK_ID, PAD_ID, frontend
 from .train import build_loader, dataset_stats, grow_speakers
@@ -152,11 +157,25 @@ def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, pr
     return full_c, full_y
 
 
+def kernel_loss(f_gen: dict, f_pos: dict, kind: str, tau: torch.Tensor, key_weights=None,
+                max_locations: int | None = None) -> tuple[torch.Tensor, dict]:
+    """The loss of one set of kernel maps: Kyutai's drifting field at the learned temperature (``field``) or the
+    energy score (``energy``). ``info`` holds ``tau_loss`` (0 for the energy score) and the per-map entries."""
+    if kind == "energy":
+        loss, info = feature_energy_loss(f_gen, f_pos, key_weights, max_locations)
+        return loss, {**info, "tau_loss": loss.new_zeros(())}
+    if kind != "field":
+        raise ValueError(f"drift.loss: {kind!r} (field or energy)")
+    return feature_drift_loss(f_gen, f_pos, None, taus=tau, reduce="mean", key_weights=key_weights,
+                              max_locations=max_locations)
+
+
 def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torch.Tensor,
-                  mel_std: float | None = None, detail: bool = False) -> tuple:
+                  mel_std: float | None = None, detail: bool = False, mae=None) -> tuple:
     """One training step; ``mel_std``: the scalar std of the mel statistics (for ``drift.energy_bands``).
     ``detail``: the metrics also hold every feature map's drift loss, raw field and data mass (``loss/<map>``,
-    ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop."""
+    ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop. ``mae``: the frozen Mel-MAE of
+    ``drift.window``."""
     dc, lc = cfg.drift, cfg.loss
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
@@ -249,15 +268,34 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     f_gen = ar_features(x, kf, C, **opts)
     with torch.no_grad():
         f_pos = ar_features(target[:, None], kf, C, **opts)
-    l_drift, info = feature_drift_loss(f_gen, f_pos, None, taus=tau, reduce="mean",
-                                       key_weights=dc.get("key_weights"))
+    kind = dc.get("loss", "field")
+    l_drift, info = kernel_loss(f_gen, f_pos, kind, tau, dc.get("key_weights"))
+    wc = dc.get("window")
+    if wc:  # kernel maps over a window: the recorded patches before the step, then the step's patch (#97)
+        if mae is None or model.tied or k * C != x.shape[-1]:
+            raise ValueError("drift.window needs the Mel-MAE (drift.window.mae) and a log-mel model")
+        n, rw, gw = int(wc.get("context", 3)), int(wc.get("rows", 256)), int(wc.get("samples", 16))
+        hist = history_patches(patchify(y, k), n).flatten(0, 1)[idx[:rw]]  # [Rw, n, k * C]: the recording's
+        with amp:
+            w_gen = window_features(mae, hist, x[:rw, :gw], k, C)
+            with torch.no_grad():
+                w_pos = window_features(mae, hist, target[:rw, None], k, C)
+        l_win, w_info = kernel_loss(w_gen, w_pos, wc.get("loss", "energy"), tau, None, wc.get("max_locations", 32))
+        l_drift = l_drift + float(wc.get("weight", 1.0)) * l_win
+        info = {**info, **{kk: v for kk, v in w_info.items() if kk != "tau_loss"},
+                "tau_loss": info["tau_loss"] + w_info["tau_loss"], "window": l_win.detach() - w_info["tau_loss"]}
     loss = lc.drift * l_drift + lc.prior * l_prior + lc.duration * l_dur
     with torch.no_grad():
         metrics = {"loss": loss.detach(), "drift": l_drift.detach() - info["tau_loss"], "tau_loss": info["tau_loss"],
                    "prior": l_prior.detach(), "duration": l_dur.detach(),
                    "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean(),
-                   "rows": float(R), "tau": tau.detach().reshape(()),
-                   "p_data": torch.stack([v for kk, v in info.items() if kk.startswith("p_data/")]).mean()}
+                   "rows": float(R), "tau": tau.detach().reshape(())}
+        for name in ("p_data", "spread"):  # the field's data mass; the energy score's spread (1: as the data's)
+            vals = [v for kk, v in info.items() if kk.startswith(name + "/")]
+            if vals:
+                metrics[name] = torch.stack(vals).mean()
+        if "window" in info:
+            metrics["window"] = info["window"]
         if prompting or referencing:
             metrics["prompted"] = (lead > 0).float().mean()
             metrics["id_dropped"] = dropped.float().mean()
@@ -266,7 +304,8 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
             metrics["referenced"] = has_ref.float().mean()
             metrics["no_voice"] = (unknown & ~has_ref & (lead == 0)).float().mean()
         if detail:
-            metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
+            metrics.update({kk: v for kk, v in info.items()
+                            if kk.startswith(("loss/", "force/", "p_data/", "spread/"))})
     return loss, metrics
 
 
@@ -367,12 +406,20 @@ def run(args) -> None:
             vocoder = load_vocoder(tc.get("vocoder", "vocos-v2"), device)
 
     mel_std = None if ds.stats.per_channel else ds.stats.std  # drift.energy_bands: log-mel data only
+    mae = None
+    if cfg.drift.get("window"):  # the frozen Mel-MAE of the window maps (#97)
+        from .train_mae import load_mae
+
+        mae = load_mae(cfg.drift.window.mae, device)
+        mae.eval().requires_grad_(False)
+        print(f"window maps: {cfg.drift.window.mae}, {int(cfg.drift.window.get('context', 3))} patches of history",
+              flush=True)
 
     def evaluate(at: int) -> None:  # every EMA on the held-out objective and on synthesised sentences (#102)
         t = time.time()
         for n, (name, e) in enumerate(emas.items()):
-            res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True)[1],
-                                  heldout)
+            res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True,
+                                                                     mae=mae)[1], heldout)
             res.update(audio(e.model))
             record(writer, work, at, name, n == 0, res)
         print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
@@ -399,7 +446,7 @@ def run(args) -> None:
     it = infinite(loader)
     t0, agg = time.time(), {}
     while step < tc.steps:
-        loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std)
+        loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std, mae=mae)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm_enc = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)
