@@ -173,3 +173,46 @@ def test_train_ar_with_prompts_from_a_plain_checkpoint_and_ref_audio(tmp_path):
     assert torch.equal(continue_prompt(plain, mel, "merhaba", "dünya nasılsın", 0, 0.5, seed=1), wav)
     r = summarize([{"sim": 0.5, "word_errors": 1, "words": 10}, {"sim": 0.7, "word_errors": 0, "words": 10}])
     assert r["items"] == 2 and abs(r["sim"] - 0.6) < 1e-9 and r["wer"] == 0.05
+
+
+def test_voices_without_a_speaker_row_are_always_prompted():
+    """A corpus streamed with ``speakers: prompt`` (#104): speaker id -1. Such an utterance never reads a speaker
+    row: it is cut whenever it can be, and its voice is the prompt's."""
+    m = _model().train()
+    b = _batch()
+    b["spk"] = torch.tensor([-1, 1])
+    over = ["drift.gen_per_cond=4", "drift.max_rows=64", "model.ar.prompt=true"] + [f"drift.prompt.{k}={v}"
+                                                                                    for k, v in PROMPT.items()]
+    cfg = load_config("configs/ar_tts.yaml", over + ["drift.prompt.id_dropout=0.0", "drift.prompt.prob=0.0"])
+    tau = torch.nn.Parameter(torch.tensor(1.0))
+    torch.manual_seed(0)
+    loss, metrics = training_step(m, b, cfg, "cpu", tau)
+    loss.backward()
+    assert metrics["no_row"] == 0.5 and metrics["prompted"] == 0.5 and metrics["id_dropped"] == 0.5  # only that one
+    grad = m.spk.weight.grad
+    assert grad[m.prompt_row].abs().sum() > 0 and grad[1].abs().sum() > 0 and not grad[0].any() and not grad[2].any()
+    with pytest.raises(ValueError, match="prompts"):
+        training_step(_model(prompt=False).train(), b, load_config("configs/ar_tts.yaml", over[:2]), "cpu", tau)
+
+
+def test_stream_mixes_in_a_corpus_of_prompted_voices(tmp_path):
+    from drifting_tts.cli import main
+    from drifting_tts.stream import ParquetStream
+    from tests.test_text_en import _english_parquet
+
+    _english_parquet(tmp_path / "train-0.parquet", 12)
+    _english_parquet(tmp_path / "other-0.parquet", 8, start=50)
+    out = tmp_path / "prep"
+    main(["prepare", "--parquet-glob", str(tmp_path / "train-*.parquet"), "--val-size", "0", "--out", str(out),
+          "--workers", "1", "--no-trim", "--backend", "bigvgan", "--language", "en", "--speaker-column", "speaker_id"])
+    extra = [{"files": [str(tmp_path / "other-0.parquet")], "speaker_column": "speaker_id", "share": 0.5,
+              "speakers": "prompt"}]
+    stream = ParquetStream([str(tmp_path / "train-0.parquet")], out, speaker_column="speaker_id", min_frames=1,
+                           batch_frames=10**6, max_batch=4, trim=False, extra=extra)
+    it = iter(stream)
+    kinds = set()
+    for _ in range(24):
+        spk = next(it)["spk"]
+        assert (spk < 0).all() or (spk >= 0).all()  # a batch is of one shard
+        kinds.add(bool((spk < 0).all()))
+    assert kinds == {True, False}  # both corpora came by: the extra one's speakers have no row, whatever their name

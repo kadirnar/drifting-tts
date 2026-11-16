@@ -58,7 +58,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 @torch.no_grad()
 def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor,
-                spk: torch.Tensor, pc, space: int) -> dict:
+                spk: torch.Tensor, pc, space: int, always: torch.Tensor | None = None) -> dict:
     """Prompts for a batch (#95): an utterance that is long enough is cut where a word starts, between
     ``min_seconds`` and ``max_seconds`` and at least ``min_target`` seconds before its end (the model's own
     alignment gives the frame). The frames before the cut, less up to ``max_trim`` seconds of their end, are the
@@ -68,7 +68,9 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
 
     Returns ``text`` / ``text_len`` / ``mel`` / ``mel_len`` of the part after the cut (the whole utterance where
     there is no cut), ``prompt`` ``[B, n_mels, P]`` with ``prompt_len`` (whole patches; 0: no prompt), and
-    ``dropped`` ``[B]``: the prompted utterances whose speaker row is the prompted one (``id_dropout``)."""
+    ``dropped`` ``[B]``: the prompted utterances whose speaker row is the prompted one (``id_dropout``). ``always``
+    ``[B]``: utterances of voices without a row (a corpus streamed with ``speakers: prompt``), which are cut
+    whenever they can be and never keep a row."""
     B, k, dev = y.shape[0], model.patch, y.device
     fps = SAMPLE_RATE / HOP_LENGTH
     lo, hi, rest, trim = (int(round(float(pc.get(name, default)) * fps)) for name, default in
@@ -82,7 +84,8 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
     after_space = torch.nn.functional.pad(text[:, :-1] == space, (1, 0)) & (text == BLANK_ID)
     inside = torch.arange(text.shape[1], device=dev)[None] < text_len[:, None]
     ok = after_space & inside & (start >= lo) & (start <= hi) & (start <= y_len[:, None] - rest)
-    ok &= (torch.rand(B, device=dev) < float(pc.get("prob", 0.85)))[:, None]
+    always = torch.zeros(B, dtype=torch.bool, device=dev) if always is None else always
+    ok &= ((torch.rand(B, device=dev) < float(pc.get("prob", 0.85))) | always)[:, None]
     texts, mels, prompts = [], [], []
     for b in range(B):
         cand = ok[b].nonzero()[:, 0]
@@ -93,7 +96,7 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
         mels.append(y[b, :, f0: int(y_len[b])].T)
         prompts.append(y[b, :, :p].T)
     prompt_len = torch.tensor([p.shape[0] for p in prompts], device=dev)
-    dropped = (prompt_len > 0) & (torch.rand(B, device=dev) < float(pc.get("id_dropout", 0.5)))
+    dropped = (prompt_len > 0) & ((torch.rand(B, device=dev) < float(pc.get("id_dropout", 0.5))) | always)
     return {"text": pad_sequence(texts, batch_first=True, padding_value=PAD_ID),
             "text_len": torch.tensor([t.numel() for t in texts], device=dev),
             "mel": pad_sequence(mels, batch_first=True).transpose(1, 2),
@@ -125,11 +128,16 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
     amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
     B = y.shape[0]
+    unknown = spk < 0  # voices without a speaker row (a corpus streamed with `speakers: prompt`, #104)
+    if unknown.any():
+        if not model.prompted:
+            raise ValueError("utterances without a speaker row need a model trained with prompts (model.ar.prompt)")
+        spk = torch.where(unknown, torch.full_like(spk, model.prompt_row), spk)  # without a prompt: the null voice
     lead, spk_emb, spk_in = torch.zeros_like(y_len), None, spk  # prompt frames, the encoder's and the backbone's voice
     prompting = model.prompted and dc.get("prompt")
     if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
         cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
-                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "])
+                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown)
         text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
         with amp:
             vec = model.prompt_vector(cut["prompt"], lead)
@@ -194,6 +202,7 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         if prompting:
             metrics["prompted"] = (lead > 0).float().mean()
             metrics["id_dropped"] = cut["dropped"].float().mean()
+            metrics["no_row"] = unknown.float().mean()
         if detail:
             metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
     return loss, metrics

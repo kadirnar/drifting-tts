@@ -15,6 +15,13 @@ corpus (``data.root``), so a streamed model is used like any other. Config::
         speaker_column: speaker_id
         workers: 10
         cache: /workspace/stream_cache
+        extra:                   # other corpora mixed in (#104): a share of the shards comes from each
+          - files: hf://datasets/mythicinfinity/libritts_r/data/train.clean.360/*.parquet
+            speaker_column: speaker_id
+            text_column: text_normalized
+            share: 0.25
+            speakers: prompt     # its speakers have no row of the table: their voices come from prompts
+                                 # (model.ar.prompt, #95); without it, rows of unknown speakers are skipped
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ class ParquetStream(IterableDataset):
 
     def __init__(self, files: list[str], root: str | Path, speaker_column: str = "speaker", text_column: str = "text",
                  min_frames: int = 64, max_frames: int = 1500, batch_frames: int = 24000, max_batch: int = 24,
-                 seed: int = 0, cache: str | Path | None = None, trim: bool = True):
+                 seed: int = 0, cache: str | Path | None = None, trim: bool = True, extra: list[dict] | None = None):
         root = Path(root)
         st = json.loads((root / "stats.json").read_text())
         self.backend, self.language = st.get("backend", "vocos"), st.get("language", "tr")
@@ -58,18 +65,40 @@ class ParquetStream(IterableDataset):
         if not self.files:
             raise FileNotFoundError("no parquet files to stream")
         self.speaker_column, self.text_column = speaker_column, text_column
+        # the corpus itself, then the extra ones: (files, speaker column, text column, share of the shards, whether
+        # its speakers are prompted voices, i.e. speaker id -1)
+        self.sources = [(self.files, speaker_column, text_column, None, False)]
+        for e in extra or []:
+            if not e["files"]:
+                raise FileNotFoundError("an extra stream has no parquet files")
+            self.sources.append((sorted(e["files"]), e.get("speaker_column", "speaker"), e.get("text_column", "text"),
+                                 float(e["share"]), e.get("speakers") == "prompt"))
         self.min_frames, self.max_frames, self.batch_frames, self.max_batch = min_frames, max_frames, batch_frames, \
             max_batch
         self.seed, self.trim, self.epoch = seed, trim, 0
         self.cache = Path(cache) if cache else root / "stream_cache"
 
-    def _shards(self, worker: int, workers: int):
+    def _cycle(self, files: list[str], worker: int, workers: int, salt: int):
         epoch = self.epoch
         while True:
-            order = self.files[:]
-            random.Random(self.seed + 1000 * epoch).shuffle(order)
-            yield from order[worker::workers]
+            order = files[:]
+            random.Random(self.seed + 1000 * epoch + 77 * salt).shuffle(order)
+            yield from order[worker::workers] or order  # fewer shards than workers: every worker reads all of them
             epoch += 1
+
+    def _shards(self, worker: int, workers: int):
+        """An endless order of ``(shard, source)``: the corpus's shards, and with each extra source's ``share`` one
+        of its own."""
+        cycles = [self._cycle(src[0], worker, workers, i) for i, src in enumerate(self.sources)]
+        rng = random.Random(self.seed + 31 * worker + 1000 * self.epoch)
+        while True:
+            r, k = rng.random(), 0
+            for i, src in enumerate(self.sources[1:], 1):
+                if r < src[3]:
+                    k = i
+                    break
+                r -= src[3]
+            yield next(cycles[k]), k
 
     def _fetch(self, f: str, worker: int) -> tuple[str | None, bool]:
         """A local path of shard ``f`` (downloaded for ``hf://``; ``True``: delete it after use)."""
@@ -86,14 +115,15 @@ class ParquetStream(IterableDataset):
                 time.sleep(10 * (attempt + 1))
         return None, False
 
-    def _items(self, path: str, mel_fn, text) -> list[dict]:
+    def _items(self, path: str, mel_fn, text, source: int = 0) -> list[dict]:
+        _, speaker_column, text_column, _, prompted = self.sources[source]
         pf = pq.ParquetFile(path)
-        cols = ["audio", self.text_column, self.speaker_column]
+        cols = ["audio", text_column, speaker_column]
         items = []
         for rg in range(pf.num_row_groups):
             for row in pf.read_row_group(rg, columns=cols).to_pylist():
-                spk = self.speakers.get(row[self.speaker_column])
-                norm = text.normalize(row[self.text_column] or "")
+                spk = -1 if prompted else self.speakers.get(row[speaker_column])  # -1: a voice without a row
+                norm = text.normalize(row[text_column] or "")
                 if spk is None or len(norm) < 2:
                     continue
                 try:
@@ -129,23 +159,26 @@ class ParquetStream(IterableDataset):
         rng = random.Random(self.seed + 7919 * worker + self.epoch)
         shards = self._shards(worker, workers)
         with ThreadPoolExecutor(1) as pool:
-            ahead = pool.submit(self._fetch, next(shards), worker)
+            f, source = next(shards)
+            ahead = pool.submit(self._fetch, f, worker)
             while True:
-                path, temporary = ahead.result()
-                ahead = pool.submit(self._fetch, next(shards), worker)
+                (path, temporary), current = ahead.result(), source
+                f, source = next(shards)
+                ahead = pool.submit(self._fetch, f, worker)
                 if path is None:
                     continue
-                items = self._items(path, mel_fn, text)
+                items = self._items(path, mel_fn, text, current)
                 if temporary:
                     os.remove(path)
                 for batch in self._batches(items, rng):
                     yield collate(batch)
 
 
-def stream_files(pattern: str) -> list[str]:
+def stream_files(pattern: str | list[str]) -> list[str]:
     from .prepare import _glob
 
-    return _glob(pattern)
+    patterns = [pattern] if isinstance(pattern, str) else list(pattern)
+    return [f for p in patterns for f in _glob(p)]
 
 
 def stream_loader(cfg) -> tuple[MelDataset, DataLoader]:
@@ -154,12 +187,16 @@ def stream_loader(cfg) -> tuple[MelDataset, DataLoader]:
     d, t, s = cfg.data, cfg.train, cfg.data.stream
     ref = MelDataset(d.root, "val", min_frames=1, max_frames=10**9)
     files = stream_files(s.files)
+    extra = [{**(e.to_dict() if hasattr(e, "to_dict") else dict(e)), "files": stream_files(e["files"])}
+             for e in (s.get("extra") or [])]
     stream = ParquetStream(files, d.root, speaker_column=s.get("speaker_column", "speaker"),
                            text_column=s.get("text_column", "text"), min_frames=cfg.drift.crop_frames,
                            max_frames=d.max_frames, batch_frames=t.batch_frames, max_batch=t.batch_size, seed=t.seed,
-                           cache=s.get("cache"))
+                           cache=s.get("cache"), extra=extra)
     workers = int(s.get("workers", 8))
     loader = DataLoader(stream, batch_size=None, num_workers=workers, pin_memory=True, persistent_workers=workers > 0,
                         prefetch_factor=4 if workers > 0 else None)
-    print(f"stream: {len(files)} shards ({s.files}), {workers} workers", flush=True)
+    print(f"stream: {len(files)} shards ({s.files}), {workers} workers"
+          + "".join(f"; {e['share']:.0%} of the shards from {len(e['files'])} of another corpus" for e in extra),
+          flush=True)
     return ref, loader
