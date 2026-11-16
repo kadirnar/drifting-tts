@@ -456,11 +456,31 @@ items; "by its row" is the speaker ID, what the model did before):
   errors. Between speakers the similarity goes from 0.17 to 0.61 (median 0.44).
 - **The curve is flat after 4,000 steps on unseen voices** (0.425, 0.427, 0.435) and still rising slowly on the
   corpus's. More steps of this recipe on this data will not close the gap: the model has heard 4,000 synthetic
-  voices of one generator and no recording (#104). #95 cites 0.66 for F5-TTS on LibriSpeech-PC, a system trained
+  voices of one generator and no recording (#104; recorded speech in the stream, below, adds 0.10). #95 cites 0.66 for F5-TTS on LibriSpeech-PC, a system trained
   on recorded speech; the test set here is another, so only the rows of one table compare.
 - **What the pilot costs the old path**: the speaker rows lose 0.03 similarity (0.768 to 0.741) and make 7 word
   errors more of 2,437 (inside its interval). The duration predictor is trained with the log loss again, which the release
   re-fitted to the mean (#72): `train-durations` has to follow a fine-tune, and it does not know prompts yet.
+
+**Recorded speech in the stream (#104).** The gap on unseen voices is the data's: the model had heard 4,000
+synthetic voices and no recording. `data.stream.extra` mixes another corpus into the stream; with `speakers:
+prompt` its speakers have no row of the table and every one of its utterances is trained through a prompt (cut
+whenever it can be; too short, it is the prompted row without a prompt). `configs/ar_tts_en_prompt_recorded.yaml`:
+LibriTTS-R train-clean (CC BY 4.0; 245 h, 1,151 speakers, none of the test's) as a quarter of the shards, half of
+the utterances, for 6,000 more steps from the pilot above (1.9 it/s, 53 minutes):
+
+| model | unseen recorded speakers: SIM-o | WER | corpus voices, prompt | by its row |
+|---|---|---|---|---|
+| the speaker's own recording | 0.656 | 2.35% | – | – |
+| synthetic corpus only, 8,000 steps | 0.435 | 3.77% | 0.680 | 0.741 |
+| **+ recorded speech, 6,000 steps** | **0.532** | 3.77% | 0.678 | 0.731 |
+
+- **Recorded speech is what was missing**: +0.097 on speakers never heard (95%: +0.082 to +0.113; higher on 88% of
+  the items) with the same word errors, and nothing lost on the corpus's own voices (prompt -0.002, row -0.009).
+  The worst speaker goes from 0.17 to 0.37, the median from 0.44 to 0.54.
+- **0.12 is left to the speaker's own recording** (0.532 against 0.656), after 53 minutes on 245 h. The test's
+  vocoder was fine-tuned on the model's mels of synthetic voices only, and neither the long run of #95 (40-100k
+  steps) nor more recorded speakers (LibriTTS-R has another 500 h) were tried.
 
 Not done: the per-voice pause tables and the prosody sampler fall back to the pooled defaults for a prompted
 voice; the benchmark has no `--ref-audio` yet; voice guidance (#99) and the reference encoder (#96) are their own
@@ -527,6 +547,7 @@ python scripts/eval_prosody_tokens.py --cache runs/pm_cache/targets_en.pt --tts 
     --prosody sampler=runs/prosody_ar_en/prosody_ema.pt --temperatures 1.0 0.5 --splits dev --out outputs/prosody_ar_en
 # voices from a prompt (#95): the released model fine-tuned; SIM-o and WER on a manifest of prompts and targets
 drifting-tts train-ar --config configs/ar_tts_en_prompt.yaml --workdir runs/ar_en_prompt
+drifting-tts train-ar --config configs/ar_tts_en_prompt_recorded.yaml --workdir runs/ar_en_prompt_rec  # + LibriTTS-R
 python scripts/clone_eval.py --model runs/ar_en_prompt/model_ema.pt --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt \
     --manifest data/clone_eval/libritts_r/manifest.json --systems recording other prompt --out outputs/clone/libritts_r
 drifting-tts synthesize --model runs/ar_en_prompt/model_ema.pt --ref-audio voice.wav --text "Hello there."

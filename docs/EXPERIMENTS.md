@@ -375,6 +375,13 @@ voices a 6 s recording gives SIM-o 0.68 without the speaker row (0.74 with it); 
 training speaker and 0.415 for that speaker continuing the prompt under its transcript (at twice the WER). Flat
 after 4,000 steps on unseen voices: the limit is 4,000 synthetic training voices and no recorded speech (#104).
 
+**Recorded speech for the prompted model (#104).** LibriTTS-R train-clean (CC BY 4.0, 245 h, 1,151 speakers) mixed
+into the stream as voices without a speaker row, trained through prompts only: 6,000 more steps lift the unseen
+recorded speakers from 0.435 to 0.532 (their own recordings 0.656) at the same WER, with nothing lost on the
+synthetic voices (0.678 from a prompt, 0.731 by row). Also from #104: `data.filters.require_scores` (an unscored
+utterance fails) and the stream reports the rows it skips for unknown speakers. Not done here: scoring the 10k-h
+corpus, more Turkish speakers, restoring tr-dataset-12 (no access to the Turkish data).
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**
