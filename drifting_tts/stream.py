@@ -119,11 +119,12 @@ class ParquetStream(IterableDataset):
         _, speaker_column, text_column, _, prompted = self.sources[source]
         pf = pq.ParquetFile(path)
         cols = ["audio", text_column, speaker_column]
-        items = []
+        items, unknown = [], 0
         for rg in range(pf.num_row_groups):
             for row in pf.read_row_group(rg, columns=cols).to_pylist():
                 spk = -1 if prompted else self.speakers.get(row[speaker_column])  # -1: a voice without a row
                 norm = text.normalize(row[text_column] or "")
+                unknown += spk is None
                 if spk is None or len(norm) < 2:
                     continue
                 try:
@@ -137,6 +138,9 @@ class ParquetStream(IterableDataset):
                     continue
                 items.append({"text": torch.tensor(ids, dtype=torch.long), "mel": self.stats.normalize(mel),
                               "spk": spk, "index": -1})
+        if unknown:  # they used to vanish without a word (#104)
+            print(f"[stream] {Path(path).name}: {unknown} rows of speakers that are not in the speaker table were "
+                  f"skipped (`speakers: prompt` trains them through prompts)", flush=True)
         return items
 
     def _batches(self, items: list[dict], rng: random.Random) -> list[list[dict]]:

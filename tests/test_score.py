@@ -140,6 +140,9 @@ def test_filters_parse_and_pass():
     assert passes({"cer": 0.05, "mos_ovrl": 3.5, "cps": 12}, rules)
     assert not passes({"cer": 0.2}, rules) and not passes({"cps": 5}, rules)
     assert passes({}, rules) and passes(None, rules)  # unscored: kept
+    assert not passes({}, rules, require=True) and not passes({"cer": 0.05, "cps": 12}, rules, require=True)  # #104
+    assert passes({"cer": 0.05, "mos_ovrl": 3.5, "cps": 12}, rules, require=True)
+    assert parse_filters({"max_cer": 0.1, "require_scores": True}) == parse_filters({"max_cer": 0.1})
     with pytest.raises(ValueError):
         parse_filters({"cer": 0.1})
 
