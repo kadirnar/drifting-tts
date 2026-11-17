@@ -36,6 +36,17 @@ def rope_at(x: Tensor, pos: Tensor) -> Tensor:
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
+def rope_pos(x: Tensor, pos: Tensor) -> Tensor:
+    """:func:`rope` at given positions: ``x`` ``[B, H, L, Dh]``, ``pos`` ``[B, L]`` (any real numbers: the text of
+    a prefix model stands on the audio's clock, #103)."""
+    half = x.shape[-1] // 2
+    freqs = 1.0 / (10000 ** (torch.arange(half, device=x.device, dtype=torch.float32) / half))
+    ang = pos.float()[:, None, :, None] * freqs  # [B, 1, L, half]
+    cos, sin = ang.cos().to(x.dtype), ang.sin().to(x.dtype)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class CausalAttention(nn.Module):
     def __init__(self, dim: int, heads: int):
         super().__init__()
@@ -45,17 +56,22 @@ class CausalAttention(nn.Module):
         self.k_norm = RMSNorm(dim // heads)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None,
+                pos: Tensor | None = None) -> Tensor:
         """``x`` ``[B, L, D]``. Without ``cache``: causal attention over the sequence. With ``cache`` (a dict per layer,
         inference): ``x`` are the next ``L`` positions, appended to the cached keys and values. ``mask``
         ``[B, 1, L, L]`` (bool, without a cache): which keys every position may read, in place of the causal
-        triangle (a batch whose rows have padding in front, #103)."""
+        triangle (a batch whose rows have padding in front, #103). ``pos`` ``[B, L]``: the rotary positions of
+        ``x``, in place of their index in the sequence."""
         B, L, D = x.shape
         q, k, v = self.qkv(x).view(B, L, 3, self.heads, D // self.heads).permute(2, 0, 3, 1, 4)
         offset = 0 if cache is None else cache.get("n", 0)
         if cache is not None and offset:
             assert L == 1, "a cached step takes one position at a time"
-        q, k = rope(self.q_norm(q), offset), rope(self.k_norm(k), offset)
+        if pos is None:
+            q, k = rope(self.q_norm(q), offset), rope(self.k_norm(k), offset)
+        else:
+            q, k = rope_pos(self.q_norm(q), pos), rope_pos(self.k_norm(k), pos)
         if cache is None:
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=mask is None)
         else:
@@ -84,8 +100,9 @@ class Block(nn.Module):
         self.attn = CausalAttention(dim, heads)
         self.mlp = SwiGLU(dim, (int(2 / 3 * dim * mlp_ratio) + 31) // 32 * 32)
 
-    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.norm1(x), cache, mask)
+    def forward(self, x: Tensor, cache: dict | None = None, mask: Tensor | None = None,
+                pos: Tensor | None = None) -> Tensor:
+        x = x + self.attn(self.norm1(x), cache, mask, pos)
         return x + self.mlp(self.norm2(x))
 
     def step_static(self, x: Tensor, pos: Tensor, kc: Tensor, vc: Tensor, mask: Tensor) -> Tensor:

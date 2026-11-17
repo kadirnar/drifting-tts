@@ -16,6 +16,16 @@ The sequence is Kyutai's: ``[voice] [text] [audio]``.
 With ``model.ar.prenet`` the patches the model reads back go through a narrow pre-net with dropout
 (:class:`PreNet`), so that the history alone does not say what comes next.
 
+With ``model.ar.clock`` the text stands **on the audio's clock**: the rotary position of audio step ``t`` is ``t``
+and that of character ``j`` is ``(j + 0.5) * rate - lead``, ``rate`` patches per character. A character is then
+at a small rotary distance from the steps that say it, instead of somewhere in a prefix that the model has to
+learn to search by content. It is the diagonal prior of attention-based TTS (the guided attention of DC-TTS, the
+beta-binomial attention prior of RAD-TTS and of NVIDIA's T5-TTS: text and audio advance together), given as
+positions instead of as a loss or a bias on a cross-attention. In training ``rate`` is the utterance's own
+(``fit: utterance``: its patches over its characters) or one number for all (``fit: global``); at inference it is
+given, the corpus's mean by default: the tempo of the utterance is then an input, the rhythm inside it stays the
+model's.
+
 One causal transformer reads all of it. A second head on the same state says whether the utterance is over (the
 step after the last patch; Kyutai's ``eos_loss_weight: 0.1``). The rows of a batch are padded **in front**, so that
 the audio starts at the same position in every row; rotary positions are relative, so a row does not see its
@@ -98,6 +108,12 @@ class ARPrefixTTS(nn.Module):
         self.head = DriftHead(dim, k * n_mels, int(a.head_dim), int(a.head_depth), a.get("noise_dim"))
         self.eos = nn.Linear(dim, 1)
         self.max_rate = float(a.get("max_seconds_per_char", 0.35))  # a bound on the length, should the end not come
+        ck = a.get("clock")  # {rate: patches per character, lead: patches, fit: utterance | global}
+        self.clock = bool(ck)
+        self.rate = float(ck.get("rate", 1.57)) if ck else None
+        self.lead = float(ck.get("lead", 4.0)) if ck else 0.0
+        self.fit = str(ck.get("fit", "utterance")) if ck else None
+        self.voice_gap = 16.0  # patches between the end of the voice prompt and the first audio step, on the clock
         self.temperature = None
 
     @property
@@ -108,66 +124,82 @@ class ARPrefixTTS(nn.Module):
 
     # ------------------------------------------------------------------------------------------------- the prefix
     def prefix(self, text: Tensor, text_len: Tensor, spk: Tensor, prompt: Tensor | None = None,
-               prompt_len: Tensor | None = None, drop: Tensor | None = None) -> tuple[Tensor, Tensor]:
+               prompt_len: Tensor | None = None, drop: Tensor | None = None,
+               rate: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor | None]:
         """What stands in front of the audio: ``[voice] [text]`` as embeddings ``[B, P, dim]``, padded in front,
-        and its mask ``[B, P]``. ``text``: characters ``[B, N]`` with ``text_len``; ``prompt``: normalised mels
-        ``[B, n_mels, R]`` with ``prompt_len`` frames (0: none); ``drop`` ``[B]``: rows without their text (the
-        null branch of guidance: the text segment's embedding alone, once)."""
-        k, rows = self.patch, []
+        its mask ``[B, P]``, and with a clock its rotary positions ``[B, P]`` (else ``None``). ``text``:
+        characters ``[B, N]`` with ``text_len``; ``prompt``: normalised mels ``[B, n_mels, R]`` with
+        ``prompt_len`` frames (0: none); ``drop`` ``[B]``: rows without their text (the null branch of guidance:
+        the text segment's embedding alone, once); ``rate`` ``[B]``: patches per character of every row (the
+        clock; default :attr:`rate`)."""
+        k, rows, clocks = self.patch, [], []
         tok = self.tok(text.clamp_min(0)) + self.seg[TEXT]
         if prompt is not None:
             voice = self.x_in(patchify(prompt[..., : prompt.shape[-1] // k * k], k)) + self.seg[VOICE]
         for b in range(text.shape[0]):
-            parts = []
+            parts, where = [], []
             if prompt is not None:
                 n = prompt.shape[-1] // k if prompt_len is None else int(prompt_len[b]) // k
                 parts.append(voice[b, :n])
+                where.append(torch.arange(n, device=tok.device) - n - self.voice_gap)
             if drop is not None and bool(drop[b]):
                 parts.append(self.seg[TEXT][None].to(tok.dtype))
+                where.append(tok.new_full((1,), -self.lead, dtype=torch.float))
             else:
-                parts.append(tok[b, : int(text_len[b])])
+                n = int(text_len[b])
+                parts.append(tok[b, :n])
+                r = self.rate if rate is None else rate[b]
+                where.append((torch.arange(n, device=tok.device) + 0.5) * r - self.lead if self.clock
+                             else torch.zeros(n, device=tok.device))
             rows.append(torch.cat(parts))
+            clocks.append(torch.cat([w.float() for w in where])[:, None])
         out, mask = front_pad(rows, tok.shape[-1])
-        return out + self.spk(spk)[:, None].to(out.dtype), mask
+        pos = front_pad(clocks, 1)[0][..., 0] if self.clock else None
+        return out + self.spk(spk)[:, None].to(out.dtype), mask, pos
 
-    def states(self, prefix: Tensor, mask: Tensor, x_prev: Tensor, spk: Tensor) -> Tensor:
-        """The states of the audio positions ``[B, S, dim]``: the prefix (:meth:`prefix`) and the patches before
-        each step ``x_prev`` ``[B, S, k * n_mels]`` (the first: :attr:`bos`) through the causal transformer."""
+    def states(self, prefix: Tensor, mask: Tensor, x_prev: Tensor, spk: Tensor, pos: Tensor | None = None) -> Tensor:
+        """The states of the audio positions ``[B, S, dim]``: the prefix (:meth:`prefix`, with its positions on
+        the clock ``pos``) and the patches before each step ``x_prev`` ``[B, S, k * n_mels]`` (the first:
+        :attr:`bos`) through the causal transformer."""
         P, S = prefix.shape[1], x_prev.shape[1]
         audio = self.x_in(x_prev) + self.seg[AUDIO] + self.spk(spk)[:, None]
         h = torch.cat([prefix.to(audio.dtype), audio], 1)
         L = P + S
+        if pos is not None:  # audio step t stands at t
+            pos = torch.cat([pos, torch.arange(S, device=h.device, dtype=pos.dtype).expand(pos.shape[0], -1)], 1)
         keys = torch.cat([mask, torch.ones(mask.shape[0], S, dtype=torch.bool, device=mask.device)], 1)
         causal = torch.ones(L, L, dtype=torch.bool, device=h.device).tril()
         attn = causal[None, None] & keys[:, None, None]
         attn = attn | torch.eye(L, dtype=torch.bool, device=h.device)[None, None]  # a padded position reads itself
         for blk in self.blocks:
-            h = blk(h, mask=attn)
+            h = blk(h, mask=attn, pos=pos)
         return self.norm(h[:, P:])
 
     def teacher_forced(self, text: Tensor, text_len: Tensor, y: Tensor, spk: Tensor,
                        input_noise: Tensor | None = None, prompt: Tensor | None = None,
-                       prompt_len: Tensor | None = None, drop: Tensor | None = None) -> Tensor:
+                       prompt_len: Tensor | None = None, drop: Tensor | None = None,
+                       rate: Tensor | None = None) -> Tensor:
         """States ``[B, S + 1, dim]`` for the ``S`` patches of ``y`` ``[B, n_mels, S * k]`` and the step after them
         (where the end is said), the recorded patches as the history (plus ``input_noise`` ``[B]`` times unit
-        noise)."""
+        noise). ``rate`` ``[B]``: the clock's patches per character (:meth:`prefix`)."""
         yp = patchify(y, self.patch)
         x_prev = torch.cat([self.bos.expand(yp.shape[0], 1, -1), yp], 1)
         if input_noise is not None:
             noise = input_noise[:, None, None] * torch.randn_like(x_prev)
             noise[:, 0] = 0  # the beginning-of-sequence patch is not audio
             x_prev = x_prev + noise
-        prefix, mask = self.prefix(text, text_len, spk, prompt, prompt_len, drop)
-        return self.states(prefix, mask, x_prev, spk)
+        prefix, mask, pos = self.prefix(text, text_len, spk, prompt, prompt_len, drop, rate)
+        return self.states(prefix, mask, x_prev, spk, pos)
 
     # -------------------------------------------------------------------------------------------------- inference
     @torch.no_grad()
     def generate(self, text: Tensor, spk: Tensor, temperature: float = 1.0, generator: torch.Generator | None = None,
                  prompt: Tensor | None = None, max_steps: int | None = None, min_steps: int = 4,
-                 eos_threshold: float = 0.5) -> Tensor:
+                 eos_threshold: float = 0.5, rate: float | None = None) -> Tensor:
         """Characters ``[1, N]`` -> normalised mel ``[1, n_mels, T]``: one utterance, one patch at a time with a KV
         cache, until the end head says so (``eos_threshold``; never before ``min_steps``) or ``max_steps`` (default:
-        :attr:`max_rate` seconds per character)."""
+        :attr:`max_rate` seconds per character). ``rate``: with a clock, the patches per character the text is
+        laid out at (the tempo; default :attr:`rate`)."""
         from ..audio import HOP_LENGTH, SAMPLE_RATE
 
         if text.shape[0] != 1:
@@ -176,13 +208,18 @@ class ARPrefixTTS(nn.Module):
         n = torch.tensor([text.shape[1]], device=text.device)
         if max_steps is None:
             max_steps = max(int(text.shape[1] * self.max_rate * SAMPLE_RATE / HOP_LENGTH / k), min_steps + 1)
-        prefix, _ = self.prefix(text, n, spk, prompt)
+        prefix, _, pos = self.prefix(text, n, spk, prompt,
+                                     rate=None if rate is None else torch.tensor([rate], device=text.device))
         caches = [{} for _ in self.blocks]
         h = torch.cat([prefix, (self.x_in(self.bos) + self.seg[AUDIO] + self.spk(spk))[:, None].to(prefix.dtype)], 1)
+        if pos is not None:
+            pos = torch.cat([pos, pos.new_zeros(1, 1)], 1)  # the first audio step stands at 0
         out = []
         for t in range(max_steps):
             for blk, cache in zip(self.blocks, caches):
-                h = blk(h, cache)
+                h = blk(h, cache, pos=pos)
+            if pos is not None:
+                pos = pos.new_full((1, 1), t + 1.0)
             s = self.norm(h[:, -1])
             if t >= min_steps and float(torch.sigmoid(self.eos(s).float())[0, 0]) > eos_threshold:
                 break
@@ -197,14 +234,14 @@ class ARPrefixTTS(nn.Module):
     @torch.no_grad()
     def synthesize(self, text: Tensor, text_len: Tensor, spk: Tensor, cfg_scale: float = 1.0,
                    temperature: float = 1.0, generator: torch.Generator | None = None,
-                   prompt: Tensor | None = None, **_) -> tuple[Tensor, Tensor]:
+                   prompt: Tensor | None = None, rate: float | None = None, **_) -> tuple[Tensor, Tensor]:
         """As the other models' ``synthesize`` for one utterance: token ids as the frontend gives them (with or
         without blanks) -> normalised mel ``[1, n_mels, T]`` and its length. ``prompt``: a recording of the voice
         (``model.ar.prompt``); ``spk`` is then ignored."""
         chars, n = characters(text, text_len)
         if prompt is not None:
             spk = torch.full_like(spk, self.prompt_row)
-        mel = self.generate(chars[:, : int(n[0])], spk, temperature, generator, prompt)
+        mel = self.generate(chars[:, : int(n[0])], spk, temperature, generator, prompt, rate=rate)
         return mel, torch.tensor([mel.shape[-1]], device=mel.device)
 
 

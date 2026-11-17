@@ -107,6 +107,58 @@ def test_prenet_is_a_bottleneck_with_dropout_at_inference():
     assert mel.shape[:2] == (1, 100) and mel.shape[-1] % 4 == 0
 
 
+def test_the_clock_lays_the_text_over_the_audio():
+    m = _model(clock={"rate": 1.5, "lead": 4.0})
+    assert m.clock and m.rate == 1.5 and m.lead == 4.0 and m.fit == "utterance" and not _model().clock
+    text, n = torch.randint(3, 20, (2, 7)), torch.tensor([7, 4])
+    spk, rate = torch.tensor([0, 1]), torch.tensor([2.0, 1.0])
+    prompt, plen = torch.randn(2, 100, 12), torch.tensor([12, 0])
+    out, mask, pos = m.prefix(text, n, spk, prompt, plen, rate=rate)
+    assert out.shape[:2] == (2, 10) and mask.sum(1).tolist() == [10, 4]
+    # the voice: three patches before the gap; the characters: (j + 0.5) * rate - lead
+    assert pos[0, :3].tolist() == [-19.0, -18.0, -17.0] and pos[0, 3:].tolist() == [j * 2.0 - 3.0 for j in range(7)]
+    assert pos[1, 6:].tolist() == [j - 3.5 for j in range(4)]
+    assert m.prefix(text, n, spk)[2][1, 3:].tolist() == [(j + 0.5) * 1.5 - 4.0 for j in range(4)]  # the default rate
+    assert _model().prefix(text, n, spk)[2] is None
+    # a row alone and in a batch: the same states; the rate changes them
+    y = torch.randn(2, 100, 16)
+    s = m.teacher_forced(text, n, y, spk, rate=rate)
+    alone = m.teacher_forced(text[1:, :4], n[1:], y[1:], spk[1:], rate=rate[1:])
+    torch.testing.assert_close(s[1], alone[0], atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(m.teacher_forced(text, n, y, spk, rate=rate * 1.5)[0], s[0], atol=1e-4)
+    later = y.clone()
+    later[..., 8:] += 1.0
+    torch.testing.assert_close(m.teacher_forced(text, n, later, spk, rate=rate)[:, :3], s[:, :3], atol=1e-5, rtol=1e-5)
+    # generation with a cache stands on the same clock as teacher forcing
+    one, spk1 = text[:1, :6], torch.tensor([2])
+    for r in (None, 2.5):
+        mel = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=r)
+        tf = m.teacher_forced(one, torch.tensor([6]), mel, spk1, rate=None if r is None else torch.tensor([r]))
+        torch.testing.assert_close(m.head(tf[0, :5], torch.zeros(5, 400)), patchify(mel, 4)[0], atol=1e-4, rtol=1e-4)
+    assert not torch.allclose(m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=1.0), mel, atol=1e-4)  # the tempo
+    voiced = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, prompt=torch.randn(1, 100, 16))
+    assert voiced.shape == (1, 100, 20)
+    # the training step lays every utterance out at its own rate
+    cfg = load_config("configs/ar_tts.yaml", OVER + ["drift.cond_dropout=0.5"])
+    seen = {}
+    tf0 = m.teacher_forced
+
+    def spy(*a, **kw):
+        seen["rate"] = a[8] if len(a) > 8 else kw.get("rate")
+        return tf0(*a, **kw)
+
+    m.teacher_forced = spy
+    b = _batch()
+    loss, _ = training_step(m.train(), b, cfg, "cpu", torch.nn.Parameter(torch.tensor(1.0)))
+    chars, cn = characters(b["text"], b["text_len"])
+    torch.testing.assert_close(seen["rate"], -(-b["mel_len"] // 4).float() / cn)
+    assert torch.isfinite(loss)
+    m.fit = "global"
+    seen.clear()
+    training_step(m, _batch(), cfg, "cpu", torch.nn.Parameter(torch.tensor(1.0)))
+    assert seen["rate"] is None
+
+
 def test_eos_loss_marks_the_step_after_the_last_patch():
     logits = torch.full((2, 5), -10.0)
     logits[0, 4], logits[1, 2] = 10.0, 10.0

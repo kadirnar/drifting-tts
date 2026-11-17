@@ -15,6 +15,9 @@ model:
     prompt: true           # a crop of another utterance of the speaker as the [voice] prefix, for a share of them
     max_seconds_per_char: 0.35   # the bound on a generated utterance's length, should the end head not fire
     # prenet: {dim: 256, dropout: 0.5}   # a bottleneck on the history (Tacotron 2, MELLE), at inference too
+    # clock: {rate: 1.57, lead: 4, fit: utterance}   # the text on the audio's clock: character j at rotary
+    #   position (j + 0.5) * rate - lead, audio step t at t (rate: patches per character; fit: utterance trains
+    #   with every utterance's own rate, global with `rate`); at inference `rate` is the tempo
 
 drift:
   cond_dropout: 0.1        # utterances without their text (the null branch of guidance)

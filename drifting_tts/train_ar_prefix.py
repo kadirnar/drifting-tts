@@ -56,8 +56,10 @@ def training_step(model: ARPrefixTTS, batch: dict, cfg: Config, device, tau: tor
     noise = torch.rand(B, device=device) * float(dc.get("input_noise", 0.0))
     p_drop = float(dc.get("cond_dropout", 0.0))
     drop = torch.rand(B, device=device) < p_drop if p_drop > 0 else None
+    # the clock (model.ar.clock): the text laid over the utterance at its own patches per character
+    rate = steps.float() / n.clamp_min(1) if model.clock and model.fit == "utterance" else None
     with amp:
-        s = model.teacher_forced(chars, n, y, spk, noise, prompt, prompt_len, drop)  # [B, S + 1, dim]
+        s = model.teacher_forced(chars, n, y, spk, noise, prompt, prompt_len, drop, rate)  # [B, S + 1, dim]
     S = s.shape[1] - 1
     valid = torch.arange(S, device=device)[None] < steps[:, None]
     idx = valid.flatten().nonzero()[:, 0]
