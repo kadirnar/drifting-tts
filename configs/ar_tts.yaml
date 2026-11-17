@@ -66,3 +66,14 @@ train:
   save_every: 5000
   keep_snapshots: true
   vocoder: vocos-v2
+  # ema_decays: [0.999, 0.9999]  # more than one EMA (#102): the first is model_ema.pt, another model_ema_<decay>.pt
+  eval_every: 0            # > 0: evaluation in the loop every N steps (#102, drifting_tts/loop_eval.py): every EMA on
+  eval:                    #   the held-out objective and on synthesised sentences, to TensorBoard and eval_history.json
+    num: 24                # held-out sentences (val split) synthesised with train.vocoder and judged
+    batches: 8             # held-out batches of the training objective, batch_size utterances each
+    batch_size: 8
+    asr: large-v3          # Whisper model for WER / CER, or none; asr_device: cpu beside a full GPU
+    mos: utmosv2           # utmosv2 | utmos22 | none
+    f0: true               # F0 spread of the generated audio (WORLD harvest, on the CPU)
+    temperature: 0.5       # noise temperature of the synthesised sentences
+    at_start: false        # also before the first step: where a continued or fine-tuned run starts from

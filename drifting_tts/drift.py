@@ -422,7 +422,9 @@ def feature_drift_loss(
             loss, kinfo = drift_loss(g, p, n, weight_neg=wn, temperatures=temperatures, affinity_floor=affinity_floor)
         if tau_loss is not None:
             tau_total = tau_loss if tau_total is None else tau_total + tau_loss
-        loss = loss.mean() * w
+        loss = loss.mean()
+        info[f"loss/{key}"] = loss.detach()  # the map's own drift loss, before its weight
+        loss = loss * w
         total = loss if total is None else total + loss
         for k, v in kinfo.items():
             info[f"{k}/{key}"] = v

@@ -116,3 +116,14 @@ train:
   sample_every: 2500
   sample_temperature: 0.5  # noise temperature of the TensorBoard samples
   save_every: 2500
+  # ema_decays: [0.999, 0.9999]  # more than one EMA (#102): the first is model_ema.pt, another model_ema_<decay>.pt
+  eval_every: 0            # > 0: evaluation in the loop every N steps (#102, drifting_tts/loop_eval.py): held-out
+  eval:                    #   sentences through every EMA, judged, to TensorBoard and eval_history.json
+    num: 24                # held-out sentences (val split)
+    asr: large-v3          # Whisper model for WER / CER, or none; asr_device: cpu beside a full GPU
+    mos: utmosv2           # utmosv2 | utmos22 | none
+    f0: true               # F0 spread of the generated audio (WORLD harvest, on the CPU)
+    temperature: 0.5       # noise temperature and guidance scale of the synthesised sentences
+    cfg_scale: 2.0
+    vocoder: null          # a vocoder name or checkpoint (null: the stock vocoder of the mel backend)
+    at_start: false        # also before the first step
