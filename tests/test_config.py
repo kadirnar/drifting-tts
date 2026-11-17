@@ -20,3 +20,15 @@ def test_override_does_not_mutate_input(tmp_path):
     cfg = load_config(tmp_path / "a.yaml")
     new = apply_overrides(cfg, ["x.y=2"])
     assert cfg.x.y == 1 and new.x.y == 2
+
+
+def test_turkish_gta_vocoder_config_is_the_english_recipe_with_balanced_speakers():
+    tr, en = load_config("configs/vocoder_bigvgan_tr_gta.yaml"), load_config("configs/vocoder_bigvgan_en_gta.yaml")
+    assert tr.vocoder.to_dict() == en.vocoder.to_dict()  # NVIDIA's generator, discriminators and optimizer states
+    same = ("steps", "gta_cfg", "gta_prob", "gta_temperature", "lr", "batch_size", "segment_frames", "keep_snapshots")
+    for key in same:
+        assert tr.train[key] == en.train[key], key
+    shares = tr.train.speaker_balance.shares
+    assert set(shares) == {722, 389, 323, *range(723, 729)} and 0.5 < sum(shares.values()) < 1  # room for the rest
+    assert tr.data.filters.max_cer == load_config("configs/ar_tts_ft.yaml").data.filters.max_cer
+

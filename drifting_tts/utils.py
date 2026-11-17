@@ -93,3 +93,12 @@ def count_params(model: nn.Module) -> float:
 def infinite(loader):
     while True:
         yield from loader
+
+
+def dct_matrix(n: int, device=None) -> torch.Tensor:
+    """Orthonormal DCT-II ``[n, n]``: row ``j`` is the cosine of frequency ``j`` (row 0 the mean times ``sqrt(n)``)."""
+    t = torch.arange(n, dtype=torch.float32, device=device)
+    m = torch.cos(math.pi * (t[None] + 0.5) * t[:, None] / n) * math.sqrt(2 / n)
+    m[0] = m[0] / math.sqrt(2)
+    return m
+

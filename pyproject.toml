@@ -36,6 +36,9 @@ eval = ["faster-whisper", "transformers", "safetensors",
 bigvgan = ["librosa", "scipy", "matplotlib", "nnAudio"]   # BigVGAN-v2 backend (its code imports these; nnAudio: CQT-D)
 # data scoring (`drifting-tts score`): Whisper large-v3, DNSMOS (Microsoft's ONNX models run in torch), ECAPA
 score = ["faster-whisper>=1.1", "rapidfuzz", "speechmos", "onnx", "onnx2torch", "librosa", "speechbrain>=1.0"]
+# the judge panel (scripts/judge_panel.py) beside the eval judges: SCOREQ, Audiobox Aesthetics, NISQA (torchmetrics),
+# DNSMOS (speechmos + onnx2torch, as `score`); UTMOS22 and SQUIM come with torch.hub and torchaudio
+panel = ["scoreq", "audiobox_aesthetics", "torchmetrics", "speechmos", "onnx", "onnx2torch", "librosa"]
 # speech restoration (`drifting-tts restore-audio`, #71): Sidon's TorchScript networks and w2v-BERT 2.0's filterbanks
 restore = ["transformers", "huggingface_hub"]
 # audio-VAE latent spaces (`drifting_tts.latents`): the model code is vendored (upstream packages pin protobuf or pull
