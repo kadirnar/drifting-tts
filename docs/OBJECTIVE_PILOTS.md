@@ -42,7 +42,8 @@ spread-skill: the head's spread over its error, slow to fast inside the patch, 1
 | the released model | 2.37% | 3.381 | 4.131 | 4.251 | 4.633 | 7.510 | 0.88 / 0.94 | 0.79 | 1.02 0.97 0.88 0.80 | +1.56 dB |
 | **control** | 2.17% | 3.357 | 4.116 | 4.246 | 4.658 | 7.513 | 0.85 / 0.92 | 0.78 | 1.02 0.97 0.89 0.80 | +1.34 dB |
 | energy score (#97) | 2.17% | −0.003 | −0.003 | +0.002 | −0.014 | −0.006 | **0.82 / 0.84** | **0.71** | 1.05 1.00 0.93 0.84 | +1.66 dB |
-WINDOW_ROWS
+| energy score + window maps (#97) | 2.30% | −0.012 | +0.004 | +0.002 | +0.008 | −0.022 | 0.82 / 0.91 | **0.54** | 1.04 1.01 0.94 0.87 | +1.75 dB |
+| field + window maps, field (#97) | 2.10% | −0.000 | −0.000 | −0.006 | −0.030 | −0.027 | 0.83 / 0.91 | 0.62 | 1.01 0.99 0.92 0.85 | +1.88 dB |
 | noise level as an input (#101) | 2.44% | +0.025 | +0.018 | +0.000 | −0.030 | −0.025* | 0.85 / 0.92 | 0.74 | 1.02 0.97 0.89 0.80 | +1.47 dB |
 | rollouts of 4–16 patches (#101) | 2.30% | +0.015 | +0.019 | −0.000 | −0.040* | +0.001 | 0.85 / 0.91 | 0.74 | 1.03 0.98 0.89 0.80 | +1.61 dB |
 | one-step own history (#101) | 2.51% | −0.015 | +0.007 | +0.006 | −0.029 | −0.025* | 0.85 / 0.91 | 0.77 | 1.06 0.98 0.89 0.80 | +1.39 dB |
@@ -69,7 +70,35 @@ sees in one patch. Those runs trained the head on frozen states; here the whole 
   kernel maps, with the energy score or with the field (`drift.window.loss`). Gradients reach the generated patch
   only.
 
-WINDOW_RESULTS
+What a classifier still tells from the recordings (accuracy; 0.5: nothing), by what it is shown:
+
+| arm | one teacher-forced patch: whole / harmonic detail / envelope / frame change | 4 free-running frames: whole / detail | 16 free-running frames: whole / detail | spread-skill, slow to fast |
+|---|---|---|---|---|
+| the released model | 0.79 / 0.86 / 0.57 / 0.88 | 0.88 / 0.89 | 0.94 / 0.95 | 1.02 0.97 0.88 0.80 |
+| control | 0.78 / 0.85 / 0.63 / 0.88 | 0.85 / 0.88 | 0.92 / 0.92 | 1.02 0.97 0.89 0.80 |
+| energy score | 0.71 / 0.84 / 0.53 / 0.87 | 0.82 / 0.86 | 0.84 / 0.92 | 1.05 1.00 0.93 0.84 |
+| energy score + window maps | **0.54** / 0.80 / 0.52 / 0.87 | 0.82 / 0.84 | 0.91 / 0.91 | 1.04 1.01 0.94 0.87 |
+| field + window maps with the field | 0.62 / **0.73** / 0.51 / 0.87 | 0.83 / 0.86 | 0.91 / 0.92 | 1.01 0.99 0.92 0.85 |
+
+- **The window maps do to the whole model what they did to the head alone**: one teacher-forced patch is told
+  from the recorded one 54% of the time instead of 78%, and the head's spread in the fastest band rises from 0.80
+  to 0.87 of its error. 5,000 steps of 16 utterances, the backbone and the text encoder training with the head.
+- **The field works with them too.** On the head alone no new map helped while the field was Kyutai's; with the
+  window maps and the whole model the field gets 0.62 on the whole patch and the best harmonic detail of all
+  (0.73). The energy score is not required; it calibrates a little further (0.87 against 0.85).
+- **Nothing a judge hears changes**: all seven inside their intervals for the three arms, word errors 2.1–2.3%.
+  With the fine-tuned vocoder the released model is already at the recordings' level on these judges.
+- **What the window does not reach.** The frame-to-frame-change view stays at 0.87–0.88 in every arm, as it did
+  for every head. Free-running, 4 frames move from 0.85 to 0.82–0.83 and 16 frames stay at 0.91; the energy score
+  alone has the lowest 16-frame number (0.84), which the window maps do not keep. The quietest frames get louder
+  free-running (+1.8 dB against +1.3 dB).
+- **Cost**: 256 rows × 16 samples through the MAE take 5.6 GB more and a quarter of the speed (1.4–1.6 it/s
+  against 1.9).
+- **Step 1 of #97**, the patch boundaries, was answered before: free-running, the change across a boundary is 1.01
+  of the change inside a patch (the recordings: 1.00).
+- Not done: the 20–40k steps of the issue, the Turkish model, a longer window (28 frames; the MAE here was trained
+  on 16), an encoder that predicts WavLM features, and a listening test. The vocoder was fine-tuned on the released
+  model's mels, not on these arms'.
 
 ## Training on the model's own history (#101)
 
@@ -227,3 +256,29 @@ WER 21.5% against 25.1%, UTMOSv2 2.09 against 1.88, 3.1 pauses per utterance aga
 4.9 semitones (the control: 2.2%, 3.36, 2.3, 3.6). The mechanism works; what it was given to distil is damage.
 
 ## Commands
+
+```bash
+# an arm: the released model, 5,000 steps, the control's settings plus the arm's own
+drifting-tts train-ar --config configs/ar_tts_en_10k.yaml --workdir runs/arm train.init_from=ardrift_en.pt \
+    train.batch_size=16 train.batch_frames=16000 train.lr=1e-4 train.steps=5000 train.warmup=300 \
+    drift.max_rows=768 drift.tau_init=0.06 loss.duration=0 <the arm>
+#   #97   drift.loss=energy                                            # the energy score
+#         drift.window.mae=runs/mae16/mae_ema.pt drift.window.loss=energy|field [drift.loss=energy]
+#   #101  model.ar.noise_level=true | drift.rollout.prob=0.5 "drift.rollout.steps=[4,16]" | drift.self_history=0.5
+#   #98   drift.teacher.path=ardrift_en.pt drift.teacher.positives=31 [drift.teacher.head=flow/head.pt
+#         drift.teacher.steps=32]
+#   #99   drift.cond_dropout=0.15; then drift.distill.teacher=<that model> drift.distill.cfg_scale=1.5
+drifting-tts train-mae --config configs/mae2d.yaml --workdir runs/mae16 data.root=data/en_ft \
+    model.speaker_head=false "model.mask_patch=[10,4]" train.crop_frames=16 train.steps=10000    # the window's MAE
+python scripts/head_finetune.py --model ardrift_en.pt --data data/en_ft --out flow --loss flow --steps 30000 \
+    --samples 8 --input-noise 0                                                      # teacher B's flow head
+# the tests of an arm
+python scripts/judge_panel.py --systems control=wav/control arm=wav/arm --baseline control --out outputs/panel
+python scripts/c2st_mel.py --model runs/arm/model_ema.pt --data data/en_val --mode free --temperature 0.5 \
+    --windows 4 16 --views full detail envelope delta --active -0.5
+python scripts/c2st_mel.py --model runs/arm/model_ema.pt --data data/en_val --mode gta --temperature 1.0 \
+    --windows 4 --stride 4 --views full detail envelope delta --active -0.5
+python scripts/drift_calibration.py --model runs/arm/model_ema.pt --data data/en_val --active -0.5 --no-free
+python scripts/gta_mismatch.py --model runs/arm/model_ema.pt --data data/en_val --num 200 --steps 0 \
+    [--history-noise 0.15]
+```

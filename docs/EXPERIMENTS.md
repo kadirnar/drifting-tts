@@ -409,6 +409,15 @@ both 0.555 (control: 0.538). Against a recording of the speaker that the model w
 prompt's SIM-o is the recording's conditions, and a second recording adds voice. Lesson: a new conditioning path
 into a pretrained autoregressive backbone has to start from something the backbone already reads.
 
+**A kernel over a window for ARDrift (#97, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#a-kernel-over-a-window-97)).**
+`drift.window` in `train-ar`: the recorded patches before a step and the generated patch through a frozen Mel-MAE,
+whose maps over the patch are further kernel maps; `drift.loss: energy` for the energy score. Whole-model
+fine-tunes of 5,000 steps: one teacher-forced patch is told from the recorded one 54% of the time (control 78%;
+the energy score alone 71%; the field with the window maps 62%), the head's spread in the fastest band rises from
+0.80 to 0.85–0.87 of its error, and no judge and no word error rate moves. The frame-to-frame-change view (0.87)
+and 16 free-running frames (0.91) stay where they were. The head-only result carries over to the whole model, and
+the field is enough once the maps see a window.
+
 **Exposure bias of ARDrift (#101, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#training-on-the-models-own-history-101)).**
 On the released English model, noise on the free-running history at inference does not help (every measure moves
 away from the recordings as it grows; no judge hears 0.15 of it). Three fine-tunes of 5,000 steps against a control:
