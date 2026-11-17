@@ -409,6 +409,17 @@ both 0.555 (control: 0.538). Against a recording of the speaker that the model w
 prompt's SIM-o is the recording's conditions, and a second recording adds voice. Lesson: a new conditioning path
 into a pretrained autoregressive backbone has to start from something the backbone already reads.
 
+**ARDrift v2, the text as a prefix (#103, [ENGLISH.md](ENGLISH.md#the-pilot-what-makes-a-prefix-model-start-to-read)).**
+`model.kind: ar_prefix`: `[voice] [text] [audio]` through one causal transformer, the drifting head draws the whole
+patch, no aligner, no duration predictor, no prior mean. Pilots on an A10 from the released backbone (about 12
+utterances a step). "Text use": teacher-forced, how much larger the mean patch's error is with another
+utterance's text. A plain prefix: 0% at 5,000 steps, +2.4% at 10,000, no intelligible speech. A pre-net with
+dropout on the history (Tacotron 2, MELLE): +2.4% at 7,500. **The text on the audio's clock** (`model.ar.clock`:
+character `j` at rotary position `(j + 0.5) * rate - lead`, the diagonal prior of attention-based TTS as
+positions): +0.9 / +3.2 / +8.0 / +13.7 / +26.9 / +45.3 / +60.8 / +69.5% every 2,500 steps, and at 20,000 steps
+WER 67.6% on 100 sentences: the first 3.5 words of a sentence on average. The price is the tempo as an input.
+The aligned model stays the release; v2 is a long run.
+
 **A kernel over a window for ARDrift (#97, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#a-kernel-over-a-window-97)).**
 `drift.window` in `train-ar`: the recorded patches before a step and the generated patch through a frozen Mel-MAE,
 whose maps over the patch are further kernel maps; `drift.loss: energy` for the energy score. Whole-model

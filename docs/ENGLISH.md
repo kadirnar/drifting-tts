@@ -596,7 +596,7 @@ and let the autoregressive model decide the timing and the end of the utterance.
 | | aligned ARDrift | v2 |
 |---|---|---|
 | text | character encoder, monotonic alignment, the aligned states as a condition of every step | the characters as embeddings in front of the sequence |
-| timing | duration predictor (and the sampler of #100) | the model's own: it stops when its end head says so |
+| timing | duration predictor (and the sampler of #100) | the model's own inside the utterance; with the clock (below) the tempo is given and the utterance ends with its text, without it the end head ends it |
 | what the head draws | a residual over the aligned prior mean | the patch itself |
 | voice | a row of the speaker table, a prompt (#95), a reference encoder (#96) | a row, or a crop of another utterance of the speaker in front of the text |
 | losses | drifting, prior, duration | drifting, end of utterance (binary cross-entropy, weight 0.1) |
@@ -609,6 +609,81 @@ and let the autoregressive model decide the timing and the end of the utterance.
 - **A bound on the length**: 0.35 s per character, should the end head not fire.
 - **Not there yet**: guidance at inference (the text dropout that trains its null branch is), the fast generator
   with CUDA graphs, streaming, the `Synthesizer`'s units and pauses. `model.synthesize` speaks one utterance.
+
+### The pilot: what makes a prefix model start to read
+
+Three arms on an A10, each from the released model's backbone and head (the character and segment embeddings and
+the end head are new), batches of 12,000 frames (about 12 utterances; the aligned model's: 48), learning rate
+2e-4. Two measures on held-out sentences:
+
+- **WER** of 24 sentences, free-running (Whisper large-v3);
+- **text use**: teacher-forced on 24 to 40 utterances, how much larger the error of the head's mean patch is when
+  the text is another utterance's (the same noise for both; 0%: the states do not depend on the text).
+  `text_gap / null_steps` in the training log is the same thing on the utterances that lost their text.
+
+| arm | steps | text use (95%) | first eight patches | error of the mean patch, held out | WER, to the length bound | output / recording, length |
+|---|---|---|---|---|---|---|
+| plain prefix | 5,000 | about 0% | | 0.052 | 98% | 4.6 |
+| | 10,000 | +2.4% (+0.3 to +4.4) | +11% | 0.050 | 112% | 4.3 |
+| pre-net (256 wide, dropout 0.5) | 5,000 | +1.2% (+0.6 to +1.8) | +2% | 0.116 | 97% | 4.6 |
+| | 7,500 | +2.4% (+1.4 to +3.5) | +4% | | | |
+| **the text on the clock** | 2,500 | +0.9% (+0.2 to +1.5) | +3% | 0.061 | 97% | 4.6 |
+| | 5,000 | +3.2% (+1.8 to +4.8) | +8% | 0.052 | 95% | 4.6 |
+| | 7,500 | +8.0% (+5.7 to +10.4) | +16% | 0.049 | 150% | 4.1 |
+| | 10,000 | **+13.7%** (+10.5 to +17.1) | +28% | 0.047 | 110% | 4.3 |
+| | 12,500 | +26.9% (+21.0 to +32.6) | +40% | 0.045 | 123% | 3.6 |
+| | 15,000 | +45.3% (+36.5 to +54.2) | +51% | 0.042 | 114% | 4.2 |
+| | 17,500 | +60.8% (+49.0 to +73.6) | +60% | 0.040 | 82% | 4.1 |
+| | 20,000 | **+69.5%** (+56.6 to +83.2) | +63% | 0.039 | 88% | 4.3 |
+
+The WER of this table is the training loop's: 24 sentences up to the bound of 0.35 s per character, which every
+output reached (the last column), so most of it is what was said after the text.
+
+- **A plain prefix model is an audio model for its first 10,000 steps.** Its states do not depend on the text at
+  5,000 steps and barely at 10,000, and what it reads first is the beginning of the utterance. Its end head reads
+  the end from the audio (it fires at the right step with another utterance's text as often as with its own), so
+  free-running there is no end: every output runs into the length bound.
+- **A pre-net** on the history (`model.ar.prenet`; Tacotron 2: "essential for learning attention"; MELLE keeps it,
+  dropout 0.5, at inference too) is a quarter faster: at 7,500 steps where the plain model is at 10,000, with twice
+  the error of the mean patch, since half of the history is dropped. A fresh pre-net needs the temperature of a
+  run from scratch (`drift.tau_init=1.0`): at the fine-tuning value 0.06 the head's spread collapsed (0.04 against
+  0.2) for the first 1,000 steps.
+- **The clock** (`model.ar.clock`) is the lever: at 10,000 steps the text counts 5.7 times as much as in the plain
+  model, and it is the only arm whose error falls below the plain model's (0.047 against 0.050). The text is no
+  longer a prefix to search by content: character `j` stands at rotary position `(j + 0.5) * rate - lead` and
+  audio step `t` at `t`, so a character is near the steps that say it. It is the diagonal prior of
+  attention-based TTS (DC-TTS's guided attention, the beta-binomial prior of RAD-TTS and T5-TTS), given as
+  positions. The price: the utterance's tempo (`rate`, patches per character) is an input at inference, the
+  corpus's mean (1.57) by default; the rhythm inside the utterance stays the model's.
+- **The clock model begins to speak its text.** Its utterances end where the text ends on the clock (`generate`
+  stops after `characters × rate` patches; the end head fires by itself in 3 of 100). 100 held-out sentences at
+  20,000 steps, at the corpus's mean tempo: **WER 67.6%** (95% 63.1 to 71.8; 66.2% at every recording's own
+  tempo); 8 sentences at 15,000 and 17,500 steps: 88% and 83%.
+  - The first 3.5 words of a sentence are right on average (of 14.8); 2 sentences in 100 entirely, 8 with fewer
+    than a fifth of the words wrong, 24 with fewer than half. Sentences of up to eight words: 53%.
+  - It reads from the start of the utterance onwards, and what it loses the text at is mostly a pause: after
+    "um", "so", "oh" and a comma the rest is often not speech.
+  - Teacher-forced it is further than free-running: the text counts for 70% of the error there.
+- **The plain and the pre-net models do not speak the text** in the steps they had (10,000 and 7,500).
+- **The scale of the published models**: MELLE (mel frames, the text as a prefix, no alignment) trains 400,000
+  updates of 480,000 frames on 16 GPUs with 50,000 h; CALM's TTS has 88,000 h. 20,000 steps of 12,000 frames are
+  0.13% of MELLE's frames, and 2.5% of the utterances the aligned model saw (200,000 steps of 48).
+
+**What the pilot says about #103's decision.** A prefix model with a drifting head learns to read on one A10
+without an aligner, a duration predictor or a prior mean, **if the text stands on the clock**; as a plain prefix
+it does not within what a pilot can afford. At 20,000 small steps it is at the first words of a sentence, far from
+the aligned model's 2.4% WER, so the aligned model stays the released one and v2 is a long run to decide on:
+
+- the recipe: `configs/ar_prefix_en.yaml` (the clock is its default now), the aligned model's batch of 48 and
+  200,000 steps on the machine that trained it, `text_gap / null_steps` and the in-loop WER as the signs to watch;
+- what the clock leaves of the duration model is **one number per utterance**, the tempo. The pilot speaks at the
+  corpus's mean (1.57 patches per character); a model for release needs that number from the text and the voice
+  (a regression or a sampler on the prefix), or from the user as a speed control;
+- the end of the utterance comes from the clock in the pilot; the end head learned the audio's trailing silence
+  and fires on real recordings only.
+
+Not done: the long run; the tempo predictor; the clock and the pre-net together; `fit: global` (one rate for every
+utterance in training); guidance, the fast generator, streaming and the `Synthesizer` for this model; Turkish.
 
 ## Release
 

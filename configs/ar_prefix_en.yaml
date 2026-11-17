@@ -5,8 +5,8 @@
 # The same data, backbone size, head and drifting loss as the aligned model (configs/ar_tts_en_10k.yaml), so the two
 # compare what the issue asks: WER, pauses per utterance, duration spread, F0, at equal steps.
 #   drifting-tts train-ar --config configs/ar_prefix_en.yaml --workdir runs/ar_prefix_en
-# Not run to the end: the aligned model took 200k steps of 48 utterances on an RTX 5090 (11 h), and a model without
-# an alignment needs at least as much before it reads (docs/ENGLISH.md has the pilot on an A10).
+# Not run to the end: the aligned model took 200k steps of 48 utterances on an RTX 5090 (11 h). The pilot on an A10
+# (docs/ENGLISH.md: 20,000 steps of about 12 utterances) reaches the first words of a sentence, WER 68%.
 base: ar_tts_en_10k.yaml
 
 model:
@@ -15,9 +15,11 @@ model:
     prompt: true           # a crop of another utterance of the speaker as the [voice] prefix, for a share of them
     max_seconds_per_char: 0.35   # the bound on a generated utterance's length, should the end head not fire
     # prenet: {dim: 256, dropout: 0.5}   # a bottleneck on the history (Tacotron 2, MELLE), at inference too
-    # clock: {rate: 1.57, lead: 4, fit: utterance}   # the text on the audio's clock: character j at rotary
-    #   position (j + 0.5) * rate - lead, audio step t at t (rate: patches per character; fit: utterance trains
-    #   with every utterance's own rate, global with `rate`); at inference `rate` is the tempo
+    clock:                 # the text on the audio's clock: character j at rotary position (j + 0.5) * rate - lead,
+      rate: 1.57           # audio step t at t. `rate`: patches per character, the corpus's mean; at inference the
+      lead: 4              # tempo. Without the clock the model did not read in 10,000 steps of the pilot; with it
+      fit: utterance       # the text counts 5.7 times as much there (docs/ENGLISH.md). fit: utterance trains with
+                           # every utterance's own rate, global with `rate`
 
 drift:
   cond_dropout: 0.1        # utterances without their text (the null branch of guidance)
