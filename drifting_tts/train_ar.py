@@ -479,7 +479,8 @@ def run(args) -> None:
         val_ds = ds
     else:
         ds, loader = build_loader(cfg)
-        val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9)
+        val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9,  # the held-out objective samples
+                            with_std=cfg.drift.get("target_noise") == "posterior")  # its targets as the training
     if ds.language != cfg.model.text.get("language", "tr"):
         raise ValueError(f"{cfg.data.root} is {ds.language!r} text (stats.json), the model's text frontend is "
                          f"{cfg.model.text.get('language', 'tr')!r}: set model.text.language")

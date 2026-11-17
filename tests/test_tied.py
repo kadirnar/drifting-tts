@@ -197,9 +197,29 @@ def test_train_ar_on_native_latents_with_a_tied_model(roots, tmp_path):
     from tests.test_loop_eval import TINY
 
     work = tmp_path / "run"
-    main(["train-ar", "--workdir", str(work), f"data.root={roots / 'native'}", *TINY, "train.steps=2",
-          "train.save_every=2", "model.ar.tied=true", "drift.detail=false", "drift.target_noise=posterior",
-          "train.sample_every=0"])
+    index = roots / "native" / "index.jsonl"  # two utterances as the held-out split of the loop's evaluation
+    lines = index.read_text().splitlines()
+    index.write_text("\n".join(l.replace('"split": "train"', '"split": "val"') if n < 2 else l
+                               for n, l in enumerate(lines)) + "\n")
+    quiet = ["train.vocoder=griffin-lim", "train.eval.num=1", "train.eval.asr=none", "train.eval.mos=none",
+             "train.eval.f0=false", "train.eval.batches=1", "train.eval.batch_size=2"]
+    class Decoder(FakeVAE):  # the loop's audio comes from the codec's decoder
+        hop_out, device = 960, "cpu"
+
+        def decode(self, latent):
+            return torch.zeros(latent.shape[0], latent.shape[-1] * 960)
+
+    from drifting_tts.latents import vocoder
+
+    original = vocoder.load_backend
+    vocoder.load_backend = lambda name, device="cpu", **kw: Decoder()
+    try:
+        main(["train-ar", "--workdir", str(work), f"data.root={roots / 'native'}", *TINY, "train.steps=2",
+              "train.save_every=2", "model.ar.tied=true", "drift.detail=false", "drift.target_noise=posterior",
+              "train.sample_every=0", "train.eval_every=2", *quiet])
+    finally:
+        vocoder.load_backend = original
+    assert (work / "eval_history.json").exists()  # the held-out objective draws posterior samples too
     ck = torch.load(work / "model_ema.pt", map_location="cpu", weights_only=False)
     assert ck["ema"]["head.out.weight"].shape[0] == 6 and ck["ema"]["x_in.weight"].shape[1] == 6
     from drifting_tts.train import load_tts
