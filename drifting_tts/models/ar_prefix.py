@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..text import BLANK_ID, PAD_ID, frontend
+from ..text import BLANK_ID, frontend
 from .ar import Block, DriftHead, patchify, unpatchify
 from .generator import RMSNorm
 

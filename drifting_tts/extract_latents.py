@@ -228,7 +228,8 @@ def run(args) -> None:
     std = np.sqrt(np.maximum((ss / n_native).cpu().numpy() - mean**2, 0.0))
     stats = {"backend": args.backend, "dim": int(be.dim), "frame_rate": rate, "latent_repeat": args.repeat,
              "latent_rate": be.frame_rate, "output_rate": be.output_rate, "audio_rate": sr, "mean": mean.tolist(),
-             "std": std.tolist(), "frames": int(total), "utterances": len(index), **storage_stats(args, sd, n_native, std)}
+             "std": std.tolist(), "frames": int(total), "utterances": len(index),
+             **storage_stats(args, sd, n_native, std)}
     stats.update({k: st_src[k] for k in ("f0_method", "lf0_mean", "lf0_std", "language") if k in st_src})
     (out / "stats.json").write_text(json.dumps(stats, indent=1))
     for name in ("speakers.json", "scores.jsonl"):

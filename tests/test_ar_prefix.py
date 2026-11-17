@@ -135,7 +135,8 @@ def test_the_clock_lays_the_text_over_the_audio():
         mel = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=r)
         tf = m.teacher_forced(one, torch.tensor([6]), mel, spk1, rate=None if r is None else torch.tensor([r]))
         torch.testing.assert_close(m.head(tf[0, :5], torch.zeros(5, 400)), patchify(mel, 4)[0], atol=1e-4, rtol=1e-4)
-    assert not torch.allclose(m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=1.0), mel, atol=1e-4)  # the tempo
+    slow = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=1.0)
+    assert not torch.allclose(slow, mel, atol=1e-4)  # the tempo
     voiced = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, prompt=torch.randn(1, 100, 16))
     assert voiced.shape == (1, 100, 20)
     with torch.no_grad():

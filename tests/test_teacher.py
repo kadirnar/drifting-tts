@@ -14,7 +14,7 @@ from drifting_tts.models.ar import FlowHead
 from drifting_tts.train import load_tts
 from drifting_tts.train_ar import Teacher, training_step
 from scripts import head_finetune as hf
-from tests.test_head_diagnostics import CFG, _checkpoint, _data_root
+from tests.test_head_diagnostics import _checkpoint, _data_root
 
 OVER = ["drift.gen_per_cond=4", "drift.max_rows=24", "model.ar.dim=32", "model.ar.depth=2", "model.ar.heads=2",
         "model.ar.head_dim=32", "model.ar.head_depth=2", "model.text.d=16", "model.text.layers=1",
@@ -35,7 +35,8 @@ def test_flow_head_is_a_velocity_field_sampled_in_steps():
     assert not torch.allclose(a, b)  # the time is read
     loss = head.loss(s, torch.randn(5, 12), torch.Generator().manual_seed(1))
     loss.backward()
-    assert torch.isfinite(loss) and head.body.out.weight.grad.abs().sum() > 0 and head.time.net[0].weight.grad is not None
+    assert torch.isfinite(loss) and head.body.out.weight.grad.abs().sum() > 0
+    assert head.time.net[0].weight.grad is not None
 
 
 def test_flow_matching_learns_a_conditional_distribution():

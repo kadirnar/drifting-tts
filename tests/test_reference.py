@@ -217,11 +217,8 @@ def test_references_are_another_utterance_of_the_speaker():
 def test_train_ar_with_references_and_the_synthesizers_modes(tmp_path):
     """Fine-tuning a prompted model with a reference encoder on prepared data (``MelDataset``'s references), then
     the Synthesizer: a recording as a prompt, through the reference encoder, or both."""
-    import soundfile as sf
-
     from drifting_tts.cli import main
     from drifting_tts.data import MelDataset
-    from drifting_tts.synthesize import Synthesizer
     from tests.test_data import _fake_parquet
     from tests.test_loop_eval import TINY
 

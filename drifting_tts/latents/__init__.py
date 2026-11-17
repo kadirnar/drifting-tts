@@ -17,7 +17,8 @@ from __future__ import annotations
 from .base import AudioBackend, LatentStats, resample, stream_decode
 
 BACKENDS = ("bigvgan", "dacvae", "voxcpm2", "voxcpm1.5", "mimi", "semantic-vae")
-VAE_BACKENDS = ("dacvae", "voxcpm2", "voxcpm1.5", "mimi", "semantic-vae")  # the TTS model can be trained on these (`extract-latents`)
+# the TTS model can be trained on these (`extract-latents`)
+VAE_BACKENDS = ("dacvae", "voxcpm2", "voxcpm1.5", "mimi", "semantic-vae")
 
 __all__ = ["BACKENDS", "VAE_BACKENDS", "AudioBackend", "LatentStats", "load_backend", "resample", "stream_decode"]
 

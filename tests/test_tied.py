@@ -182,7 +182,8 @@ def test_unused_channels_are_left_out_of_the_normalised_frames():
     z = st.normalize(x)
     assert not z[:, 1].any() and torch.allclose(z[:, 0], (x[:, 0] - 1.0) / 2.0)
     back = st.denormalize(z + 0.3)  # whatever a model writes there, the channel decodes as its mean
-    assert torch.allclose(back[:, 1], torch.full((2, 7), -2.0)) and torch.allclose(back[:, 2], (z[:, 2] + 0.3) * 0.1 + 0.5)
+    assert torch.allclose(back[:, 1], torch.full((2, 7), -2.0))
+    assert torch.allclose(back[:, 2], (z[:, 2] + 0.3) * 0.1 + 0.5)
     again = MelStats.from_dict(st.to_dict())
     assert again.to_dict() == st.to_dict() and st.to_dict()["active"] == [True, False, True]
     assert MelStats([0.0, 1.0], [1.0, 1.0], active=[True, True]).active is None  # all used: nothing to mask
@@ -199,8 +200,8 @@ def test_train_ar_on_native_latents_with_a_tied_model(roots, tmp_path):
     work = tmp_path / "run"
     index = roots / "native" / "index.jsonl"  # two utterances as the held-out split of the loop's evaluation
     lines = index.read_text().splitlines()
-    index.write_text("\n".join(l.replace('"split": "train"', '"split": "val"') if n < 2 else l
-                               for n, l in enumerate(lines)) + "\n")
+    index.write_text("\n".join(line.replace('"split": "train"', '"split": "val"') if n < 2 else line
+                               for n, line in enumerate(lines)) + "\n")
     quiet = ["train.vocoder=griffin-lim", "train.eval.num=1", "train.eval.asr=none", "train.eval.mos=none",
              "train.eval.f0=false", "train.eval.batches=1", "train.eval.batch_size=2"]
     class Decoder(FakeVAE):  # the loop's audio comes from the codec's decoder

@@ -149,7 +149,7 @@ def main() -> None:
         files = [t.get("file") for t in entry["targets"]]  # the speaker's other recordings, for SIM (unheard)
         heard = {i: sv(load16(root / f)).float().cpu() for i, f in enumerate(files) if f} if len(files) >= 3 else {}
         near = None if table is None else int((table @ ref_emb).argmax())
-        def voice(system: str, t: int):
+        def voice(system: str, t: int, prompt_path=prompt_path, entry=entry):
             """The voice of target ``t``: the prompt recording, and for the reference encoder with
             ``--reference-from other`` the recording of the speaker's next target (never the one spoken)."""
             mode = None if synth.model.ref_enc is None else MODES[system]
