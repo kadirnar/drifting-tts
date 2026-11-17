@@ -718,6 +718,21 @@ words that are the sentence's words in the sentence's order. UTMOSv2: one crop p
 - UTMOSv2 does not pay for the temperature: 3.09 at 1.0 against 2.84 at 0.5 (the aligned model 2.91, the
   recordings 3.27), on outputs of which 44% is quiet.
 
+The commands. `scripts/prefix_eval.py` makes the rows of the table and the text use; 20,000 steps take 3 h 20 min
+on an A10 (16.5 GB):
+
+    drifting-tts train-ar --config configs/ar_prefix_en.yaml --workdir runs/ar_prefix_en \
+        train.init_from=checkpoints/en/ardrift_en.pt train.batch_size=16 train.batch_frames=12000 \
+        train.lr=0.0002 train.steps=20000 train.warmup=1000 train.save_last=false \
+        drift.max_rows=768 drift.tau_init=0.06 drift.reference.max_seconds=4.0
+    python scripts/prefix_eval.py render --model runs/ar_prefix_en/model_ema.pt \
+        --vocoder checkpoints/en/bigvgan_en.pt --data data/train --out outputs/prefix/t1.0
+    python scripts/prefix_eval.py score --data data/train --mos t1.0=outputs/prefix/t1.0
+    python scripts/prefix_eval.py text-use --model runs/ar_prefix_en/model_ema.pt --data data/train --num 200
+
+`train.init_from` is the released aligned model for the first 20,000 steps and the run's own `model_ema.pt` for a
+continuation (`train.warmup=300`); `render --temperature 0.5` and `--own-tempo` make the other rows.
+
 **What the pilot says about #103's decision.** A prefix model with a drifting head learns to read on one A10
 without an aligner, a duration predictor or a prior mean, **if the text stands on the clock**; as a plain prefix
 it does not within what a pilot can afford. At 40,000 small steps it says 86% of the words of a sentence and 81%
