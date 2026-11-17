@@ -247,6 +247,10 @@ def test_finetune_decoder_of_an_ar_model_cpu(tiny_backend, latent_root, tmp_path
     assert wav.numel() > 0 and torch.isfinite(wav).all()
     with pytest.raises(ValueError, match="without guidance"):
         main([a if a != "train.gta_cfg=1.0" else "train.gta_cfg=2.0" for a in args] + ["train.steps=3"])
+    # #90: free-running GTA latents (the model's own history), where guidance is allowed; resumes from step 2
+    main([a if a != "train.gta_cfg=1.0" else "train.gta_cfg=2.0" for a in args]
+         + ["train.steps=4", "train.gta_free_prob=1.0", "train.gta_temperature=auto"])
+    assert load_decoder_checkpoint(path)["step"] == 4
     # distillation without discriminators: noisy recorded latents and GTA latents against the released decoder
     distill = [a.replace(str(work), str(tmp_path / "distill")) for a in args]
     main(distill + ["train.gta_prob=0.5", "train.teacher=true", "train.latent_noise=0.3", "train.adv_loss_coeff=0",

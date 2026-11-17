@@ -12,6 +12,7 @@ from drifting_tts.config import Config
 from drifting_tts.models.ar import ARDriftTTS
 from scripts import c2st_mel as c2st
 from scripts import drift_calibration as calib
+from scripts import gta_mismatch as gm
 
 CFG = {"data": {"max_frames": 1500},
        "drift": {"crop_frames": 8},
@@ -181,3 +182,49 @@ def test_calibration_script_on_a_tiny_model(tmp_path, monkeypatch, capsys):
                                  "T0.5/free_running"}
     assert r["texture"]["recording"]["boundary_ratio"] == pytest.approx(1.0, abs=0.2)
     assert "spread / error" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------------------------ GTA mismatch (#90)
+
+
+def test_gta_mismatch_measures_distance_pause_energy_and_patch_joins():
+    rec = [m for m in _smooth_mel(3, 64)]
+    assert gm.distance_db(rec, rec, 2.0)["mean"] == 0.0
+    d = gm.distance_db(rec, [m + 0.1 for m in rec], 2.0)
+    assert d["mean"] == pytest.approx(0.1 * 2.0 * gm.DB, rel=1e-4) and len(d["parts"]) == 4
+    assert d["parts"] == pytest.approx([d["mean"]] * 4, rel=1e-4)
+    late = [m + 0.1 * (torch.arange(64) >= 48) for m in rec]  # the error is in the last quarter only
+    assert gm.distance_db(rec, late, 2.0)["parts"][:3] == [0.0, 0.0, 0.0]
+    # a murmur in the quietest frames only: +6 dB of power there is 0.5 * ln(4) in log-magnitude
+    loud = []
+    for m in rec:
+        quiet = (2 * m).exp().sum(0).argsort()[:6]  # 10% of 64 frames
+        x = m.clone()
+        x[:, quiet] += 0.5 * np.log(4.0)
+        loud.append(x)
+    assert gm.pause_excess_db(rec, loud, 0.0, 1.0)["mean"] == pytest.approx(10 * np.log10(4.0), abs=1e-3)
+    assert gm.pause_excess_db(rec, rec, 0.0, 1.0)["mean"] == pytest.approx(0.0, abs=1e-4)
+    # a recording has no patch grid; independent offsets per patch do not join
+    assert gm.frame_change_db(rec, 1.0, 4)["ratio"] == pytest.approx(1.0, abs=0.1)
+    steps = [m + 0.3 * torch.randn(16, generator=torch.Generator().manual_seed(0)).repeat_interleave(4) for m in rec]
+    c = gm.frame_change_db(steps, 1.0, 4)
+    assert c["ratio"] > 1.5 and c["inside"] == pytest.approx(gm.frame_change_db(rec, 1.0, 4)["inside"], rel=1e-4)
+
+
+def test_gta_mismatch_renditions_share_the_recordings_frames(tmp_path):
+    from drifting_tts.data import MelDataset
+    from drifting_tts.train import load_tts
+
+    model, _, _ = load_tts(_checkpoint(tmp_path), "cpu")
+    ds = MelDataset(_data_root(tmp_path), "val", min_frames=1)
+    idx = [4, 0, 2]
+    mels = gm.renditions(model, ds, idx, "cpu", 0.5, batch=2)
+    assert set(mels) == set(gm.KINDS) and all(len(v) == 3 for v in mels.values())
+    for j, i in enumerate(idx):  # in the order asked for, frame for frame with the recording
+        torch.testing.assert_close(mels["rec"][j], ds[i]["mel"].float(), rtol=1e-4, atol=1e-5)
+        assert all(mels[k][j].shape == (100, 64) for k in gm.KINDS)
+    assert not torch.allclose(mels["tf"][0], mels["tf2"][0])  # two draws of the head's noise
+    cold = gm.renditions(model, ds, idx, "cpu", 0.0, batch=2)
+    torch.testing.assert_close(cold["tf"][0], cold["tf2"][0])  # no noise: one teacher-forced mel
+    torch.testing.assert_close(cold["free"][0][:, :4], cold["tf"][0][:, :4], rtol=1e-4, atol=1e-5)  # the first patch
+    assert not torch.allclose(cold["free"][0][:, 4:], cold["tf"][0][:, 4:], atol=1e-3)

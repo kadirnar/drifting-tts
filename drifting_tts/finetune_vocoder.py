@@ -17,6 +17,10 @@ GAN objective:
   discriminators (:class:`VAEDecoderGAN`). DAC-VAE's watermark stays frozen and is added as at release. Exports
   ``decoder_ft.pt`` for ``LatentVocoder`` / ``Synthesizer(vocoder=...)``.
 
+``train.gta_free_prob`` (ARDrift, #90): this share of the generated batches is drawn free-running, on the model's own
+history as at inference, instead of teacher-forced on the recording's; ``gta_temperature`` / ``gta_cfg: auto`` take
+the TTS checkpoint's operating point (:func:`gta_operating_point`).
+
 ``vocoder.objective: drift`` trains either architecture without a GAN (:class:`DriftVocoder`, ``drift_vocoder.py``).
 ``train.speaker_balance`` (any trainer, opt-in) gives chosen speakers fixed shares of the batches and splits the rest
 over the other speakers by their amount of audio raised to a temperature (:func:`batch_sampler`).
@@ -54,11 +58,32 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("overrides", nargs="*", help="config overrides, e.g. train.steps=1000")
 
 
+def gta_operating_point(tc, tts) -> tuple[float, float]:
+    """``(gta_temperature, gta_cfg)`` of a run. ``auto`` (either key): the TTS checkpoint's preferred value
+    (``calibrate-durations --temperature / --cfg``), else the Synthesizer's default for its kind, so the vocoder
+    trains on the mels it decodes at inference (#90). A missing ``gta_cfg`` stays 1, as before."""
+    from .synthesize import DEFAULT_CFG, DEFAULT_TEMPERATURE
+
+    temperature, cfg = tc.get("gta_temperature", "auto"), tc.get("gta_cfg", 1.0)
+    if temperature == "auto":
+        stored = getattr(tts, "temperature", None)
+        temperature = DEFAULT_TEMPERATURE if stored is None else stored
+    if cfg == "auto":
+        stored = getattr(tts, "cfg_scale", None)
+        cfg = DEFAULT_CFG["ar" if hasattr(tts, "gta") else "dit"] if stored is None else stored
+    return float(temperature), float(cfg)
+
+
 @torch.no_grad()
 def gta_mels(tts, batch: dict, temperature: float, device, cfg_scale: float = 1.0, steps: int | None = None,
-             generator: torch.Generator | None = None) -> torch.Tensor:
-    """Teacher-forced (ground-truth alignment) generated mels ``[B, n_mels, T]`` (normalised), or latent frames for a
-    model trained on VAE latents.
+             generator: torch.Generator | None = None, free: bool = False) -> torch.Tensor:
+    """Generated mels ``[B, n_mels, T]`` (normalised) under the ground-truth alignment, frame for frame with the
+    recording, or latent frames for a model trained on VAE latents.
+
+    An autoregressive model (ARDrift) draws them teacher-forced, every patch from the state after the *recorded*
+    previous patches, in one pass; with ``free`` every patch follows the model's *own* previous patches, as at
+    inference (``train.gta_free_prob``, #90: one backbone step per patch, guidance allowed). The DiT has no history:
+    ``free`` changes nothing for it.
 
     Pitch-conditioned models use the ground-truth pitch from ``batch["f0"]``, or the predicted pitch without it."""
     text, text_len = batch["text"].to(device), batch["text_len"].to(device)
@@ -71,9 +96,13 @@ def gta_mels(tts, batch: dict, temperature: float, device, cfg_scale: float = 1.
         pitch = token_pitch(batch["f0"].to(device), attn, lf0_mean, lf0_std) if "f0" in batch else None
         h, _ = tts.pitch_condition(h, x_mask, spk, pitch)
     cond = tts.frame_condition(h, mu, attn)
+    if hasattr(tts, "gta") and free:  # ARDrift on its own history, the recording's alignment
+        generate = getattr(tts, "fast_generator", None) or tts.generate
+        return generate(cond, spk, temperature, generator, cfg_scale=cfg_scale) * y_mask[:, None]
     if hasattr(tts, "gta"):  # ARDrift: one teacher-forced pass (no guidance)
         if cfg_scale != 1.0:
-            raise ValueError("GTA latents of an autoregressive model are drawn without guidance (gta_cfg: 1)")
+            raise ValueError("teacher-forced GTA latents of an autoregressive model are drawn without guidance "
+                             "(gta_cfg: 1, or train.gta_free_prob: 1)")
         return tts.gta(cond, y, spk, temperature, generator) * y_mask[:, None]
     z = torch.randn(y.shape[0], y.shape[1], y.shape[-1], device=device, generator=generator) * temperature
     alpha = torch.full((y.shape[0],), float(cfg_scale), device=device)
@@ -885,11 +914,16 @@ def batch_sampler(ds: MelDataset, tc) -> BucketBatchSampler:
 
 @torch.no_grad()
 def log_samples(gan, tts, batch: dict, stats: MelStats, tc, writer, step: int, device) -> None:
-    """Full validation utterances: the vocoder on GTA mels and on recorded mels, plus the real audio."""
-    gta = stats.denormalize(gta_mels(tts, batch, tc.gta_temperature, device, cfg_scale=tc.get("gta_cfg", 1.0)))
-    rec = stats.denormalize(batch["mel"].to(device))
+    """Full validation utterances: the vocoder on GTA mels (teacher-forced unless every generated batch is
+    free-running; both with a mix) and on recorded mels, plus the real audio."""
+    temperature, cfg_scale = gta_operating_point(tc, tts)
+    share = tc.get("gta_free_prob", 0.0) if hasattr(tts, "gta") else 0.0
+    mels = {"recorded_mel": stats.denormalize(batch["mel"].to(device))}
+    for name, free in (("gta", False), ("gta_free", True)):
+        if (share < 1.0) if not free else (share > 0.0):
+            mels[name] = stats.denormalize(gta_mels(tts, batch, temperature, device, cfg_scale=cfg_scale, free=free))
     for i, n in enumerate(batch["mel_len"].tolist()):
-        for name, mel in (("gta", gta), ("recorded_mel", rec)):
+        for name, mel in mels.items():
             wav = gan.generate(mel[i: i + 1, :, :n])[0].clamp(-1, 1).float().cpu()
             writer.add_audio(f"{name}/{i}", wav, step, sample_rate=SAMPLE_RATE)
         writer.add_audio(f"real/{i}", batch["audio"][i, : gan.audio_samples(n)], step, sample_rate=SAMPLE_RATE)
@@ -950,6 +984,17 @@ def run(args) -> None:
         val = val if len(val) else ds
         samples = collate([val[i] for i in range(min(tc.get("num_samples", 2), len(val)))])
 
+    temperature, cfg_scale = gta_operating_point(tc, tts)
+    free_prob = float(tc.get("gta_free_prob", 0.0))  # share of the generated batches drawn free-running (#90)
+    if not 0.0 <= free_prob <= 1.0:
+        raise ValueError(f"train.gta_free_prob must be in [0, 1], got {free_prob}")
+    if free_prob > 0 and not hasattr(tts, "gta"):
+        raise ValueError("train.gta_free_prob is for an autoregressive TTS model (ARDrift): the DiT has no history")
+    if free_prob > 0 and device == "cuda":  # one CUDA graph per batch size, replayed for every patch
+        tts.enable_fast(max_steps=-(-d.max_frames // tts.patch) + 1)
+    print(f"GTA mels: temperature {temperature:g}, guidance {cfg_scale:g}"
+          + (f", {100 * free_prob:.0f}% of them free-running" if free_prob else ""), flush=True)
+
     step = 0
     if (work / "last.pt").exists():
         ck = torch.load(work / "last.pt", map_location="cpu", weights_only=False)
@@ -967,7 +1012,8 @@ def run(args) -> None:
     while step < tc.steps:
         batch = next(it)
         use_gta = torch.rand(()) < tc.gta_prob
-        mel = gta_mels(tts, batch, tc.gta_temperature, device, cfg_scale=tc.get("gta_cfg", 1.0)) if use_gta \
+        free = bool(use_gta) and free_prob > 0 and bool(torch.rand(()) < free_prob)
+        mel = gta_mels(tts, batch, temperature, device, cfg_scale=cfg_scale, free=free) if use_gta \
             else batch["mel"].to(device)
         if not use_gta and tc.get("latent_noise", 0) > 0:
             mel = add_latent_noise(mel, tc.latent_noise, gan.repeat)
@@ -980,7 +1026,7 @@ def run(args) -> None:
             metrics = gan.step(x, audio, step)
         step += 1
         if "mel" in metrics:  # the mel loss on generated and on recorded frames, separately
-            metrics[f"mel_{'gta' if use_gta else 'recorded'}"] = metrics["mel"]
+            metrics[f"mel_{('gta_free' if free else 'gta') if use_gta else 'recorded'}"] = metrics["mel"]
         for k, v in metrics.items():
             total, count = agg.get(k, (0.0, 0))
             agg[k] = (total + v, count + 1)

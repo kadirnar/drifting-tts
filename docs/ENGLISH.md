@@ -170,6 +170,91 @@ percentile of the 20 ms frame energies minus the 95th, lower is quieter):
   1 GB, every stored file version included. Its English tab keeps Vocos v2. The vocoder is not on the Hub and not in
   the vocoder registry.
 
+## GTA mels that match inference (#90)
+
+`finetune-vocoder` draws ARDrift's mels teacher-forced: one pass, every patch from the state after the *recorded*
+previous patches (`ARDriftTTS.gta`). At inference every patch follows the model's own patches. Under the recording's
+alignment both can be generated frame for frame with the recording, so the difference the vocoder never trains on can
+be measured (`scripts/gta_mismatch.py`; the released model, T 0.5, held-out utterances).
+
+**The mels** (200 utterances; dB of log-mel magnitude):
+
+| | recording | teacher-forced | free-running |
+|---|---|---|---|
+| mean distance to the recording | – | 2.31 dB | 4.38 dB |
+| frame-to-frame change inside a patch | 4.96 dB | 4.72 dB | 4.68 dB |
+| ... across a patch boundary | 4.92 dB | **5.89 dB** | 4.70 dB |
+| energy of the recording's quietest 10% of frames | – | +0.75 dB | +1.56 dB |
+
+Two teacher-forced draws of the same utterance are 1.58 dB apart (the head's own noise). The distances do not grow
+along the utterance (by quarter: 5.1 / 4.4 / 3.9 / 4.3 dB free-running), so the model's error does not accumulate.
+
+- **Teacher-forced patches do not join.** Every patch is drawn after the recorded history, independently of the
+  generated patch before it, so the mel steps at every patch boundary: 25% more change there than inside a patch.
+  A recording has no such grid, and neither has the free-running mel, whose patches continue each other.
+- **A classifier tells the two apart** (`c2st_mel.py`'s test; two teacher-forced draws: 0.50): 0.67 from 4 frames,
+  0.86 from 16, 0.92 from 64. On one-patch windows it is 0.58 on the patch grid and 0.81 half a patch off it: the
+  tell is where the patches join.
+- **The free-running mel is a different reading of the sentence**: twice as far from the recording, which makes the
+  recording a noisier target for it.
+
+**Through the vocoders** (val 100, the judges of [HEAD_REALISM.md](HEAD_REALISM.md#a-panel-of-judges-where-the-audible-gap-is),
+both mels under the recording's alignment):
+
+| vocoder | mel | UTMOSv2 | UTMOS22 | SCOREQ | NISQA | DNSMOS OVRL | SQUIM | Audiobox PQ |
+|---|---|---|---|---|---|---|---|---|
+| – | recording | 3.27 | 4.20 | 4.28 | 4.63 | 3.29 | 4.33 | 7.49 |
+| NVIDIA BigVGAN-v2, as released | teacher-forced | 2.63 | 2.95 | 3.10 | 4.38 | 2.94 | 4.08 | 6.54 |
+| NVIDIA BigVGAN-v2, as released | free-running | 2.83 | 3.37 | 3.51 | 4.44 | 3.13 | 4.16 | 6.89 |
+| BigVGAN-v2 GTA 40k (teacher-forced GTA) | teacher-forced | 3.29 | 4.05 | 4.17 | 4.59 | 3.29 | 4.30 | 7.44 |
+| BigVGAN-v2 GTA 40k (teacher-forced GTA) | free-running | 3.32 | 4.07 | 4.21 | 4.60 | 3.32 | 4.32 | 7.51 |
+
+- **Teacher-forced mels are the harder input, not the easier one.** An unadapted vocoder renders the steps at the
+  patch boundaries: 0.42 UTMOS22 and 0.41 SCOREQ below the free-running mels of the same sentences (all seven judges
+  significant).
+- **The fine-tuned vocoder has learned to repair them**, and decodes the free-running mels it never saw slightly
+  better than its own training mels (all seven judges higher, three significantly).
+
+**Does training on free-running mels help?** `train.gta_free_prob` draws that share of the generated batches
+free-running (the recording's alignment, the model's own history; guidance is allowed there). Three fine-tunes of
+NVIDIA's generator with the released recipe, the same seed and the same data (3,194 utterances of up to 16 s, 6.0 h,
+1,266 speakers, from eight shards of the corpus), on an A10. The system as it is used (predicted durations,
+free-running, T 0.5; val 100; WER by Whisper large-v3):
+
+| vocoder | steps | UTMOSv2 | UTMOS22 | SCOREQ | NISQA | DNSMOS OVRL | SQUIM | Audiobox PQ | WER |
+|---|---|---|---|---|---|---|---|---|---|
+| NVIDIA BigVGAN-v2, as released | 0 | 2.91 | 3.45 | 3.61 | 4.46 | 3.12 | 4.17 | 6.95 | 2.10% |
+| teacher-forced GTA (`gta_free_prob: 0`) | 2,500 | 3.28 | 4.10 | 4.20 | 4.57 | 3.28 | 4.30 | 7.46 | 2.10% |
+| | 5,000 | 3.22 | 4.09 | 4.25 | 4.56 | 3.27 | 4.29 | 7.45 | 2.17% |
+| half free-running (`gta_free_prob: 0.5`) | 2,500 | 3.25 | 4.04 | 4.17 | 4.55 | 3.25 | 4.33 | 7.43 | 2.17% |
+| | 5,000 | 3.34 | 4.07 | 4.23 | 4.58 | 3.26 | 4.30 | 7.45 | 2.17% |
+| all free-running (`gta_free_prob: 1`) | 2,500 | 3.26 | 4.01 | 4.12 | 4.52 | 3.24 | 4.33 | 7.41 | 2.37% |
+| released: teacher-forced GTA, 105 h | 40,000 | 3.38 | 4.13 | 4.25 | 4.63 | 3.29 | 4.32 | 7.51 | 2.37% |
+| recording | – | 3.27 | 4.20 | 4.28 | 4.63 | 3.29 | 4.33 | 7.49 | 2.44% |
+
+- **No, and the more of them the lower.** After 2,500 steps the system falls with the share of free-running
+  batches on five of seven judges: UTMOS22 4.10 / 4.04 / 4.01 and SCOREQ 4.20 / 4.17 / 4.12 for none, half and all
+  of them (four judges significantly lower for half, the same four for all; the third run was stopped there). After
+  5,000 steps half is mixed (three judges higher; UTMOSv2 +0.13 and SCOREQ -0.03 are the significant ones).
+- **What differs between the two vocoders is not how they decode the model's mels.** They differ by the same
+  amounts on copy-synthesis of *recorded* mels (UTMOSv2 +0.16, SCOREQ -0.03): system minus copy-synthesis is within
+  0.03 on every judge and no interval excludes 0. And each decodes the free-running mel better than the
+  teacher-forced one by the same margin (half free-running against teacher-forced vocoder: UTMOS22 +0.10 / +0.12,
+  SCOREQ +0.10 / +0.09, Audiobox PQ +0.11 / +0.10): the interaction is inside its interval on all seven judges.
+  There is one run per arm, and UTMOSv2 alone moves by 0.06 to 0.10 between two snapshots of one run.
+- **Why it need not help.** The teacher-forced mel carries the model's texture *and* the boundary steps, and it is
+  the cleaner pair: 2.3 dB from the recording that is the vocoder's target, against 4.4 dB (multi-scale mel loss on
+  those batches 1.09 against 1.44). A free-running batch also costs one backbone step per patch: 1.15 it/s against
+  1.64.
+- **A short fine-tune gives most of the vocoder's gain.** 2,500 steps on 6 h (25 minutes on an A10) recover 91-95%
+  of what the released 40k-step vocoder gains over NVIDIA's on UTMOS22, SCOREQ, SQUIM and Audiobox PQ (DNSMOS 89%,
+  UTMOSv2 78%, NISQA 64%). What the long fine-tune still adds is mostly the repair of the boundary steps, which
+  inference never meets: at 5,000 steps the teacher-forced mel decodes 0.12 UTMOS22 below the free-running one, for
+  the 40k vocoder 0.03.
+
+`gta_free_prob` stays 0. `gta_temperature: auto` / `gta_cfg: auto` take the operating point stored in the TTS
+checkpoint, so that a vocoder is not fine-tuned at another temperature than the model is used at.
+
 ## Pauses: the duration predictor re-fitted to the mean (#72)
 
 #72 planned a discriminator against the pause noise of the table above. The measurement came first (val 100 or 200,
@@ -259,6 +344,14 @@ drifting-tts evaluate --model runs/ar_en_10k/model_ema.pt --split val --num 100 
 drifting-tts finetune-vocoder --config configs/vocoder_bigvgan_en_gta.yaml --workdir runs/en_bigvgan_gta
 drifting-tts evaluate --model runs/ar_en_10k/model_ema.pt --split val --num 100 --temperature 0.5 \
     --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt
+# GTA mels (#90): teacher-forced against free-running mels under the recording's alignment; a fine-tune that
+# draws half of its generated batches free-running; the judges on wav folders of the same sentences
+python scripts/gta_mismatch.py --model runs/en_dur/model_poisson.pt --data data/en_pilot --split val --num 200 \
+    --temperature 0.5 --out outputs/diag/gta_mismatch_T0.5.json
+drifting-tts finetune-vocoder --config configs/vocoder_bigvgan_en_gta.yaml --workdir runs/en_bigvgan_free \
+    train.gta_free_prob=0.5 train.steps=5000
+python scripts/judge_panel.py --systems recording=wav/recording tf=wav/tf free=wav/free --baseline tf \
+    --out outputs/judge/panel
 # an external text set (one sentence per line), band-matched as the Turkish benchmark; data scores in English
 drifting-tts benchmark --model runs/ar_en_10k/model_ema.pt --vocoder vocos-v2 --texts texts_en.txt --speaker 42
 drifting-tts score --data data/en_pilot --scorers asr,rate,mos

@@ -182,6 +182,36 @@ def test_gta_draws_each_patch_after_the_recorded_ones():
     assert m.gta(cond, y[..., :30], spk, 0.5).shape == (1, 100, 30)  # not a whole number of patches
 
 
+def test_free_running_gta_follows_the_models_own_history():
+    """``gta_mels(free=True)`` (#90): the model's own patches as history under the recording's alignment. At
+    temperature 0 it agrees with the teacher-forced draw on the first patch only, and teacher forcing on its own
+    output reproduces it (the free-running mel is the fixed point of the teacher-forced pass)."""
+    import pytest
+
+    from drifting_tts.finetune_vocoder import gta_mels, gta_operating_point
+
+    m = _model()
+    torch.manual_seed(1)
+    batch = {"text": torch.randint(1, 20, (2, 9)), "text_len": torch.tensor([9, 7]), "mel": torch.randn(2, 100, 32),
+             "mel_len": torch.tensor([32, 24]), "spk": torch.tensor([1, 2])}
+    tf, free = gta_mels(m, batch, 0.0, "cpu"), gta_mels(m, batch, 0.0, "cpu", free=True)
+    assert free.shape == tf.shape == (2, 100, 32) and not free[1, :, 24:].any()  # masked past the utterance
+    torch.testing.assert_close(free[..., :4], tf[..., :4], atol=1e-5, rtol=1e-4)
+    assert not torch.allclose(free[..., 4:], tf[..., 4:], atol=1e-3)
+    cond, spk = torch.randn(1, 116, 32), torch.tensor([1])
+    own = m.generate(cond, spk, temperature=0.0)
+    torch.testing.assert_close(m.gta(cond, own, spk, temperature=0.0), own, atol=1e-5, rtol=1e-4)
+    assert torch.isfinite(gta_mels(m, batch, 0.5, "cpu", cfg_scale=2.0, free=True)).all()  # guidance is allowed
+    with pytest.raises(ValueError, match="without guidance"):
+        gta_mels(m, batch, 0.5, "cpu", cfg_scale=2.0)
+    # the operating point: the config's values, or with ``auto`` the checkpoint's, else the Synthesizer's defaults
+    assert gta_operating_point(Config({"gta_temperature": 0.5}), m) == (0.5, 1.0)
+    assert gta_operating_point(Config({"gta_temperature": "auto", "gta_cfg": "auto"}), m) == (0.5, 1.0)
+    m.temperature, m.cfg_scale = 0.3, 1.5
+    assert gta_operating_point(Config({"gta_temperature": "auto", "gta_cfg": "auto"}), m) == (0.3, 1.5)
+    assert gta_operating_point(Config({"gta_temperature": 0.7, "gta_cfg": 1.0}), m) == (0.7, 1.0)
+
+
 def test_band_energy_follows_the_loudest_bins():
     from drifting_tts.models.ar import band_energy
 
