@@ -453,8 +453,9 @@ residual to the aligned prior mean, the prior mean carries the text also in the 
 state scales the residual. Distilling the guided state into the backbone works as a mechanism (the student speaks
 in one pass as its teacher in two) and has nothing good to distil here. **Voice guidance is the lever that works**:
 with voice dropout 0.15 in a fine-tune of the reference model, a null branch without the voice lifts the
-reference alone on unseen speakers from SIM-o 0.438 to 0.491 / 0.524 / 0.548 / 0.563 at scales 1.5 / 2 / 2.5 / 3
-(0.387 to 0.466 against a recording the model was never given; the prompt: 0.546 and 0.464) at 2.6–3.0% WER.
+reference alone on unseen speakers from SIM-o 0.438 to 0.491 / 0.524 / 0.548 / 0.563 / 0.585 / 0.593 at scales
+1.5 / 2 / 2.5 / 3 / 4 / 5 (0.387 to 0.485 against a recording the model was never given; the prompt: 0.546 and
+0.464) at 2.6–3.1% WER.
 
 ## 6. Pitfalls and engineering notes
 

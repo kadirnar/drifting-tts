@@ -260,16 +260,22 @@ the text stays). The 36 unseen recorded speakers, the voice from the reference a
 | 1.5 | 0.491 | 0.422 | 2.60% | 3.33 st |
 | 2.0 | 0.524 | 0.443 | 2.79% | 3.32 st |
 | 2.5 | 0.548 | 0.457 | 2.99% | 3.38 st |
-| **3.0** | **0.563** | **0.466** | 3.04% | 3.39 st |
+| 3.0 | 0.563 | 0.466 | 3.04% | 3.39 st |
+| 4.0 | 0.585 | 0.477 | 3.09% | 3.51 st |
+| **5.0** | **0.593** | **0.485** | 3.09% | 3.62 st |
 | the prompt, no guidance | 0.546 | 0.464 | 3.24% | 3.03 st |
 | prompt + reference, no guidance | 0.554 | 0.464 | 3.24% | 3.01 st |
 
-- **Every step of the scale adds voice**: +0.035, +0.056, +0.070 and +0.079 on the voice alone (the last: 95%
-  +0.065 to +0.092, higher on 87% of the items), for a quarter of a point of WER at most. The curve had not turned
-  at 3.
-- **At 3 the reference alone is the prompt's equal**: the same similarity with an unheard recording (0.466 against
-  0.464, the difference inside its interval), a higher SIM-o (+0.017), fewer word errors and a wider F0. A
-  reference need not be contiguous with the output and does not carry its recording's conditions into it.
+- **Every step of the scale adds voice**: +0.035, +0.056, +0.070 and +0.079 on the voice alone up to 3 (the
+  last: 95% +0.065 to +0.092, higher on 87% of the items), for a quarter of a point of WER at most. The curve
+  flattens and has not turned at 5 (5 over 4: +0.008, 95% +0.004 to +0.013).
+- **At 3 the reference alone is the prompt's equal, from 4 on it is ahead**: the similarity with an unheard
+  recording is 0.466 against 0.464 at 3 (inside its interval), +0.013 at 4 (95% +0.002 to +0.024) and +0.021 at 5
+  (+0.009 to +0.034); SIM-o +0.017, +0.039 and +0.047; fewer word errors and a wider F0. A reference need not be
+  contiguous with the output and does not carry its recording's conditions into it.
+- **A reference from another recording of the speaker**, at 3: alone 0.449 and 0.453 with an unheard recording
+  (unguided: 0.373 and 0.381), level with the prompt (−0.011, inside its interval); the prompt with it 0.541 and
+  0.482, +0.017 over the prompt alone (95% +0.007 to +0.027) at 2.8% WER.
 - **Why the voice and not the text.** The voice reaches the output only through the state (the tokens and the
   speaker row), as the text does in Pocket TTS; the text reaches ARDrift's output through the prior mean as well.
 - **It does little for a prompt** (prompt + reference at 1.5: +0.003): the prompt is history, and the null branch
@@ -278,7 +284,7 @@ the text stays). The 36 unseen recorded speakers, the voice from the reference a
   without the voice in the null branch.
 - **The dropouts cost nothing**: without guidance the model is where it was before them (0.546 / 0.438 / 0.554 for
   prompt / reference / both).
-- Not done: scales above 3, guidance with a prompt in the null branch removed, and the distillation of voice
+- Not done: scales above 5, guidance with a prompt in the null branch removed, and the distillation of voice
   guidance into the backbone (`drift.distill` takes voices of the speaker table; a reference would have to come
   with the batch).
 
