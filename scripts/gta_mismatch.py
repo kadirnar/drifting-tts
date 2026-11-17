@@ -39,9 +39,10 @@ KINDS = ("rec", "tf", "tf2", "free")
 
 @torch.no_grad()
 def renditions(model, ds, idx: list[int], dev: str, temperature: float, seed: int = 0, batch: int = 10,
-               cfg_scale: float = 1.0) -> dict[str, list[torch.Tensor]]:
+               cfg_scale: float = 1.0, history_noise: float = 0.0) -> dict[str, list[torch.Tensor]]:
     """Normalised mels ``[n_mels, T]`` of the utterances ``idx``: the recording (``rec``), two teacher-forced draws
     (``tf``, ``tf2``) and a free-running one (``free``), all under the recording's alignment, in the order of ``idx``.
+    ``history_noise`` (#101): noise of this level on what the backbone reads of the free-running history.
     """
     from drifting_tts.alignment import sequence_mask
     from drifting_tts.data import collate
@@ -56,7 +57,8 @@ def renditions(model, ds, idx: list[int], dev: str, temperature: float, seed: in
         attn, _ = align(mu, x_mask, y, sequence_mask(y_len, y.shape[-1])[:, None].float())
         cond = model.frame_condition(h, mu, attn)
         g = [torch.Generator(device=dev).manual_seed(seed + 3 * b0 + j) for j in range(3)]
-        free = (model.fast_generator or model.generate)(cond, spk, temperature, g[2], cfg_scale=cfg_scale)
+        free = (model.fast_generator or model.generate)(cond, spk, temperature, g[2], cfg_scale=cfg_scale,
+                                                        history_noise=history_noise)
         mels = {"rec": y, "tf": model.gta(cond, y, spk, temperature, g[0]),
                 "tf2": model.gta(cond, y, spk, temperature, g[1]), "free": free}
         for k, m in mels.items():
@@ -108,6 +110,8 @@ def main() -> None:
     ap.add_argument("--num", type=int, default=200)
     ap.add_argument("--temperature", type=float, default=0.5)
     ap.add_argument("--cfg", type=float, default=1.0, help="guidance of the free-running rendition")
+    ap.add_argument("--history-noise", type=float, default=0.0,
+                    help="noise on the free-running history, as on the recorded one in training (#101)")
     ap.add_argument("--batch", type=int, default=10)
     ap.add_argument("--windows", type=int, nargs="+", default=[4, 16, 64])
     ap.add_argument("--views", nargs="+", default=["full", "envelope", "detail", "delta"])
@@ -131,12 +135,13 @@ def main() -> None:
         if dev == "cuda":
             model.enable_fast()
         mels = renditions(model, ds, list(range(min(args.num, len(ds)))), dev, args.temperature, args.seed,
-                          args.batch, args.cfg)
+                          args.batch, args.cfg, args.history_noise)
         if args.cache:
             Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
             torch.save(mels, args.cache)
     n = len(mels["rec"])
-    res: dict = {"model": args.model, "temperature": args.temperature, "cfg": args.cfg, "utterances": n,
+    res: dict = {"model": args.model, "temperature": args.temperature, "cfg": args.cfg,
+                 "history_noise": args.history_noise, "utterances": n,
                  "distance_db": {}, "pause_db": {}, "c2st": {}}
     print(f"{n} utterances, T {args.temperature:g}, under the recordings' alignment\n")
     print("mean |log-mel difference| in dB (and by quarter of the utterance)")

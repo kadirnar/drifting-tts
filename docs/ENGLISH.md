@@ -483,8 +483,208 @@ the utterances, for 6,000 more steps from the pilot above (1.9 it/s, 53 minutes)
   steps) nor more recorded speakers (LibriTTS-R has another 500 h) were tried.
 
 Not done: the per-voice pause tables and the prosody sampler fall back to the pooled defaults for a prompted
-voice; the benchmark has no `--ref-audio` yet; voice guidance (#99) and the reference encoder (#96) are their own
-issues.
+voice; the benchmark has no `--ref-audio` yet; voice guidance is in [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#guidance-99).
+
+### A reference from another utterance (#96)
+
+A prompt is the beginning of the recording that the model continues: it carries the recording's conditions and has
+to stand directly in front of the output. The second path gives the model the voice alone: a crop of **another**
+utterance of the speaker, no transcript, in front of the sequence.
+
+- **Data.** A shard of the 10,000 h corpus holds one or two utterances per speaker, so every loader worker keeps
+  one utterance of each speaker it has read and pairs across shards (`drift.reference`: a crop of 3–6 s, never the
+  target; a prepared dataset pairs within itself). Recorded speech (#104) comes in speaker order and pairs within
+  a shard.
+- **Training.** Prompts and references train together: a prompt for 40% of the utterances that can be cut, a
+  reference for 85% of those that have one, the speaker row dropped for half of each. A voice without a row always
+  has one of the two.
+- **Inference.** `tts.reference("voice.wav", mode=...)`: `prefix` (the first 6 s as a prompt), `reference` (the
+  recording through the reference path) or `both`.
+
+**The first design did not train.** `kind: resampler`: four transformer layers over the reference's patches and 32
+learned queries (a Perceiver resampler, the conditioning encoder of [XTTS](https://arxiv.org/abs/2406.04904)), whose
+tokens stand in front of the backbone's sequence. Two fine-tunes of 6,000 steps from the model with recorded
+speech, on the 36 unseen recorded speakers (SIM-o with the prompt recording):
+
+| run | prompt | reference alone | both |
+|---|---|---|---|
+| control: the prompted model, 6,000 more steps without a reference path | 0.538 | – | – |
+| resampler; the reference alone trains on a tenth of the utterances | 0.546 | 0.234 | 0.546 |
+| resampler; the reference alone trains on 45% of the utterances | 0.546 | 0.224 | 0.542 |
+| another speaker's recording (the floor) | 0.153 | | |
+
+- **The reference tokens carried almost no voice**, with a tenth or with nearly half of the utterances depending on
+  them alone. (In the first run a voice without a speaker row was cut into prompt and target whenever it could be,
+  so recorded speech never met a reference without a prompt; that was fixed, and it was not the cause.)
+- **Why.** Training is teacher-forced: after a few patches the backbone reads the voice from the utterance's own
+  recorded history. Only the first fraction of a second needs the reference, so little gradient reaches tokens
+  that start as noise. A prompt has no such problem: it *is* history.
+- **More prompt training has stopped helping**: 0.532 → 0.538 with 6,000 more steps.
+
+**The second design starts where the prompt is.** `kind: patches` (the layout of VoxCPM2's REF tokens): the
+reference's own mel patches stand in front of the sequence. Every token is what a prompt's position looks like to
+the backbone (its input projection, no text, the row of a voice that is not in the table), plus a segment embedding
+and the correction of two transformer layers whose output starts at zero. The text encoder's vector is the
+prompt's pooled one, corrected the same way. Shorter references and voices without one are padded in front with a
+learned null token, so nothing needs a mask.
+
+Before any training, on six of the test's speakers, the reference alone already gives the prompt's similarity (0.52
+against 0.52). After 6,000 steps (`configs/ar_tts_en_reference.yaml`, 2.1 it/s on an A10, 48 minutes; references of
+3–6 s), on the 36 unseen recorded speakers, with a reference of 6 s:
+
+| voice given as | SIM-o (the prompt recording) | SIM with a recording the model was not given | WER |
+|---|---|---|---|
+| the speaker's own recording of the sentence | 0.656 | 0.650 | 2.35% |
+| control: the prompted model, 6,000 more steps | 0.538 | – | 3.73% |
+| prompt (6 s of the recording) | 0.546 | 0.462 | 3.63% |
+| reference alone (the same recording) | 0.431 | 0.387 | 2.60% |
+| prompt + reference (the same recording) | 0.555 | 0.468 | 3.43% |
+| reference alone, another recording of the speaker | 0.373 | 0.381 | 2.50% |
+| **prompt + reference from another recording** | 0.553 | **0.483** | 3.73% |
+
+SIM-o is measured against the recording the prompt was cut from, and a prompt is continued: a part of its 0.546 is
+that recording's conditions. The third column compares with a recording of the speaker that the model was never
+given (`scripts/clone_eval.py`): the voice alone.
+
+- **A second recording adds to the prompt.** On the voice alone, the prompt and a reference from another recording
+  are 0.021 above the prompt (95%: +0.012 to +0.031, higher on 67% of the items); with the same recording through
+  both paths the gain is 0.006 and inside its interval. VoxCPM2 reports the same order: reference alone,
+  continuation alone, both.
+- **The reference alone carries the voice now** (0.43 on SIM-o, where the resampler gave 0.23), but less of it than
+  the prompt: 0.075 lower on the voice alone. It makes a quarter fewer word errors (2.5–2.6% against 3.6%): nothing
+  has to be continued.
+- **0.084 of the prompt's SIM-o is the recording, not the voice** (0.546 against 0.462 with an unheard recording);
+  the speaker's own recording loses 0.006 by the same change.
+- **A 10 s reference** (longer than in training) gives the same picture: reference alone 0.443, both 0.559
+  (+0.013 over the prompt, 95% +0.006 to +0.019).
+- **F0 spread is the guard**: 3.0–3.1 semitones for every path, the recordings' 4.2. No path flattens it further.
+- **0.17 is left to the speaker's own recording** on the voice alone (0.483 against 0.650).
+
+On the corpus's own 40 voices (120 sentences):
+
+| model | by its row | prompt | reference alone | both |
+|---|---|---|---|---|
+| control: the prompted model, 6,000 more steps | 0.731 (WER 1.60%) | 0.685 (1.85%) | – | – |
+| resampler (34 of the 40 voices) | 0.708 (1.49%) | 0.665 (2.21%) | 0.401 (1.70%) | 0.670 (2.00%) |
+| **patch reference** | 0.722 (1.03%) | 0.688 (1.35%) | **0.667** (1.40%) | **0.701** (1.31%) |
+
+- **On voices of the training corpus the reference alone is almost the prompt** (0.667 against 0.688), and both
+  together are again 0.013 above the prompt. The speaker rows keep their voices (0.722 against 0.731, inside the
+  interval), with fewer word errors in every column.
+
+`runs/ar_en_reference3` is this model: `Synthesizer(model, "cuda", vocoder=...)(text, ref_audio="voice.wav")` uses
+both paths; `tts.reference("voice.wav", mode="reference")` the reference alone.
+
+**With voice guidance the reference alone passes the prompt** (#99,
+[OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#guidance-99)): 4,000 more steps with voice dropout, then guidance with
+a null branch without the voice. At a scale of 3: SIM-o 0.563 and 0.466 with an unheard recording (the prompt:
+0.546 and 0.464); at 5: 0.593 and 0.485, WER 3.1%. `runs/ar_en_voice` is that model; `tts.guidance = "voice"`
+and `cfg_scale` select it.
+
+Not done: the long run (the prompt path stopped rising at 0.54 here; the reference path was still new at 6,000
+steps), references longer than the 6 s it was trained on, a reference through a noisy channel (where a prompt would
+copy the noise and a reference need not), and the speaker-verification and CTC losses through the head that #96
+lists as a later step.
+## ARDrift v2: the text as a prefix (#103)
+
+ARDrift is a Grad-TTS front end with an autoregressive back end: monotonic alignment, a duration predictor, a prior
+mean, and a head that draws a residual over that mean. Its rhythm is fixed before the first patch is drawn, which is
+why a separate duration sampler had to be added (#100). Pocket TTS, CALM, DiTAR and VoxCPM give the text as tokens
+and let the autoregressive model decide the timing and the end of the utterance.
+
+**The model** (`model.kind: ar_prefix`, `drifting_tts/models/ar_prefix.py`; `train-ar` trains it):
+
+| | aligned ARDrift | v2 |
+|---|---|---|
+| text | character encoder, monotonic alignment, the aligned states as a condition of every step | the characters as embeddings in front of the sequence |
+| timing | duration predictor (and the sampler of #100) | the model's own inside the utterance; with the clock (below) the tempo is given and the utterance ends with its text, without it the end head ends it |
+| what the head draws | a residual over the aligned prior mean | the patch itself |
+| voice | a row of the speaker table, a prompt (#95), a reference encoder (#96) | a row, or a crop of another utterance of the speaker in front of the text |
+| losses | drifting, prior, duration | drifting, end of utterance (binary cross-entropy, weight 0.1) |
+
+- **The sequence is Kyutai's**: `[voice] [text] [audio]`, one causal transformer over all of it.
+- **Batches are padded in front**, so the audio starts at the same position in every row. Rotary positions are
+  relative: a row computed alone and in a batch gives the same states (tested).
+- **The voice prompt needs no cut.** The aligned model cuts an utterance at a word, which takes an alignment; here
+  the prompt is the loader's crop of *another* utterance of the speaker (#96's pairs).
+- **A bound on the length**: 0.35 s per character, should the end head not fire.
+- **Not there yet**: guidance at inference (the text dropout that trains its null branch is), the fast generator
+  with CUDA graphs, streaming, the `Synthesizer`'s units and pauses. `model.synthesize` speaks one utterance.
+
+### The pilot: what makes a prefix model start to read
+
+Three arms on an A10, each from the released model's backbone and head (the character and segment embeddings and
+the end head are new), batches of 12,000 frames (about 12 utterances; the aligned model's: 48), learning rate
+2e-4. Two measures on held-out sentences:
+
+- **WER** of 24 sentences, free-running (Whisper large-v3);
+- **text use**: teacher-forced on 24 to 40 utterances, how much larger the error of the head's mean patch is when
+  the text is another utterance's (the same noise for both; 0%: the states do not depend on the text).
+  `text_gap / null_steps` in the training log is the same thing on the utterances that lost their text.
+
+| arm | steps | text use (95%) | first eight patches | error of the mean patch, held out | WER, to the length bound | output / recording, length |
+|---|---|---|---|---|---|---|
+| plain prefix | 5,000 | about 0% | | 0.052 | 98% | 4.6 |
+| | 10,000 | +2.4% (+0.3 to +4.4) | +11% | 0.050 | 112% | 4.3 |
+| pre-net (256 wide, dropout 0.5) | 5,000 | +1.2% (+0.6 to +1.8) | +2% | 0.116 | 97% | 4.6 |
+| | 7,500 | +2.4% (+1.4 to +3.5) | +4% | | | |
+| **the text on the clock** | 2,500 | +0.9% (+0.2 to +1.5) | +3% | 0.061 | 97% | 4.6 |
+| | 5,000 | +3.2% (+1.8 to +4.8) | +8% | 0.052 | 95% | 4.6 |
+| | 7,500 | +8.0% (+5.7 to +10.4) | +16% | 0.049 | 150% | 4.1 |
+| | 10,000 | **+13.7%** (+10.5 to +17.1) | +28% | 0.047 | 110% | 4.3 |
+| | 12,500 | +26.9% (+21.0 to +32.6) | +40% | 0.045 | 123% | 3.6 |
+| | 15,000 | +45.3% (+36.5 to +54.2) | +51% | 0.042 | 114% | 4.2 |
+| | 17,500 | +60.8% (+49.0 to +73.6) | +60% | 0.040 | 82% | 4.1 |
+| | 20,000 | **+69.5%** (+56.6 to +83.2) | +63% | 0.039 | 88% | 4.3 |
+
+The WER of this table is the training loop's: 24 sentences up to the bound of 0.35 s per character, which every
+output reached (the last column), so most of it is what was said after the text.
+
+- **A plain prefix model is an audio model for its first 10,000 steps.** Its states do not depend on the text at
+  5,000 steps and barely at 10,000, and what it reads first is the beginning of the utterance. Its end head reads
+  the end from the audio (it fires at the right step with another utterance's text as often as with its own), so
+  free-running there is no end: every output runs into the length bound.
+- **A pre-net** on the history (`model.ar.prenet`; Tacotron 2: "essential for learning attention"; MELLE keeps it,
+  dropout 0.5, at inference too) is a quarter faster: at 7,500 steps where the plain model is at 10,000, with twice
+  the error of the mean patch, since half of the history is dropped. A fresh pre-net needs the temperature of a
+  run from scratch (`drift.tau_init=1.0`): at the fine-tuning value 0.06 the head's spread collapsed (0.04 against
+  0.2) for the first 1,000 steps.
+- **The clock** (`model.ar.clock`) is the lever: at 10,000 steps the text counts 5.7 times as much as in the plain
+  model, and it is the only arm whose error falls below the plain model's (0.047 against 0.050). The text is no
+  longer a prefix to search by content: character `j` stands at rotary position `(j + 0.5) * rate - lead` and
+  audio step `t` at `t`, so a character is near the steps that say it. It is the diagonal prior of
+  attention-based TTS (DC-TTS's guided attention, the beta-binomial prior of RAD-TTS and T5-TTS), given as
+  positions. The price: the utterance's tempo (`rate`, patches per character) is an input at inference, the
+  corpus's mean (1.57) by default; the rhythm inside the utterance stays the model's.
+- **The clock model begins to speak its text.** Its utterances end where the text ends on the clock (`generate`
+  stops after `characters × rate` patches; the end head fires by itself in 3 of 100). 100 held-out sentences at
+  20,000 steps, at the corpus's mean tempo: **WER 67.6%** (95% 63.1 to 71.8; 66.2% at every recording's own
+  tempo); 8 sentences at 15,000 and 17,500 steps: 88% and 83%.
+  - The first 3.5 words of a sentence are right on average (of 14.8); 2 sentences in 100 entirely, 8 with fewer
+    than a fifth of the words wrong, 24 with fewer than half. Sentences of up to eight words: 53%.
+  - It reads from the start of the utterance onwards, and what it loses the text at is mostly a pause: after
+    "um", "so", "oh" and a comma the rest is often not speech.
+  - Teacher-forced it is further than free-running: the text counts for 70% of the error there.
+- **The plain and the pre-net models do not speak the text** in the steps they had (10,000 and 7,500).
+- **The scale of the published models**: MELLE (mel frames, the text as a prefix, no alignment) trains 400,000
+  updates of 480,000 frames on 16 GPUs with 50,000 h; CALM's TTS has 88,000 h. 20,000 steps of 12,000 frames are
+  0.13% of MELLE's frames, and 2.5% of the utterances the aligned model saw (200,000 steps of 48).
+
+**What the pilot says about #103's decision.** A prefix model with a drifting head learns to read on one A10
+without an aligner, a duration predictor or a prior mean, **if the text stands on the clock**; as a plain prefix
+it does not within what a pilot can afford. At 20,000 small steps it is at the first words of a sentence, far from
+the aligned model's 2.4% WER, so the aligned model stays the released one and v2 is a long run to decide on:
+
+- the recipe: `configs/ar_prefix_en.yaml` (the clock is its default now), the aligned model's batch of 48 and
+  200,000 steps on the machine that trained it, `text_gap / null_steps` and the in-loop WER as the signs to watch;
+- what the clock leaves of the duration model is **one number per utterance**, the tempo. The pilot speaks at the
+  corpus's mean (1.57 patches per character); a model for release needs that number from the text and the voice
+  (a regression or a sampler on the prefix), or from the user as a speed control;
+- the end of the utterance comes from the clock in the pilot; the end head learned the audio's trailing silence
+  and fires on real recordings only.
+
+Not done: the long run; the tempo predictor; the clock and the pre-net together; `fit: global` (one rate for every
+utterance in training); guidance, the fast generator, streaming and the `Synthesizer` for this model; Turkish.
 
 ## Release
 

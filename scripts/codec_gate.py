@@ -23,10 +23,13 @@ mel + vocoder pairs and the audio VAEs of :mod:`drifting_tts.latents`.
    of this table with each other, and are **not** ZeroSpeech ABX numbers (triphone contexts, DTW over frames) nor
    comparable with the ~8% Kyutai quote for Mimi. Characters are a fair phoneme proxy for Turkish and a poor one
    for English. A 12.5 Hz frame (Mimi) is longer than most characters, so its segments also hold their neighbours.
-4. **Repeated latents** (``--model``, a DiT trained on latents): the model's generated frames are split into the
-   groups of ``latent_repeat`` copies that ``LatentVocoder`` averages; reported per position in the group: the mean
-   squared deviation from the group mean, relative to the per-channel variance. The recordings' stored latents give
-   exactly 0. This is the measurement #94 (crops off the frame grid) asks for.
+4. **Repeated latents** (``--model``, a DiT or an ARDrift model trained on latents; for ARDrift pass ``--cfg 1
+   --temperature 0.5``): the model's generated frames are split into the groups of ``latent_repeat`` copies that
+   ``LatentVocoder`` averages; reported per position in the group: the mean squared deviation from the group mean,
+   relative to the per-channel variance. The recordings' stored latents give exactly 0. This is the measurement #94
+   (crops off the frame grid) asks for. With the judges, the generated latents are also decoded twice, from the mean
+   of the copies (what ``LatentVocoder`` does) and from the first copy alone (#92): if one copy sounds better than
+   their mean, the averaging hides a head that cannot make four values agree.
 
 ``results.json`` and ``results.md`` (one row per backend) go to ``--out``. ``--max-roundtrip-loss`` and
 ``--max-noise-loss`` add a pass / fail column: UTMOSv2 below the recording after a 24 kHz round trip, and UTMOSv2 lost
@@ -59,7 +62,7 @@ from drifting_tts.evaluate import _plain, summarize
 from drifting_tts.latents import VAE_BACKENDS, AudioBackend, LatentStats, load_backend
 from drifting_tts.metrics import band_lsd, bootstrap_ci, error_counts
 
-BACKENDS = ("vocos", "bigvgan", "dacvae", "voxcpm2", "voxcpm1.5", "mimi")
+BACKENDS = ("vocos", "bigvgan", "dacvae", "voxcpm2", "voxcpm1.5", "mimi", "semantic-vae")
 MEL_VOCODERS = {"vocos": "vocos-v2", "bigvgan": "bigvgan-v2-ft"}  # the vocoders of releases v3.2 and v3.1
 PARTS = ("native", "tolerance", "phonetic", "repeat")
 NOISE, SCALE = (0.05, 0.1, 0.2, 0.3, 0.5), (0.7, 0.8, 0.9)
@@ -249,8 +252,25 @@ def mean_metrics(rows: list[dict]) -> dict[str, float | None]:
 
 
 def active_channels(stats: LatentStats) -> Tensor:
-    """Channels that carry signal (some VAE channels are unused: constant, std ~ 0)."""
-    return stats.std > 0.01 * stats.std.median()
+    """Channels that carry signal. Some VAE channels are unused: constant (std ~ 0), or, for a codec with a
+    posterior, as wide as the prior: their spread over the data is below the posterior's own standard deviation
+    (``stats.posterior``, :func:`posterior_spread`), so they hold its noise and nothing of the audio."""
+    active = stats.std > 0.01 * stats.std.median()
+    post = getattr(stats, "posterior", None)
+    return active if post is None else active & (stats.std > post)
+
+
+@torch.no_grad()
+def posterior_spread(backend: AudioBackend, wavs: Sequence[Tensor], sr: int) -> Tensor | None:
+    """The posterior's mean standard deviation per channel ``[dim]`` over the recordings, or ``None`` for a backend
+    without a posterior."""
+    if not hasattr(backend, "posterior"):
+        return None
+    total, frames = None, 0
+    for w in wavs:
+        std = backend.posterior(w.to(backend.device), sr)[1][0].double().cpu()
+        total, frames = (std.sum(1) if total is None else total + std.sum(1)), frames + std.shape[1]
+    return (total / frames).float()
 
 
 def normalize(z: Tensor, stats: LatentStats) -> Tensor:
@@ -484,16 +504,15 @@ def repeat_deviation(latents: Sequence[Tensor], repeat: int) -> dict:
 
 
 @torch.no_grad()
-def generated_latents(args) -> tuple[list[Tensor], list[Tensor], int]:
-    """The latents a DiT trained on latents generates for held-out texts (as ``scripts/latent_smoothness.py``:
-    predicted durations with the voice's duration factor, seed = index), the recordings' stored latents and the
-    data's ``latent_repeat``."""
+def generated_latents(args) -> tuple[list[Tensor], list[Tensor], int, dict]:
+    """The latents a model trained on latents generates for held-out texts (as ``scripts/latent_smoothness.py``:
+    predicted durations with the voice's duration factor, seed = index), the recordings' stored latents, the
+    data's ``latent_repeat`` and what decoding them needs (the data's backend and statistics, the texts)."""
     from drifting_tts.data import MelDataset
     from drifting_tts.train import load_tts
 
     model, cfg, _ = load_tts(args.model, args.device)
-    if not hasattr(model, "synthesize"):
-        raise SystemExit("--model: the repeated-latents check generates with a DiT (ARDrift emits whole patches)")
+    model.eval()
     ds = MelDataset(args.model_data or cfg.data.root, args.split, min_frames=1, max_frames=10**9)
     items = [i for i in range(len(ds)) if args.speaker is None or ds.items[i]["spk_id"] == args.speaker]
     items = items[: args.model_num]
@@ -512,7 +531,24 @@ def generated_latents(args) -> tuple[list[Tensor], list[Tensor], int]:
                                 length_scale=model.duration_scales.get(spk, model.duration_scale))
         gen.append(x[0, :, : int(n[0])].float().cpu())
         rec.append(it["mel"])
-    return gen, rec, ds.latent_repeat
+    info = {"backend": ds.backend, "stats": ds.stats, "language": ds.language,
+            "refs": [_plain(ds.items[i]["norm_text"], ds.language) for i in items]}
+    return gen, rec, ds.latent_repeat, info
+
+
+@torch.no_grad()
+def decode_copies(gen: Sequence[Tensor], repeat: int, info: dict, device: str) -> dict[str, list[np.ndarray]]:
+    """The generated latents (normalised, ``[dim, T]``) decoded from the mean of every group of ``repeat`` copies
+    and from its first copy alone: 16 kHz audio under ``mean`` and ``copy0``."""
+    from drifting_tts.latents.vocoder import LatentVocoder, native_frames
+
+    voc = LatentVocoder(info["backend"], device, repeat=1, sample_rate=16_000)
+    out: dict[str, list[np.ndarray]] = {"mean": [], "copy0": []}
+    for x in gen:
+        z = info["stats"].denormalize(x[None].float())
+        out["mean"].append(voc(native_frames(z, repeat))[0].cpu().numpy())
+        out["copy0"].append(voc(z[..., ::repeat])[0].cpu().numpy())
+    return out
 
 
 # ------------------------------------------------------------------------------------------------------- judges
@@ -693,6 +729,13 @@ def tables(results: dict) -> str:
             d = rep[side]
             out.append(f"| {side} | " + " | ".join(_num(v, ".4f") for v in d["positions"])
                        + f" | {_num(d['share'], '.4f')} |")
+        if rep.get("decoded"):
+            out += ["", "The generated latents decoded from the mean of the copies and from the first copy alone:", "",
+                    "| decoded from | WER | UTMOSv2 |", "|---|---|---|"]
+            for key, label in (("mean", "the mean of the copies"), ("copy0", "the first copy")):
+                d = rep["decoded"].get(key, {})
+                out.append(f"| {label} | {_num(d.get('wer'), '.2f', 100, '%')} | "
+                           f"{_num(_get(d, 'utmosv2', 'mean'))} |")
     return "\n".join(out)
 
 
@@ -719,7 +762,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--abx-per-pair", type=int, default=50, help="triplets per (speaker, character pair)")
     p.add_argument("--probe-steps", type=int, default=200, help="L-BFGS iterations of the linear probe")
     p.add_argument("--min-align-score", type=float, default=0.0, help="drop character spans aligned below this score")
-    p.add_argument("--model", default=None, help="a DiT trained on latents (model_ema.pt): the repeated-latents check")
+    p.add_argument("--model", default=None,
+                   help="a DiT or an ARDrift model trained on latents (model_ema.pt): the repeated-latents check")
     p.add_argument("--model-data", default=None, help="its latent data root (default: the checkpoint's data.root)")
     p.add_argument("--model-num", type=int, default=100)
     p.add_argument("--speaker", type=int, default=None, help="--model: only this speaker's utterances")
@@ -765,7 +809,11 @@ def gate_backend(name: str, backend: AudioBackend, rec: Recordings, spans: Seque
             row["roundtrip"]["native"]["source_rate"] = rec.hr_rate
             audio[f"{name}/native"] = [to16k(y, rate) for y in nat]
     stats = LatentStats.from_latents(latents)
+    stats.posterior = posterior_spread(backend, rec.wavs, SAMPLE_RATE)
     row["active_channels"] = int(active_channels(stats).sum())
+    if stats.posterior is not None:  # what a posterior sample adds, in standard deviations of an active channel
+        act = active_channels(stats)
+        row["posterior_rel"] = float((stats.posterior / stats.std)[act].median()) if act.any() else None
     if "tolerance" not in args.skip:
         conds = perturbations(args.noise, args.scale)
         for c, _, _ in conds:
@@ -828,11 +876,15 @@ def run(args, judges=None, aligner: Callable[[Tensor, str], Spans | None] | None
                "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None, "torch": torch.__version__,
                "recording": recording, "backends": rows}
     if args.model and "repeat" not in args.skip:
-        gen, stored, repeat = (generate or generated_latents)(args)
+        gen, stored, repeat, *info = (generate or generated_latents)(args)
         results["repeated_latents"] = {"model": str(args.model), "repeat": repeat, "utterances": len(gen),
                                        "temperature": args.temperature, "cfg": args.cfg,
                                        "generated": repeat_deviation(gen, repeat),
                                        "recorded": repeat_deviation(stored, repeat)}
+        if judges is not None and info and repeat > 1:  # one copy against the mean of the copies (#92)
+            info = info[0]
+            results["repeated_latents"]["decoded"] = judge(decode_copies(gen, repeat, info, args.device),
+                                                           info["refs"], info["language"], judges)
     (out / "results.json").write_text(json.dumps(results, indent=1))
     (out / "results.md").write_text(tables(results) + "\n")
     print(tables(results))

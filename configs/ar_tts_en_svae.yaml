@@ -1,0 +1,35 @@
+# Issue #93: ARDrift in English on Semantic-VAE latents (drifting_tts/latents/semantic_vae.py): 64-d latents at 40 Hz
+# that were pulled towards WavLM features while the VAE was trained. The drifting kernel is an L2 distance; the
+# question is whether a latent in which L2 means something is an easier target than the raw log-mel (and than Mimi,
+# whose decoder punished small latent errors: docs/MIMI.md). A 16 kHz codec: this tests the hypothesis, not the final
+# audio band.
+#   drifting-tts extract-latents --parquet-glob "hf://datasets/VoiceHub/echo-clones-10kh-en/data/*.parquet" \
+#       --val-glob "hf://datasets/SynDataLab-EN/echo-clones-4m-en/data/train-07960.parquet" --backend semantic-vae \
+#       --repeat 1 --language en --speaker-column speaker_id --out data/en_svae       # ~185 GB for the 10,000 h
+#   drifting-tts train-ar --config configs/ar_tts_en_svae.yaml --workdir runs/ar_en_svae
+# The model is the 10k-h mel run's (configs/ar_tts_en_10k.yaml). 40 Hz is above the rate of characters with blanks
+# (~29 a second), so the frames are stored once and aligned as they are; a patch of 2 frames makes one step 50 ms
+# (20 steps a second; the mel model: 43 ms), and the head draws 128 values per step where the mel model draws 400.
+# Not run to the end where this was written (an A10; docs/LATENTS.md has the codec gate and a short run).
+base: ar_tts_en_10k.yaml
+
+data:
+  root: data/en_svae
+  stream: null             # the latents are on the disk
+  max_frames: 640          # <= 16 s at 40 Hz
+
+model:
+  ar:
+    patch: 2               # two latent frames per step: 50 ms
+    lookahead: 2
+
+drift:
+  crop_frames: 16          # shortest utterance used (frames at 40 Hz)
+  detail: false            # harmonic detail is a log-mel feature
+  target_noise: 0.33       # the VAE was trained on posterior samples: their std is a third of the latent's
+                           # (`extract-latents --save-std` and target_noise: posterior for the codec's own, #92)
+
+train:
+  steps: 200000
+  ema_decays: [0.999, 0.9999]
+  eval_every: 10000

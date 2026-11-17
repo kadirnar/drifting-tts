@@ -65,19 +65,33 @@ def passes(rec: dict | None, rules: list[tuple[str, float, float]], require: boo
 
 class MelStats:
     """Normalisation ``(x - mean) / std``: one scalar for log-mels, one value per channel for VAE latents (lists in
-    ``stats.json``; a channel's std is floored at ``min_std`` so collapsed channels stay finite)."""
+    ``stats.json``; a channel's std is floored at ``min_std`` so collapsed channels stay finite).
 
-    def __init__(self, mean: float | list[float], std: float | list[float], min_std: float = 1e-3):
+    ``active`` (per channel, ``stats.json`` of ``extract-latents`` for a codec with a posterior, #93): a VAE can
+    leave channels unused, their posterior as wide as the prior. Such a channel holds the posterior's noise and
+    nothing of the audio, and dividing it by its small spread would give it the weight of a real one in every L2
+    distance. Inactive channels are 0 in normalised units and the channel's mean after ``denormalize``."""
+
+    def __init__(self, mean: float | list[float], std: float | list[float], min_std: float = 1e-3,
+                 active: list[bool] | None = None):
         m, s = torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32)
+        self.active = None
         if m.numel() == 1:
             self.mean, self.std = float(m), float(s)
         else:  # [C, 1]: broadcasts over [..., C, T]
             self.mean, self.std = m.reshape(-1, 1), s.reshape(-1, 1).clamp_min(min_std)
+            if active is not None and not all(active):
+                self.active = torch.as_tensor(active, dtype=torch.float32).reshape(-1, 1)
 
     @classmethod
     def load(cls, root: str | Path) -> MelStats:
         s = json.loads((Path(root) / "stats.json").read_text())
-        return cls(s["mean"], s["std"])
+        return cls(s["mean"], s["std"], active=s.get("active"))
+
+    @classmethod
+    def from_dict(cls, s: dict) -> MelStats:
+        """The statistics stored in a checkpoint (:meth:`to_dict`)."""
+        return cls(s["mean"], s["std"], active=s.get("active"))
 
     @property
     def per_channel(self) -> bool:
@@ -90,16 +104,38 @@ class MelStats:
 
     def normalize(self, mel: torch.Tensor) -> torch.Tensor:
         mean, std = self._on(mel)
-        return (mel - mean) / std
+        x = (mel - mean) / std
+        return x if self.active is None else x * self.active.to(x.device, x.dtype)
 
     def denormalize(self, mel: torch.Tensor) -> torch.Tensor:
         mean, std = self._on(mel)
+        if self.active is not None:
+            mel = mel * self.active.to(mel.device, mel.dtype)
         return mel * std + mean
 
     def to_dict(self) -> dict:
         if not self.per_channel:
             return {"mean": self.mean, "std": self.std}
-        return {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
+        out = {"mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist()}
+        if self.active is not None:
+            out["active"] = [bool(a) for a in self.active.flatten().tolist()]
+        return out
+
+
+def reference_frames(rc) -> tuple[int, int] | None:
+    """``drift.reference`` -> the shortest and the longest reference in frames (``min_seconds``, ``max_seconds``:
+    3 to 10 s), or ``None`` without it."""
+    if not rc:
+        return None
+    return int(float(rc.get("min_seconds", 3.0)) * FRAME_RATE), int(float(rc.get("max_seconds", 10.0)) * FRAME_RATE)
+
+
+def crop_reference(mel: torch.Tensor, lo: int, hi: int, rng=random) -> torch.Tensor:
+    """A reference (#96): a random crop of ``lo`` to ``hi`` frames of the normalised mel ``[n_mels, T]`` of another
+    utterance (``T >= lo``; all of it when it is shorter than the drawn length)."""
+    n = min(rng.randint(lo, hi), mel.shape[1])
+    start = rng.randint(0, mel.shape[1] - n)
+    return mel[:, start: start + n]
 
 
 class MelDataset(Dataset):
@@ -120,6 +156,8 @@ class MelDataset(Dataset):
         with_f0: bool = False,
         with_audio: bool = False,
         filters: dict | None = None,
+        reference: tuple[int, int] | None = None,
+        with_std: bool = False,
     ):
         root = Path(root)
         self.stats = MelStats.load(root)
@@ -129,6 +167,14 @@ class MelDataset(Dataset):
         # features per frame and frames per second: 100 log-mel bins at 93.75 Hz, or VAE latents (extract-latents)
         self.dim, self.frame_rate = int(st.get("dim", N_MELS)), float(st.get("frame_rate", FRAME_RATE))
         self.latent_repeat = int(st.get("latent_repeat", 1))  # extract-latents: copies of every VAE frame
+        # ... and how many of them are on the disk (extract-latents --native: 1, the copies are made on reading)
+        self.copies = self.latent_repeat // int(st.get("stored_repeat", self.latent_repeat))
+        # the posterior's standard deviations (extract-latents --save-std), as "mel_std" in normalised units
+        self.with_std, self._stds_path, self._stds = with_std, root / "stds.bin", None
+        if with_std and not self._stds_path.exists():
+            raise FileNotFoundError(f"{self._stds_path} missing: run `drifting-tts extract-latents --save-std`")
+        if with_f0 and self.copies > 1:
+            raise ValueError(f"{root} stores every latent frame once (extract-latents --native): no per-frame F0")
         self.with_f0 = with_f0
         self._f0_path = root / "f0.bin"
         if with_f0 and not self._f0_path.exists():
@@ -163,6 +209,13 @@ class MelDataset(Dataset):
             print(f"data.filters ({split}): {failed}/{total} utterances fail; "
                   + (f"kept {len(self.items)} ({hours:.1f} h)" if drop else "not filtered (apply_to_val: false)"))
         self.num_speakers = len(json.loads((root / "speakers.json").read_text()))
+        # reference (#96): every item also holds "ref", a crop of another utterance of its speaker (None: the
+        # speaker has no other utterance that is long enough)
+        self.reference, self.by_speaker = reference, {}
+        if reference:
+            for n, e in enumerate(self.items):
+                if e["frames"] >= reference[0]:
+                    self.by_speaker.setdefault(e["spk_id"], []).append(n)
         self._mels_path = root / "mels.bin"
         self._mels: np.ndarray | None = None  # opened lazily (once per dataloader worker)
 
@@ -190,16 +243,34 @@ class MelDataset(Dataset):
     def frames(self, i: int) -> int:
         return self.items[i]["frames"]
 
+    def _stored(self, array: np.ndarray, i: int) -> torch.Tensor:
+        """The frames ``[dim, T]`` of utterance ``i`` from ``mels.bin`` / ``stds.bin`` (copies made if needed)."""
+        e = self.items[i]
+        x = np.array(array[e["offset"]: e["offset"] + e["frames"] // self.copies], dtype=np.float32)
+        return torch.from_numpy(x.repeat(self.copies, 0) if self.copies > 1 else x).T.contiguous()
+
+    def _mel(self, i: int) -> torch.Tensor:
+        return self.stats.normalize(self._stored(self.mels, i))
+
     def __getitem__(self, i: int) -> dict:
         e = self.items[i]
-        mel = torch.from_numpy(np.array(self.mels[e["offset"]: e["offset"] + e["frames"]], dtype=np.float32))
         item = {
             "text": torch.tensor(frontend(self.language).text_to_ids(e["norm_text"], normalized=True),
                                  dtype=torch.long),
-            "mel": self.stats.normalize(mel.T.contiguous()),
+            "mel": self._mel(i),
             "spk": e["spk_id"],
             "index": i,
         }
+        if self.with_std:
+            if self._stds is None:
+                self._stds = np.memmap(self._stds_path, dtype=np.float16, mode="r").reshape(-1, self.dim)
+            std = self._stored(self._stds, i)
+            item["mel_std"] = std / self.stats.std  # normalised units, as the frames
+            if self.stats.active is not None:  # an unused channel has no sample: it is 0
+                item["mel_std"] = item["mel_std"] * self.stats.active
+        if self.reference:
+            others = [j for j in self.by_speaker.get(e["spk_id"], ()) if j != i]
+            item["ref"] = crop_reference(self._mel(random.choice(others)), *self.reference) if others else None
         if self.with_audio:
             a = self.audio[e["audio_offset"]: e["audio_offset"] + e["audio_samples"]]
             item["audio"] = torch.from_numpy(np.array(a, dtype=np.float32))
@@ -220,6 +291,19 @@ def collate(batch: list[dict]) -> dict:
         mel[i, :, : mel_len[i]] = b["mel"]
     out = {"text": text, "text_len": text_len, "mel": mel, "mel_len": mel_len,
            "spk": torch.tensor([b["spk"] for b in batch]), "index": torch.tensor([b["index"] for b in batch])}
+    if any("ref" in b for b in batch):  # references (#96): [B, n_mels, R], 0 frames where there is none
+        refs = [b.get("ref") for b in batch]
+        ref_len = torch.tensor([0 if r is None else r.shape[1] for r in refs])
+        ref = torch.zeros(B, mel.shape[1], max(int(ref_len.max()), 1))
+        for i, r in enumerate(refs):
+            if r is not None:
+                ref[i, :, : ref_len[i]] = r
+        out["ref"], out["ref_len"] = ref, ref_len
+    if "mel_std" in batch[0]:  # the posterior's standard deviations, padded with zeros
+        std = torch.zeros_like(mel)
+        for i, b in enumerate(batch):
+            std[i, :, : mel_len[i]] = b["mel_std"]
+        out["mel_std"] = std
     if "audio" in batch[0]:
         n = max(b["audio"].numel() for b in batch)
         audio = torch.zeros(B, n)

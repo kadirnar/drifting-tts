@@ -16,6 +16,27 @@ One step:
    patch and pushes them apart, in the kernel space of :func:`~drifting_tts.models.ar.ar_features` (the whole patch,
    each frame, each frame's harmonic detail and, with ``drift.energy_bands``, each frame's band energies).
 
+``model.ar.tied`` (#92, latents stored ``patch`` times for the alignment): the backbone reads and the head draws one
+latent frame per step, copied over the patch. ``drift.target_noise`` trains on samples of the codec's posterior
+instead of its mean (:func:`sample_targets`).
+
+``drift.rollout`` (#101): with probability ``prob`` a batch has ``steps`` (4 to 16) patches of its history drawn
+free-running by the model (:meth:`~drifting_tts.models.ar.ARDriftTTS.rollout`), where ``drift.self_history`` has
+patches drawn one step after the recording. The targets stay the recording's. ``model.ar.noise_level`` tells the
+backbone the level of ``drift.input_noise``.
+
+``drift.cond_dropout`` and ``drift.voice_dropout`` train the null branches of guidance (#99): utterances without
+their text, and without any voice (no prompt, no reference, the row of a voice that is not in the table).
+``drift.distill`` then trains the backbone alone to give the guided state in one pass (:func:`distill_step`).
+
+``drift.teacher`` (#98): a frozen model draws ``positives`` more positives per row beside the recording, from its
+own state of the clean recorded history (:class:`Teacher`): its one-step head, or a multi-step flow-matching head.
+
+``drift.loss: energy`` replaces the drifting field by the energy score (:func:`~drifting_tts.drift.energy_score`, a
+proper scoring rule without a temperature; docs/HEAD_REALISM.md). ``drift.window`` adds kernel maps over a window
+(#97): the recorded patches before a step and the step's patch through a frozen 2-D Mel-MAE
+(:func:`~drifting_tts.models.ar.window_features`), on a share of the rows and samples.
+
 ``train.eval_every`` evaluates every EMA inside the loop, on the held-out objective and on synthesised held-out
 sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`drifting_tts.loop_eval`).
 
@@ -23,6 +44,12 @@ sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`driftin
 is cut at a word boundary, the frames before the cut are history without a text condition, the words after it are
 the text, and the loss is taken after the cut (:func:`cut_prompts`). For a share of them the speaker row is the
 "prompted" one, so the voice has to come from the prompt.
+
+``model.ar.reference`` with ``drift.reference`` trains voices from a reference (#96): a crop of *another* utterance
+of the speaker (the loader's ``ref``), read by the reference encoder, whose tokens stand in front of the backbone's
+sequence. ``drift.reference.prob`` of the utterances that have one use it, the others get the null tokens (no
+reference: the speaker row alone, a prompt alone, or no voice at all, the null branch of voice guidance); the
+speaker row is dropped as for a prompt (``drift.reference.id_dropout``). Both paths train together.
 """
 
 from __future__ import annotations
@@ -40,10 +67,10 @@ from .alignment import sequence_mask
 from .audio import HOP_LENGTH, SAMPLE_RATE
 from .config import Config, load_config, save_config
 from .data import MelDataset, collate
-from .drift import feature_drift_loss
+from .drift import feature_drift_loss, feature_energy_loss
 from .latents import VAE_BACKENDS
 from .loop_eval import AudioEval, build_emas, heldout_metrics, load_emas, other_emas, record
-from .models.ar import ARDriftTTS, ar_features, patchify
+from .models.ar import ARDriftTTS, ar_features, history_patches, patchify, unpatchify, window_features
 from .models.text_encoder import align, duration_loss, expand, prior_loss
 from .text import BLANK_ID, PAD_ID, frontend
 from .train import build_loader, dataset_stats, grow_speakers
@@ -58,7 +85,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 
 @torch.no_grad()
 def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor,
-                spk: torch.Tensor, pc, space: int, always: torch.Tensor | None = None) -> dict:
+                spk: torch.Tensor, pc, space: int, always: torch.Tensor | None = None,
+                never: torch.Tensor | None = None) -> dict:
     """Prompts for a batch (#95): an utterance that is long enough is cut where a word starts, between
     ``min_seconds`` and ``max_seconds`` and at least ``min_target`` seconds before its end (the model's own
     alignment gives the frame). The frames before the cut, less up to ``max_trim`` seconds of their end, are the
@@ -70,7 +98,8 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
     there is no cut), ``prompt`` ``[B, n_mels, P]`` with ``prompt_len`` (whole patches; 0: no prompt), and
     ``dropped`` ``[B]``: the prompted utterances whose speaker row is the prompted one (``id_dropout``). ``always``
     ``[B]``: utterances of voices without a row (a corpus streamed with ``speakers: prompt``), which are cut
-    whenever they can be and never keep a row."""
+    whenever they can be and never keep a row. ``never`` ``[B]``: utterances that get no prompt (their voice is
+    dropped, ``drift.voice_dropout``)."""
     B, k, dev = y.shape[0], model.patch, y.device
     fps = SAMPLE_RATE / HOP_LENGTH
     lo, hi, rest, trim = (int(round(float(pc.get(name, default)) * fps)) for name, default in
@@ -86,11 +115,15 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
     ok = after_space & inside & (start >= lo) & (start <= hi) & (start <= y_len[:, None] - rest)
     always = torch.zeros(B, dtype=torch.bool, device=dev) if always is None else always
     ok &= ((torch.rand(B, device=dev) < float(pc.get("prob", 0.85))) | always)[:, None]
+    if never is not None:
+        ok &= ~never[:, None]
     texts, mels, prompts = [], [], []
     for b in range(B):
         cand = ok[b].nonzero()[:, 0]
         j = int(cand[torch.randint(len(cand), (1,), device=dev)]) if len(cand) else 0
         f0 = int(start[b, j]) if len(cand) else 0
+        if model.tied:  # the copies of a latent frame stay in one patch (the alignment after the cut absorbs it)
+            f0 = f0 // k * k
         p = max(f0 - int(torch.randint(trim + 1, (1,), device=dev)), 0) // k * k if len(cand) else 0
         texts.append(text[b, j: int(text_len[b])])
         mels.append(y[b, :, f0: int(y_len[b])].T)
@@ -103,6 +136,29 @@ def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y
             "mel_len": torch.tensor([m.shape[0] for m in mels], device=dev),
             "prompt": pad_sequence(prompts, batch_first=True).transpose(1, 2), "prompt_len": prompt_len,
             "dropped": dropped}
+
+
+def sample_targets(y: torch.Tensor, y_len: torch.Tensor, noise, group: int = 1,
+                   std: torch.Tensor | None = None) -> torch.Tensor:
+    """Sampled targets (#92): the frames ``[B, C, T]`` plus Gaussian noise, so that the model learns the codec's
+    posterior and not its mean (SALAD: UTMOS 4.28 against 3.47, CER 0.74 against 1.89, for a model trained on
+    samples instead of means). ``noise``: a standard deviation in normalised units, or ``"posterior"``: the
+    posterior's own ``std`` ``[B, C, T]`` (``extract-latents --save-std``). ``group``: frames that are copies of
+    one latent frame share a draw (``model.ar.tied``). Everything downstream sees the sample: the alignment, the
+    history and the target."""
+    B, C, T = y.shape
+    eps = torch.randn(B, C, -(-T // group), device=y.device, dtype=y.dtype)
+    if group > 1:
+        eps = eps.repeat_interleave(group, -1)[..., :T]
+    if noise == "posterior":
+        if std is None:
+            raise ValueError("drift.target_noise: posterior needs the posterior's standard deviations in the batch "
+                             "(a dataset of `extract-latents --save-std`)")
+        scale = std.to(y.dtype)
+    else:
+        scale = float(noise)
+    used = (y != 0).flatten(2).any(-1).any(0)[None, :, None]  # a channel the codec does not use stays 0 (#93)
+    return torch.where(sequence_mask(y_len, T)[:, None] & used, y + scale * eps, y)
 
 
 def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, prompt: torch.Tensor,
@@ -118,31 +174,159 @@ def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, pr
     return full_c, full_y
 
 
+def kernel_loss(f_gen: dict, f_pos: dict, kind: str, tau: torch.Tensor, key_weights=None,
+                max_locations: int | None = None) -> tuple[torch.Tensor, dict]:
+    """The loss of one set of kernel maps: Kyutai's drifting field at the learned temperature (``field``) or the
+    energy score (``energy``). ``info`` holds ``tau_loss`` (0 for the energy score) and the per-map entries."""
+    if kind == "energy":
+        loss, info = feature_energy_loss(f_gen, f_pos, key_weights, max_locations)
+        return loss, {**info, "tau_loss": loss.new_zeros(())}
+    if kind != "field":
+        raise ValueError(f"drift.loss: {kind!r} (field or energy)")
+    return feature_drift_loss(f_gen, f_pos, None, taus=tau, reduce="mean", key_weights=key_weights,
+                              max_locations=max_locations)
+
+
+def distill_step(model: ARDriftTTS, teacher: ARDriftTTS, batch: dict, cfg: Config, device) -> tuple:
+    """Guidance distilled into the backbone (#99, ``drift.distill``; Kyutai: "the head is not retrained, or even
+    touched"). The frozen ``teacher`` gives, for every step of the recorded history, its guided state
+    ``s_null + cfg_scale * (s - s_null)``; the student's backbone is trained to give that state in one pass (mean
+    squared error over the utterance's steps). The text encoder and the head are the teacher's and stay frozen, so
+    the distilled model generates at ``cfg_scale`` 1 what the teacher generates with guidance. Voices of the
+    speaker table; ``guide``: what the null branch is without (:meth:`ARDriftTTS.null_branch`)."""
+    dc = cfg.drift.distill
+    text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
+                                     for k in ("text", "text_len", "mel", "mel_len", "spk"))
+    amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
+    B, k = y.shape[0], model.patch
+    scale, guide = float(dc.get("cfg_scale", 1.5)), dc.get("guide", "text")
+    with torch.no_grad():
+        y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
+        with amp:
+            h, mu, _, x_mask = teacher.encoder(text, text_len, spk)
+        attn, _ = align(mu.float(), x_mask, y, y_mask)
+        cond, y = teacher.pad_frames(teacher.frame_condition(h.float(), mu.float(), attn)), teacher.pad_frames(y)
+        level = torch.rand(B, device=device) * float(cfg.drift.get("input_noise", 0.0))
+        hist = y + level[:, None, None] * torch.randn_like(y)  # the same noisy history for teacher and student
+        tokens = teacher._tokens(None, B)
+        cp, spk_b, tok_b = teacher.null_branch(teacher.cond_patches(cond), spk, tokens, guide)
+        yp = teacher.squeeze(patchify(hist, k))
+        x_prev = torch.cat([teacher.bos.expand(B, 1, -1), yp[:, :-1]], 1)
+        with amp:
+            s = teacher.backbone(torch.cat([x_prev, x_prev]), cp, spk_b, tokens=tok_b).float()
+        guided = s[B:] + scale * (s[:B] - s[B:])
+    yp = model.squeeze(patchify(hist, k))
+    x_prev = torch.cat([model.bos.expand(B, 1, -1), yp[:, :-1]], 1)
+    with amp:
+        out = model.backbone(x_prev, model.cond_patches(cond), spk, tokens=model._tokens(None, B)).float()
+    valid = (torch.arange(out.shape[1], device=device)[None] * k < y_len[:, None]).float()[..., None]
+    loss = ((out - guided) ** 2 * valid).sum() / (valid.sum() * out.shape[-1])
+    with torch.no_grad():
+        gap = ((s[:B] - guided) ** 2 * valid).sum() / (valid.sum() * out.shape[-1])  # what guidance changes
+    return loss, {"loss": loss.detach(), "state_mse": loss.detach(), "guided_gap": gap}
+
+
+class Teacher:
+    """The frozen model that draws positives (#98, ``drift.teacher``): a trained ARDrift model (``path``), whose
+    backbone gives the state of every row from the clean recorded history, and its one-step head (teacher A,
+    self-distillation) or a multi-step flow-matching head trained on those states (``head``: teacher B,
+    ``scripts/head_finetune.py --loss flow``)."""
+
+    def __init__(self, tc, device):
+        from .models.ar import FlowHead
+        from .train import load_tts
+
+        self.model = load_tts(tc.path, device)[0].eval().requires_grad_(False)
+        self.positives, self.temperature = int(tc.get("positives", 15)), float(tc.get("temperature", 1.0))
+        self.steps, self.flow = int(tc.get("steps", 8)), None
+        if tc.get("head"):
+            ck = torch.load(tc.head, map_location="cpu", weights_only=False)
+            if ck.get("kind") != "flow":
+                raise ValueError(f"{tc.head} is not a flow head (scripts/head_finetune.py --loss flow)")
+            m = self.model
+            self.flow = FlowHead(m.x_in.out_features, m.head.out.out_features, m.head.inp.out_features,
+                                 len(m.head.blocks)).to(device).eval().requires_grad_(False)
+            self.flow.load_state_dict(ck["head"])
+
+    @torch.no_grad()
+    def draw(self, text, text_len, spk, spk_emb, attn, y, idx) -> torch.Tensor:
+        """Positives ``[R, P, D]`` for the rows ``idx`` (indices into the flattened steps): the teacher's own text
+        condition under the student's alignment ``attn``, its backbone on the recorded history ``y``, its head.
+        Voices of the speaker table (a teacher with a reference encoder reads its null tokens)."""
+        m, P = self.model, self.positives
+        amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
+        with amp:
+            h, mu, _, _ = m.encoder(text, text_len, spk, spk_emb)
+        cond = m.pad_frames(m.frame_condition(h.float(), mu.float(), attn))
+        cond = torch.nn.functional.pad(cond, (y.shape[-1] - cond.shape[-1], 0))  # a prompt in front: no condition
+        with amp:
+            s = m.teacher_forced(cond, y, spk).flatten(0, 1)[idx]
+        base = m.squeeze(patchify(cond[:, : m.n_mels], m.patch).flatten(0, 1)[idx])
+        z = torch.randn(s.shape[0] * P, m.head.noise_dim, device=y.device) * self.temperature
+        with amp:
+            rows = s.repeat_interleave(P, 0)
+            res = self.flow.sample(rows, z, self.steps) if self.flow is not None else m.head(rows, z)
+        return base[:, None] + res.float().view(s.shape[0], P, -1)
+
+
 def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torch.Tensor,
-                  mel_std: float | None = None, detail: bool = False) -> tuple:
+                  mel_std: float | None = None, detail: bool = False, mae=None, teacher=None) -> tuple:
     """One training step; ``mel_std``: the scalar std of the mel statistics (for ``drift.energy_bands``).
     ``detail``: the metrics also hold every feature map's drift loss, raw field and data mass (``loss/<map>``,
-    ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop."""
+    ``force/<map>``, ``p_data/<map>``), for the evaluation in the loop. ``mae``: the frozen Mel-MAE of
+    ``drift.window``; ``teacher``: the :class:`Teacher` of ``drift.teacher``."""
     dc, lc = cfg.drift, cfg.loss
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
     amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
     B = y.shape[0]
+    if dc.get("target_noise"):  # a sample of the codec's posterior instead of its mean (#92)
+        std = batch.get("mel_std")
+        y = sample_targets(y, y_len, dc.target_noise, model.patch if model.tied else 1,
+                           None if std is None else std.to(device, non_blocking=True))
     unknown = spk < 0  # voices without a speaker row (a corpus streamed with `speakers: prompt`, #104)
     if unknown.any():
-        if not model.prompted:
-            raise ValueError("utterances without a speaker row need a model trained with prompts (model.ar.prompt)")
+        if not model.prompted and model.ref_enc is None:
+            raise ValueError("utterances without a speaker row need a model trained with prompts or references "
+                             "(model.ar.prompt, model.ar.reference)")
         spk = torch.where(unknown, torch.full_like(spk, model.prompt_row), spk)  # without a prompt: the null voice
     lead, spk_emb, spk_in = torch.zeros_like(y_len), None, spk  # prompt frames, the encoder's and the backbone's voice
     prompting = model.prompted and dc.get("prompt")
-    if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
-        cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
-                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown)
-        text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
+    referencing = model.ref_enc is not None
+    dropped = torch.zeros(B, dtype=torch.bool, device=device)  # the speaker row is the prompted one
+    has_ref, tokens, ref_vec = dropped, None, None
+    no_voice = dropped  # utterances trained without any voice: the null branch of voice guidance (#99)
+    if float(dc.get("voice_dropout", 0.0)) > 0:
+        if not model.prompted and not referencing:
+            raise ValueError("drift.voice_dropout needs the row of a voice that is not in the table "
+                             "(model.ar.prompt or model.ar.reference)")
+        no_voice = torch.rand(B, device=device) < float(dc.voice_dropout)
+    if referencing and batch.get("ref") is not None:  # voices from a reference (#96): another utterance's crop
+        rc = dc.get("reference") or {}
+        ref, ref_len = batch["ref"].to(device, non_blocking=True), batch["ref_len"].to(device, non_blocking=True)
+        has_ref = (ref_len > 0) & (torch.rand(B, device=device) < float(rc.get("prob", 0.8))) & ~no_voice
         with amp:
-            vec = model.prompt_vector(cut["prompt"], lead)
-        spk_emb = torch.where(cut["dropped"][:, None], vec.float(), model.encoder.spk(spk))
-        spk_in = torch.where(cut["dropped"], torch.full_like(spk, model.prompt_row), spk)
+            tokens, ref_vec = model.reference_tokens(ref, ref_len, has_ref)
+    if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
+        # a voice without a row is cut whenever it can be, unless it has a reference: then the reference alone
+        # is one of its conditions too (with a prompt always, the reference would never be read without one)
+        cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
+                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown & ~has_ref, no_voice)
+        text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
+        dropped = cut["dropped"]
+    if has_ref.any():  # a reference alone: its own draw of the speaker-ID dropout
+        p_id = float((dc.get("reference") or {}).get("id_dropout", 0.5))
+        dropped = dropped | (has_ref & (lead == 0) & (torch.rand(B, device=device) < p_id))
+    if prompting or referencing:
+        dropped = dropped | (unknown & ((lead > 0) | has_ref)) | no_voice  # a voice without a row never keeps one
+        spk_emb = model.encoder.spk(torch.where(no_voice, torch.full_like(spk, model.prompt_row), spk))
+        if prompting:
+            with amp:
+                vec = model.prompt_vector(cut["prompt"], lead)
+            spk_emb = torch.where((dropped & (lead > 0))[:, None], vec.float(), spk_emb)
+        if ref_vec is not None:  # with both, the text encoder's voice is the reference's
+            spk_emb = torch.where((dropped & has_ref)[:, None], ref_vec.float(), spk_emb)
+        spk_in = torch.where(dropped, torch.full_like(spk, model.prompt_row), spk)
     y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
     with amp:
         h, mu, logw, x_mask = model.encoder(text, text_len, spk, spk_emb)
@@ -162,12 +346,25 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     hist, share = y, float(dc.get("self_history", 0.0))
     if share > 0:  # the model's own one-step patches as the history of a share of the utterances
         with amp:
-            own = model.gta(cond, y, spk_in, float(dc.get("self_history_temperature", 0.5))).float()
+            own = model.gta(cond, y, spk_in, float(dc.get("self_history_temperature", 0.5)), tokens=tokens).float()
         swap = (torch.rand(B, device=device) < share)[:, None, None]
         swap = swap & (torch.arange(y.shape[-1], device=device)[None, None] >= lead[:, None, None])  # not a prompt
         hist = torch.where(swap, own, y)
+    rolled = 0
+    rc = dc.get("rollout")
+    if rc and float(torch.rand(())) < float(rc.get("prob", 0.5)):  # several free-running patches as history (#101)
+        lo, hi = (int(v) for v in rc.get("steps", [4, 16]))
+        first, last = int(lead.max()) // k + 1, int((lead + y_len).min()) // k  # steps every utterance has
+        n = min(int(torch.randint(lo, hi + 1, ())), last - first)
+        if n >= 1:
+            t0 = int(torch.randint(first, last - n + 1, ()))
+            with amp:
+                roll = model.rollout(cond, y, spk_in, t0, n, float(rc.get("temperature", 0.5)), tokens=tokens)
+            hist = hist.clone()
+            hist[..., t0 * k: (t0 + n) * k] = unpatchify(roll.float(), k, C)
+            rolled = n
     with amp:
-        s = model.teacher_forced(cond, hist, spk_in, noise, drop)  # [B, S, dim]
+        s = model.teacher_forced(cond, hist, spk_in, noise, drop, tokens)  # [B, S, dim]
     S = s.shape[1]
     pos = torch.arange(S, device=device)[None] * k
     valid = (pos >= lead[:, None]) & (pos < (lead + y_len)[:, None])  # steps that start inside the utterance
@@ -175,8 +372,9 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     if idx.numel() > dc.max_rows:  # a random subset of the steps (rows) keeps the head's batch bounded
         idx = idx[torch.randperm(idx.numel(), device=device)[: dc.max_rows]]
     rows = s.flatten(0, 1)[idx]  # [R, dim]
-    target = patchify(y, k).flatten(0, 1)[idx]  # [R, k * C]
-    base = patchify(cond[:, :C], k).flatten(0, 1)[idx]  # the aligned prior mean: the head predicts a residual
+    # what the head draws: the patch, or one frame for all of it (model.ar.tied, #92)
+    target = model.squeeze(patchify(y, k).flatten(0, 1)[idx])  # [R, k * C] (tied: [R, C])
+    base = model.squeeze(patchify(cond[:, :C], k).flatten(0, 1)[idx])  # the aligned prior mean: the head's residual
     R, G = rows.shape[0], int(dc.gen_per_cond)
     z = torch.randn(R * G, model.head.noise_dim, device=device)
     with amp:
@@ -187,24 +385,60 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
         if mel_std is None:
             raise ValueError("drift.energy_bands needs the scalar std of the mel statistics (log-mel data)")
         opts["energy_scale"] = 2.0 * float(mel_std)
-    f_gen = ar_features(x, k, C, **opts)
+    kf = 1 if model.tied else k  # frames in what the head draws
+    f_gen = ar_features(x, kf, C, **opts)
+    positives = target[:, None]  # [R, 1, D]: the recording
+    if teacher is not None:  # ... and the teacher's samples for the same step (#98)
+        if prompting and (lead > 0).any():
+            raise ValueError("drift.teacher does not go with prompts (drift.prompt): the teacher needs the cut text")
+        drawn = teacher.draw(text, text_len, spk_in, spk_emb, attn, y, idx)
+        positives = torch.cat([positives, drawn], 1)
     with torch.no_grad():
-        f_pos = ar_features(target[:, None], k, C, **opts)
-    l_drift, info = feature_drift_loss(f_gen, f_pos, None, taus=tau, reduce="mean",
-                                       key_weights=dc.get("key_weights"))
+        f_pos = ar_features(positives, kf, C, **opts)
+    kind = dc.get("loss", "field")
+    l_drift, info = kernel_loss(f_gen, f_pos, kind, tau, dc.get("key_weights"))
+    wc = dc.get("window")
+    if wc:  # kernel maps over a window: the recorded patches before the step, then the step's patch (#97)
+        if mae is None or model.tied or k * C != x.shape[-1]:
+            raise ValueError("drift.window needs the Mel-MAE (drift.window.mae) and a log-mel model")
+        n, rw, gw = int(wc.get("context", 3)), int(wc.get("rows", 256)), int(wc.get("samples", 16))
+        hist = history_patches(patchify(y, k), n).flatten(0, 1)[idx[:rw]]  # [Rw, n, k * C]: the recording's
+        with amp:
+            w_gen = window_features(mae, hist, x[:rw, :gw], k, C)
+            with torch.no_grad():
+                w_pos = window_features(mae, hist, positives[:rw], k, C)
+        l_win, w_info = kernel_loss(w_gen, w_pos, wc.get("loss", "energy"), tau, None, wc.get("max_locations", 32))
+        l_drift = l_drift + float(wc.get("weight", 1.0)) * l_win
+        info = {**info, **{kk: v for kk, v in w_info.items() if kk != "tau_loss"},
+                "tau_loss": info["tau_loss"] + w_info["tau_loss"], "window": l_win.detach() - w_info["tau_loss"]}
     loss = lc.drift * l_drift + lc.prior * l_prior + lc.duration * l_dur
     with torch.no_grad():
         metrics = {"loss": loss.detach(), "drift": l_drift.detach() - info["tau_loss"], "tau_loss": info["tau_loss"],
                    "prior": l_prior.detach(), "duration": l_dur.detach(),
                    "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean(),
-                   "rows": float(R), "tau": tau.detach().reshape(()),
-                   "p_data": torch.stack([v for kk, v in info.items() if kk.startswith("p_data/")]).mean()}
-        if prompting:
+                   "rows": float(R), "tau": tau.detach().reshape(())}
+        for name in ("p_data", "spread"):  # the field's data mass; the energy score's spread (1: as the data's)
+            vals = [v for kk, v in info.items() if kk.startswith(name + "/")]
+            if vals:
+                metrics[name] = torch.stack(vals).mean()
+        if "window" in info:
+            metrics["window"] = info["window"]
+        if rc:
+            metrics["rollout"] = float(rolled)
+        if teacher is not None:  # the teacher's spread beside the student's, and how far its mean is from the data
+            metrics["teacher_std"] = positives[:, 1:].std(1).mean()
+            metrics["teacher_mse"] = ((positives[:, 1:].mean(1) - target) ** 2).mean()
+        if prompting or referencing:
             metrics["prompted"] = (lead > 0).float().mean()
-            metrics["id_dropped"] = cut["dropped"].float().mean()
+            metrics["id_dropped"] = dropped.float().mean()
             metrics["no_row"] = unknown.float().mean()
+        if referencing:
+            metrics["referenced"] = has_ref.float().mean()
+            metrics["ref_only"] = (has_ref & (lead == 0) & dropped).float().mean()  # the reference is the voice
+            metrics["no_voice"] = ((unknown | no_voice) & ~has_ref & (lead == 0)).float().mean()
         if detail:
-            metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
+            metrics.update({kk: v for kk, v in info.items()
+                            if kk.startswith(("loss/", "force/", "p_data/", "spread/"))})
     return loss, metrics
 
 
@@ -245,15 +479,26 @@ def run(args) -> None:
         val_ds = ds
     else:
         ds, loader = build_loader(cfg)
-        val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9)
+        val_ds = MelDataset(cfg.data.root, "val", min_frames=1, max_frames=10**9,  # the held-out objective samples
+                            with_std=cfg.drift.get("target_noise") == "posterior")  # its targets as the training
     if ds.language != cfg.model.text.get("language", "tr"):
         raise ValueError(f"{cfg.data.root} is {ds.language!r} text (stats.json), the model's text frontend is "
                          f"{cfg.model.text.get('language', 'tr')!r}: set model.text.language")
-    model = ARDriftTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
-    print(f"ARDrift: text encoder {count_params(model.encoder):.2f}M, backbone "
-          f"{count_params(model) - count_params(model.encoder) - count_params(model.head):.2f}M, head "
-          f"{count_params(model.head):.2f}M; "
-          + ("streamed training data" if cfg.data.get("stream") else f"{len(ds)} training utterances"), flush=True)
+    prefix = cfg.model.get("kind") == "ar_prefix"  # ARDrift v2 (#103): the text as a prefix, no alignment
+    data = "streamed training data" if cfg.data.get("stream") else f"{len(ds)} training utterances"
+    if prefix:
+        from .models.ar_prefix import ARPrefixTTS
+        from .train_ar_prefix import training_step as step_fn
+
+        model = ARPrefixTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
+        print(f"ARDrift v2 (text prefix): backbone {count_params(model) - count_params(model.head):.2f}M, head "
+              f"{count_params(model.head):.2f}M; {data}", flush=True)
+    else:
+        step_fn = training_step
+        model = ARDriftTTS(cfg.model, num_speakers=ds.num_speakers, n_mels=ds.dim).to(device)
+        print(f"ARDrift: text encoder {count_params(model.encoder):.2f}M, backbone "
+              f"{count_params(model) - count_params(model.encoder) - count_params(model.head):.2f}M, head "
+              f"{count_params(model.head):.2f}M; {data}", flush=True)
     tau = torch.nn.Parameter(torch.tensor(float(cfg.drift.get("tau_init", 1.0)), device=device))
     betas = tuple(tc.get("betas", (0.9, 0.999)))
     opt = torch.optim.AdamW([{"params": list(model.parameters())},
@@ -305,12 +550,38 @@ def run(args) -> None:
             vocoder = load_vocoder(tc.get("vocoder", "vocos-v2"), device)
 
     mel_std = None if ds.stats.per_channel else ds.stats.std  # drift.energy_bands: log-mel data only
+    distill = None
+    if cfg.drift.get("distill"):  # the guided state into the backbone (#99): the encoder and the head stay as they are
+        from .train import load_tts
+
+        if prefix:
+            raise ValueError("drift.distill is for the aligned ARDrift model")
+        distill = load_tts(cfg.drift.distill.teacher, device)[0].eval().requires_grad_(False)
+        model.encoder.requires_grad_(False)
+        model.head.requires_grad_(False)
+        print(f"distilling guidance {float(cfg.drift.distill.get('cfg_scale', 1.5)):g} "
+              f"({cfg.drift.distill.get('guide', 'text')}) of {cfg.drift.distill.teacher} into the backbone",
+              flush=True)
+    teacher = None
+    if cfg.drift.get("teacher"):  # a frozen model draws positives beside the recording (#98)
+        teacher = Teacher(cfg.drift.teacher, device)
+        print(f"teacher: {cfg.drift.teacher.path}, {teacher.positives} positives per row"
+              + (f" from the flow head {cfg.drift.teacher.head} ({teacher.steps} steps)" if teacher.flow else ""),
+              flush=True)
+    mae = None
+    if cfg.drift.get("window"):  # the frozen Mel-MAE of the window maps (#97)
+        from .train_mae import load_mae
+
+        mae = load_mae(cfg.drift.window.mae, device)
+        mae.eval().requires_grad_(False)
+        print(f"window maps: {cfg.drift.window.mae}, {int(cfg.drift.window.get('context', 3))} patches of history",
+              flush=True)
 
     def evaluate(at: int) -> None:  # every EMA on the held-out objective and on synthesised sentences (#102)
         t = time.time()
         for n, (name, e) in enumerate(emas.items()):
-            res = heldout_metrics(lambda b, m=e.model: training_step(m, b, cfg, device, tau, mel_std, detail=True)[1],
-                                  heldout)
+            res = heldout_metrics(lambda b, m=e.model: step_fn(m, b, cfg, device, tau, mel_std, detail=True,
+                                                               mae=mae, teacher=teacher)[1], heldout)
             res.update(audio(e.model))
             record(writer, work, at, name, n == 0, res)
         print(f"  evaluation at step {at}: {time.time() - t:.0f} s", flush=True)
@@ -337,10 +608,13 @@ def run(args) -> None:
     it = infinite(loader)
     t0, agg = time.time(), {}
     while step < tc.steps:
-        loss, metrics = training_step(model, next(it), cfg, device, tau, mel_std)
+        if distill is not None:
+            loss, metrics = distill_step(model, distill, next(it), cfg, device)
+        else:
+            loss, metrics = step_fn(model, next(it), cfg, device, tau, mel_std, mae=mae, teacher=teacher)
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        gnorm_enc = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)
+        gnorm_enc = 0.0 if prefix else torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), tc.grad_clip)
         gnorm = torch.nn.utils.clip_grad_norm_([p for n, p in model.named_parameters()
                                                 if not n.startswith("encoder.")], tc.grad_clip)
         opt.step()

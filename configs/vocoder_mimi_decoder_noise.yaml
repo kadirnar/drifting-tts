@@ -1,0 +1,18 @@
+# Issue #92, step 4: a Mimi decoder that tolerates latent error. The decoder fine-tunes of docs/MIMI.md trained on
+# teacher-forced GTA latents and all ended below the released decoder. Here: Gaussian noise of up to 0.3 std on the
+# recorded latents (the released decoder loses 0.67 UTMOSv2 at 0.2 std), and the generated latents drawn
+# free-running, on the model's own history as at inference (train.gta_free_prob, #90).
+# A caution from #90: on mels, free-running batches did not help the English vocoder (UTMOS22 4.10 / 4.04 / 4.01 for
+# 0 / 50 / 100% of them at 2,500 steps). Score a teacher-forced control (gta_free_prob: 0) beside this one.
+#   drifting-tts finetune-vocoder --config configs/vocoder_mimi_decoder_noise.yaml --workdir runs/mimi_decoder_noise
+# Not run yet (the gated Mimi weights and the Mimi model of configs/ar_tts_en_mimi_v2.yaml are needed).
+base: vocoder_mimi_decoder.yaml
+
+tts:
+  path: runs/ar_en_mimi_v2/model_ema.pt
+
+train:
+  steps: 20000
+  gta_prob: 0.5            # half of the batches are generated latents, half the recordings' with noise
+  gta_free_prob: 1.0       # the generated ones are free-running
+  latent_noise: 0.3        # up to this many std of Gaussian noise on the recorded latents (one draw per Mimi frame)

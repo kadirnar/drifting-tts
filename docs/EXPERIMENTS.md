@@ -310,6 +310,21 @@ Details: [LATENTS.md](LATENTS.md).
   faster.
 - Generator-side work is open in #27.
 
+**Semantic-VAE, a WavLM-aligned latent (#93, [LATENTS.md](LATENTS.md#semantic-vae-a-wavlm-aligned-latent-93)).** A
+backend for the public Semantic-VAE (16 kHz, 40 Hz × 64) and the first judged run of the codec gate, on 100 held-out
+English recordings. Round trip UTMOSv2 3.33 (recordings 3.26, the mel through the released vocoder 3.32); noise of
+0.2 standard deviations on the latents costs 0.41 (Mimi 0.67, the mel vocoders 1.1–1.8), a temporal smoothing 1.17.
+Its L2 distance is not more phonetic than the mel's (character ABX error 37.8% against 34.5%; linear probe 31.5%
+against 28.3%). 36 of its 64 channels carry the audio: in the other 28 the posterior is wider than the channel's
+spread over the data, and per-channel normalisation would have given them 44% of the kernel's distance
+(`stats.json` now names the active channels, and the unused ones are left out). The ARDrift run on these latents
+(`configs/ar_tts_en_svae.yaml`) is not done: about 60 h on the A10 the gate ran on.
+
+**Latent ARDrift, second attempt (#92, [MIMI.md](MIMI.md#a-second-attempt-the-code-92)).** Code only: one codec
+frame per step (`model.ar.tied`), targets sampled from the posterior or with Gaussian noise (`drift.target_noise`),
+latents stored once (`extract-latents --native`), the copies of a latent model's frames decoded one by one in the
+gate. Mimi's weights are gated and its latents were not on the machine, so nothing was trained.
+
 ## 5. "Robotic" prosody: diagnosis and research
 
 Listening feedback: the voices sound robotic. Measured on Prosody-40 (harvest F0, semitones):
@@ -381,6 +396,66 @@ recorded speakers from 0.435 to 0.532 (their own recordings 0.656) at the same W
 synthetic voices (0.678 from a prompt, 0.731 by row). Also from #104: `data.filters.require_scores` (an unscored
 utterance fails) and the stream reports the rows it skips for unknown speakers. Not done here: scoring the 10k-h
 corpus, more Turkish speakers, restoring tr-dataset-12 (no access to the Turkish data).
+
+**A reference from another utterance (#96, [ENGLISH.md](ENGLISH.md#a-reference-from-another-utterance-96)).** A
+second voice path beside the prompt: a crop of another utterance of the speaker in front of the sequence. A
+Perceiver resampler (32 new tokens, as XTTS) did not train in two fine-tunes of 6,000 steps (reference alone:
+SIM-o 0.23 on unseen speakers, with a tenth or with 45% of the utterances depending on it): teacher-forced, the
+backbone reads the voice from the utterance's own history, and new tokens get little gradient. The reference's
+own patches as tokens that start as what a prompt looks like (VoxCPM2's layout, a zero-initialised correction on
+top) give the prompt's similarity before any training and after 6,000 steps: reference alone 0.43, prompt 0.546,
+both 0.555 (control: 0.538). Against a recording of the speaker that the model was never given, the prompt is
+0.462 and the prompt with a reference from another recording 0.483 (+0.021, 95% +0.012 to +0.031): 0.08 of a
+prompt's SIM-o is the recording's conditions, and a second recording adds voice. Lesson: a new conditioning path
+into a pretrained autoregressive backbone has to start from something the backbone already reads.
+
+**ARDrift v2, the text as a prefix (#103, [ENGLISH.md](ENGLISH.md#the-pilot-what-makes-a-prefix-model-start-to-read)).**
+`model.kind: ar_prefix`: `[voice] [text] [audio]` through one causal transformer, the drifting head draws the whole
+patch, no aligner, no duration predictor, no prior mean. Pilots on an A10 from the released backbone (about 12
+utterances a step). "Text use": teacher-forced, how much larger the mean patch's error is with another
+utterance's text. A plain prefix: 0% at 5,000 steps, +2.4% at 10,000, no intelligible speech. A pre-net with
+dropout on the history (Tacotron 2, MELLE): +2.4% at 7,500. **The text on the audio's clock** (`model.ar.clock`:
+character `j` at rotary position `(j + 0.5) * rate - lead`, the diagonal prior of attention-based TTS as
+positions): +0.9 / +3.2 / +8.0 / +13.7 / +26.9 / +45.3 / +60.8 / +69.5% every 2,500 steps, and at 20,000 steps
+WER 67.6% on 100 sentences: the first 3.5 words of a sentence on average. The price is the tempo as an input.
+The aligned model stays the release; v2 is a long run.
+
+**A kernel over a window for ARDrift (#97, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#a-kernel-over-a-window-97)).**
+`drift.window` in `train-ar`: the recorded patches before a step and the generated patch through a frozen Mel-MAE,
+whose maps over the patch are further kernel maps; `drift.loss: energy` for the energy score. Whole-model
+fine-tunes of 5,000 steps: one teacher-forced patch is told from the recorded one 54% of the time (control 78%;
+the energy score alone 71%; the field with the window maps 62%), the head's spread in the fastest band rises from
+0.80 to 0.85–0.87 of its error, and no judge and no word error rate moves. The frame-to-frame-change view (0.87)
+and 16 free-running frames (0.91) stay where they were. The head-only result carries over to the whole model, and
+the field is enough once the maps see a window.
+
+**Exposure bias of ARDrift (#101, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#training-on-the-models-own-history-101)).**
+On the released English model, noise on the free-running history at inference does not help (every measure moves
+away from the recordings as it grows; no judge hears 0.15 of it). Three fine-tunes of 5,000 steps against a control:
+the noise level as an input of the backbone, 4–16 free-running patches as history in half of the batches, and the
+one-step own history. None moves the free-running distance to the recording (4.33–4.38 dB; control 4.34) or the
+pause energy (+1.4 to +1.6 dB), and no judge moves. Most of that distance is another reading of the sentence, not
+an error: two teacher-forced draws are already 1.6 dB apart. The corpus is clean; the podcast voices, where the
+one-step history took 2.3 dB off, are where rollouts remain to be tried.
+
+**More than one positive per drift problem (#98, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#positives-from-a-teacher-98)).**
+`drift.teacher`: a frozen model draws 31 positives per row beside the recording. With the released model's own
+head (self-distillation), 5,000 steps move no judge outside its interval (UTMOSv2 +0.05, WER 2.03% against 2.17%)
+and no distribution test in the right direction. With a flow-matching head trained on the frozen backbone's states
+(30,000 steps on 6 h; evenly calibrated across temporal frequencies at 32 Euler steps, 0.88–0.93, but with a worse
+mean than the drifting head), six of seven judges fall and a classifier tells the mels from recordings 96–99% of
+the time: the student inherits a teacher that is worse than itself.
+
+**Guidance for ARDrift (#99, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#guidance-99)).** Text dropout 0.15 for 5,000
+steps, then a sweep: WER 2.4 / 7.9 / 25 / 45% at scales 1 / 1.25 / 1.5 / 1.75, every judge lower at each step.
+Teacher-forced, the mean patch's error is smallest at scale 1 and 1.8 times as large at 1.5: the head adds a
+residual to the aligned prior mean, the prior mean carries the text also in the null branch, and guidance on the
+state scales the residual. Distilling the guided state into the backbone works as a mechanism (the student speaks
+in one pass as its teacher in two) and has nothing good to distil here. **Voice guidance is the lever that works**:
+with voice dropout 0.15 in a fine-tune of the reference model, a null branch without the voice lifts the
+reference alone on unseen speakers from SIM-o 0.438 to 0.491 / 0.524 / 0.548 / 0.563 / 0.585 / 0.593 at scales
+1.5 / 2 / 2.5 / 3 / 4 / 5 (0.387 to 0.485 against a recording the model was never given; the prompt: 0.546 and
+0.464) at 2.6–3.1% WER.
 
 ## 6. Pitfalls and engineering notes
 

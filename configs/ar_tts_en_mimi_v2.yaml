@@ -1,0 +1,31 @@
+# Issue #92: ARDrift on Mimi latents, second attempt. What differs from configs/ar_tts_en_mimi.yaml (docs/MIMI.md):
+#   - model.ar.tied: every Mimi frame is stored 4 times for the alignment, and the first model drew a 128-d patch of
+#     four copies that nothing tied together. Here the backbone reads one 32-d frame per step and the head draws one,
+#     copied over the patch (Kyutai's head emits the 32-d latent itself). The text condition keeps its 50 Hz grid.
+#   - drift.target_noise: the first model was trained on the posterior mean; SALAD reports UTMOS 4.28 against 3.47 for
+#     a model trained on samples. Mimi exposes no posterior, so Gaussian noise of 0.1 std stands in for it (with a
+#     codec that has one: `extract-latents --save-std` and drift.target_noise: posterior).
+#   - 300k steps with the evaluation in the loop (#102): the first run stopped at 150k, on what may be the plateau
+#     Kyutai describe (UTMOSv2 flat from 60k to 150k; their jump comes between 125k and 200k).
+# The same latents work (data/en_mimi); `extract-latents --native` stores each frame once, a quarter of the 115 GB.
+#   python scripts/codec_gate.py --data data/en_mimi --backends mimi --skip native tolerance phonetic \
+#       --model runs/ar_en_mimi/model_ema.pt --cfg 1 --temperature 0.5     # first: the copies of the old model
+#   drifting-tts train-ar --config configs/ar_tts_en_mimi_v2.yaml --workdir runs/ar_en_mimi_v2
+# Not run yet: the Mimi weights are gated and the latents (10,000 h) are not where this was written.
+base: ar_tts_en_mimi.yaml
+
+model:
+  ar:
+    tied: true             # one codec frame per step
+
+drift:
+  target_noise: 0.1        # std of the noise on the latents, in their normalised units (0.05-0.1; posterior: the
+                           # codec's own, from stds.bin)
+
+train:
+  steps: 300000
+  ema_decays: [0.999, 0.9999]
+  eval_every: 10000
+  eval:
+    num: 48
+    at_start: false

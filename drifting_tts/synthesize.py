@@ -23,6 +23,7 @@ from .voices import DEFAULT_VOICE, VOICES, voice_id
 DEFAULT_TEMPERATURE = 0.5  # noise temperature of a checkpoint without a stored one (lowest CER in the README sweep)
 DEFAULT_CFG = {"dit": 2.0, "ar": 1.0}  # guidance of a checkpoint without a stored one: the DiT's operating point
 #                                        (README), none for ARDrift (it does not help: docs/AR_DRIFT.md)
+REFERENCE_MODE = "both"  # a recording's voice on a model trained with prompts and references (#95, #96)
 AR_CONTEXT_FRAMES = 256  # ARDrift: frames of the audio before a unit that it continues from (2.7 s)
 PARAGRAPH_CHARS = 180  # paragraph mode: characters per unit, within the CUDA graphs' buckets (fast.warmup)
 CONTEXT_CHARS = 190  # left context + unit, within the 384-token bucket of the CUDA graphs
@@ -42,7 +43,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--speaker", default=DEFAULT_VOICE, help=f"voice: {' or '.join(VOICES)} (default: {DEFAULT_VOICE})")
     p.add_argument("--ref-audio", default=None,
                    help="a recording whose voice is spoken instead of --speaker (an ARDrift model trained with "
-                        "prompts, model.ar.prompt)")
+                        "prompts or references: model.ar.prompt, model.ar.reference)")
     p.add_argument("--list-speakers", action="store_true", help="list the voices")
     p.add_argument("--out", default="out.wav")
     p.add_argument("--out-dir", default="outputs/synth")
@@ -168,12 +169,14 @@ def preferred_cfg(model) -> float:
 
 
 class Reference:
-    """A voice given by a recording (#95; a model trained with ``model.ar.prompt``): ``mel``, the normalised mel
-    ``[1, n_mels, P]`` of the recording's beginning (whole patches), which the model continues from, and ``vector``,
-    the speaker vector the text encoder gets in place of a table row (:meth:`Synthesizer.reference`)."""
+    """A voice given by a recording (:meth:`Synthesizer.reference`): ``mel``, the normalised mel ``[1, n_mels, P]``
+    of the recording's beginning (whole patches), which the model continues from (#95, ``model.ar.prompt``; ``None``:
+    no prompt); ``tokens`` ``[1, K, dim]``, the reference encoder's reading of the recording, in front of the
+    backbone's sequence (#96, ``model.ar.reference``; ``None``: the model's null tokens); and ``vector``, the speaker
+    vector the text encoder gets in place of a table row."""
 
-    def __init__(self, mel: torch.Tensor, vector: torch.Tensor):
-        self.mel, self.vector = mel, vector
+    def __init__(self, mel: torch.Tensor | None, vector: torch.Tensor, tokens: torch.Tensor | None = None):
+        self.mel, self.vector, self.tokens = mel, vector, tokens
 
 
 class AcousticContext:
@@ -194,6 +197,8 @@ class AcousticContext:
     def prefix(self, unit_frames: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """``(prefix_cond, prefix)`` for a unit of ``unit_frames`` frames, or ``(None, None)``."""
         ref = self.reference
+        if ref is not None and ref.mel is None:  # a reference without a prompt: its tokens alone
+            ref = None
         room = self.limit - unit_frames - (0 if ref is None else ref.mel.shape[-1])
         n = 0 if self.cond is None else max(min(self.cond.shape[-1], room), 0) // self.patch * self.patch
         cond, mel = (self.cond[..., -n:], self.mel[..., -n:]) if n > 0 else (None, None)
@@ -261,7 +266,7 @@ class Synthesizer:
         self.model, self.cfg, stats = load_tts(model_path, device)
         self.language = self.cfg.model.text.get("language", "tr")
         self.text = frontend(self.language)  # normalisation and symbols of the model's language
-        self.stats = MelStats(stats["mean"], stats["std"])
+        self.stats = MelStats.from_dict(stats)
         self.backend = stats.get("backend", "vocos")
         if self.backend in VAE_BACKENDS:  # a model trained on VAE latents: the VAE decoder is the vocoder
             from .latents.vocoder import LatentVocoder
@@ -292,6 +297,9 @@ class Synthesizer:
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
         self.acoustic, self.vocoder_graphs, self.prosody = None, None, None
+        # ARDrift, set after construction: what the null branch of `cfg_scale` is without ("text", "voice": the
+        # speaker row and the reference's tokens, or "both"; #99), and Gaussian noise on the model's own history (#101)
+        self.guidance, self.history_noise = "text", 0.0
         self.fast, self._graph_opts = fast, {"compile": compile, "tf32": tf32}
         resolve_pause(pause, 0)  # validate
         self.pause = pause
@@ -382,14 +390,32 @@ class Synthesizer:
 
     @torch.no_grad()
     def reference(self, audio: str | Path | torch.Tensor, sample_rate: int | None = None,
-                  seconds: float = 6.0) -> Reference:
-        """A voice from a recording (#95): a file, or a mono waveform at ``sample_rate`` (default 24 kHz). Its first
-        ``seconds`` are prepared as the training data was (silence trimmed, loudness normalised) and become the
-        prompt; no transcript is needed. Pass the result as ``speaker`` (or the recording as ``ref_audio``)."""
-        if not self.ar or not self.model.prompted:
-            raise ValueError("a reference voice needs an ARDrift model trained with prompts (model.ar.prompt)")
-        mel = self.reference_mel(audio, sample_rate, seconds)
-        return Reference(mel, self.model.prompt_vector(mel))
+                  seconds: float = 6.0, mode: str | None = None, reference_seconds: float = 10.0) -> Reference:
+        """A voice from a recording: a file, or a mono waveform at ``sample_rate`` (default 24 kHz), prepared as the
+        training data was (silence trimmed, loudness normalised); no transcript is needed. Pass the result as
+        ``speaker`` (or the recording as ``ref_audio``). ``mode``: how the model gets the voice:
+
+        * ``"prefix"`` (#95, ``model.ar.prompt``): the first ``seconds`` are a prompt the model continues from;
+        * ``"reference"`` (#96, ``model.ar.reference``): the first ``reference_seconds`` go through the reference
+          encoder;
+        * ``"both"``: the two together. The default: what the model was trained for (:data:`REFERENCE_MODE`)."""
+        m = self.model
+        ways = [w for w, on in (("prefix", self.ar and m.prompted), ("reference", self.ar and m.ref_enc is not None))
+                if on]
+        if not ways:
+            raise ValueError("a reference voice needs an ARDrift model trained with prompts or references "
+                             "(model.ar.prompt, model.ar.reference)")
+        mode = mode or (REFERENCE_MODE if len(ways) == 2 else ways[0])
+        if mode not in ("prefix", "reference", "both") or any(w not in ways for w in
+                                                              (("prefix", "reference") if mode == "both" else (mode,))):
+            raise ValueError(f"reference mode {mode!r}: this model was trained for {' and '.join(ways)}")
+        mel = tokens = vector = None
+        if mode != "reference":
+            mel = self.reference_mel(audio, sample_rate, seconds)
+            vector = m.prompt_vector(mel)
+        if mode != "prefix":  # with both, the text encoder's voice is the reference's, as in training
+            tokens, vector = m.reference_tokens(self.reference_mel(audio, sample_rate, reference_seconds))
+        return Reference(mel, vector, tokens)
 
     def reference_mel(self, audio: str | Path | torch.Tensor, sample_rate: int | None = None,
                       seconds: float = 6.0) -> torch.Tensor:
@@ -415,10 +441,15 @@ class Synthesizer:
         """ARDrift: the normalised mel of one unit's aligned condition, continuing from ``history`` (then updated)."""
         m = self.model
         pc, pm = (None, None) if history is None else history.prefix(cond.shape[-1])
+        tokens = getattr(getattr(history, "reference", None), "tokens", None)  # a reference's (#96)
+        hn = float(getattr(self, "history_noise", 0.0))  # noise on the model's own history (#101; default none)
+        guide = getattr(self, "guidance", "text")  # what the null branch of cfg_scale is without (#99)
         if m.fast_generator is not None:
-            mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc)
+            mel = m.fast_generator(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens,
+                                   history_noise=hn, guide=guide)
         else:
-            mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc)
+            mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
+                             tokens=tokens, history_noise=hn, guide=guide)
         if history is not None:
             history.update(cond, mel)
         return mel
@@ -506,7 +537,8 @@ class Synthesizer:
 
         self.acoustic = None
         if getattr(self.model, "generator", None) is None:  # an ARDrift model: one CUDA graph per generation step
-            self.model.enable_fast()
+            patches = getattr(getattr(self.model, "ref_enc", None), "kind", None) == "patches"
+            self.model.enable_fast(max_steps=768 if patches else 512)  # room for a reference's patches (#96)
             return
         if not graphable(self.prosody, self.prosody_spread) or self.prosody_pitch is not None:
             warnings.warn("this prosody predictor runs eagerly: only the vocoder windows use CUDA graphs", stacklevel=3)
@@ -595,7 +627,8 @@ class Synthesizer:
         regressors give), drawn from ``g`` before the acoustic model's noise. ``pt`` / ``dt``: the prosody and the
         letters' duration temperature; ``rs`` / ``edge_scale``: :meth:`_rhythm`."""
         durations = pitch = None
-        prompted = self.ar and self.model.prompted and int(spk[0]) == self.model.prompt_row
+        prompted = self.ar and (self.model.prompted or self.model.ref_enc is not None) \
+            and int(spk[0]) == self.model.prompt_row
         if self.prosody is None or prompted:  # a prosody predictor does not know a voice given by a prompt
             return durations, pitch
         ids_len = torch.tensor([ids.shape[1]], device=self.device)
@@ -871,15 +904,19 @@ class Synthesizer:
             if previous is not None:
                 yield silence(pause, previous, rng, self.sample_rate)
             previous = sentence
-            if not gen.fits(t, 0 if pc is None else pc.shape[-1]):  # longer than the caches: whole sentence
-                mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc)
+            tokens = None if ref is None else ref.tokens
+            lead = None if tokens is None else tokens.shape[1]
+            if not gen.fits(t, 0 if pc is None else pc.shape[-1], lead):  # longer than the caches: whole sentence
+                mel = m.generate(cond, spk, temperature, g, prefix=pm, cfg_scale=cfg_scale, prefix_cond=pc,
+                                 tokens=tokens, guide=getattr(self, "guidance", "text"))
                 if history is not None:
                     history.update(cond, mel)
                 for piece in stream_vocoder(voc, self.stats.denormalize(mel), first=first, chunk=chunk, context=ctx,
                                             graphs=self.vocoder_graphs):
                     yield piece.cpu()
                 continue
-            steps = gen.steps(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc)
+            steps = gen.steps(cond, spk, temperature, g, cfg_scale, prefix=pm, prefix_cond=pc, tokens=tokens,
+                              guide=getattr(self, "guidance", "text"))
             mel = torch.zeros(1, m.n_mels, m.pad_frames(cond).shape[-1], device=self.device)
             done = 0
             for a, b, start, n in stream_windows(t, first, chunk, ctx):

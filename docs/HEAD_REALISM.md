@@ -224,7 +224,9 @@ copy-synthesis 3.294. WER stays at 2.1–2.6% for every head.)
   against the recordings' 2.82, and the change is more alike across neighbouring mel bins (0.61 against 0.56).
 - **The envelope view of 16 free-running frames got worse** with the energy score (0.62 → 0.74–0.77).
 - **Only the head was trained.** The backbone never saw the new head's patches as its history, 2,500 steps is
-  short, and the whitening scale was measured once. `train-ar` is unchanged.
+  short, and the whitening scale was measured once. The whole-model runs with the energy score and the window maps
+  (`drift.loss: energy`, `drift.window` in `train-ar`) are in
+  [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#a-kernel-over-a-window-97).
 - **English only**: the Turkish corpus was not available on this machine.
 
 ## A panel of judges: where the audible gap is

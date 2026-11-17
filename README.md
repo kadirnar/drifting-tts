@@ -275,10 +275,11 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [docs/PROSODY.md](docs/PROSODY.md) | prosody metrics against recordings (`drifting-tts prosody`), oracle prosody, pitch gain, pause policy |
 | [docs/PROSODY_MODEL.md](docs/PROSODY_MODEL.md) | the stochastic prosody predictor of v3.2 (drifting), against regression and flow matching |
 | [docs/AR_DRIFT.md](docs/AR_DRIFT.md) | ARDrift, our own autoregressive model with a one-step drifting head (#42): design, training on Vyvo/tr-dataset-12, results against v3.2 |
-| [docs/ENGLISH.md](docs/ENGLISH.md) | ARDrift in English: the character frontend, training streamed from 10,000 h on the Hub, results |
+| [docs/ENGLISH.md](docs/ENGLISH.md) | ARDrift in English: the character frontend, training streamed from 10,000 h on the Hub, results; voices from a prompt and a reference; the pilot of ARDrift v2 (the text as a prefix, no aligner) |
 | [docs/HEAD_REALISM.md](docs/HEAD_REALISM.md) | why ARDrift sounds robotic at the recordings' UTMOSv2: the head's calibration, mel texture and prosody against held-out recordings, a classifier two-sample test that tells one generated patch from a recorded one, why the one-positive field leaves the head too smooth in time, and head-only fine-tunes with the energy score |
-| [docs/MIMI.md](docs/MIMI.md) | the English ARDrift on Kyutai's Mimi latents (Pocket TTS's codec): extraction from parquet shards, results against the mel model, the decoder's sensitivity, three decoder fine-tunes |
-| [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM): the backends, their resynthesis ceiling, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
+| [docs/OBJECTIVE_PILOTS.md](docs/OBJECTIVE_PILOTS.md) | changes to ARDrift's objective as fine-tunes of the English model against one control: a kernel over a window and the energy score (#97), teacher positives (#98), training on the model's own history (#101), guidance and its distillation (#99) |
+| [docs/MIMI.md](docs/MIMI.md) | the English ARDrift on Kyutai's Mimi latents (Pocket TTS's codec): extraction from parquet shards, results against the mel model, the decoder's sensitivity, three decoder fine-tunes, and the code of a second attempt (one codec frame per step, sampled targets) |
+| [docs/LATENTS.md](docs/LATENTS.md) | audio-VAE latent spaces (DAC-VAE, VoxCPM, Semantic-VAE): the backends, their resynthesis ceiling, the codec gate, the latent TTS pilots and the VoxCPM2 and DAC-VAE decoder GTA fine-tunes |
 | [docs/POCKET_TTS_GATE.md](docs/POCKET_TTS_GATE.md) | a Turkish Pocket TTS (autoregressive, Mimi latents) on Freya-100 with our judges and prosody metrics, and the Mimi codec gate (#42) |
 | [space/](space/) | the Gradio demo (`scripts/deploy_space.sh` deploys it) |
 | [space_test/](space_test/) | the private test Space: the models under test, one tab each (`scripts/deploy_test_space.sh`) |
@@ -296,8 +297,9 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 ## Limitations
 
 - **Voices:** three built-in voices; no voice cloning from a reference recording in the released models (a pilot
-  for the English ARDrift reaches a speaker similarity of 0.53 on recorded voices it never heard, against 0.66 for
-  their own recordings: [docs/ENGLISH.md](docs/ENGLISH.md#voices-from-a-prompt-95)).
+  for the English ARDrift reaches a speaker similarity of 0.55 on recorded voices it never heard, from a prompt and
+  a reference recording together, against 0.66 for their own recordings:
+  [docs/ENGLISH.md](docs/ENGLISH.md#voices-from-a-prompt-95)).
 - **Prosody:** v3.2 samples the intonation with the recordings' spread, but the rhythm still comes from a
   deterministic duration predictor, and each sentence is generated without the context of its neighbours. Sampling
   the durations too (opt-in) costs intelligibility for the male and female voices.

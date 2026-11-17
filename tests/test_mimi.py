@@ -58,6 +58,42 @@ def test_extract_latents_from_parquet(tmp_path, monkeypatch):
                                atol=2e-3)
 
 
+def test_extract_latents_from_parquet_with_a_posterior(tmp_path, monkeypatch):
+    """A codec with a posterior, straight from parquet shards: the frames stored once (``--native``), the
+    posterior's standard deviations beside them, and the channels the codec does not use named in the statistics."""
+    from drifting_tts import latents
+    from drifting_tts.cli import main
+    from drifting_tts.data import MelDataset
+    from tests.test_text_en import _english_parquet
+
+    class WithPosterior(_Fake):
+        def posterior(self, wav, sr):
+            z = self.encode(wav, sr)
+            std = torch.full_like(z, 1e-7)  # far below what the data does in the first three channels
+            std[:, 3] = 50.0  # the last channel: a posterior wider than anything the data does there
+            return z, std
+
+    monkeypatch.setattr(latents, "load_backend", lambda name, device="cpu", **kw: WithPosterior())
+    _english_parquet(tmp_path / "train-0.parquet", 8)
+    _english_parquet(tmp_path / "held-0.parquet", 6, start=100, seconds=2.5)
+    out = tmp_path / "lat"
+    main(["extract-latents", "--parquet-glob", str(tmp_path / "*.parquet"), "--val-glob", str(tmp_path / "held-*"),
+          "--val-size", "4", "--backend", "fake", "--language", "en", "--speaker-column", "speaker_id",
+          "--out", str(out), "--workers", "1", "--prefetch", "1", "--batch-seconds", "3", "--device", "cpu",
+          "--native", "--save-std"])
+    st = json.loads((out / "stats.json").read_text())
+    assert st["stored_repeat"] == 1 and st["latent_repeat"] == 4 and st["posterior_std"]
+    assert st["active"] == [True, True, True, False] and 0 < st["posterior_rel"] < 1
+    index = [json.loads(line) for line in open(out / "index.jsonl")]
+    frames = sum(e["frames"] for e in index)
+    assert (out / "mels.bin").stat().st_size == frames // 4 * 4 * 2 == (out / "stds.bin").stat().st_size
+    ds = MelDataset(out, "train", min_frames=1, with_std=True)
+    it = ds[0]
+    assert it["mel"].shape == it["mel_std"].shape and it["mel"].shape[1] == ds.frames(0)
+    assert not it["mel"][3].any() and not it["mel_std"][3].any()  # the unused channel is left out
+    assert torch.equal(it["mel"][:, 0], it["mel"][:, 3]) and it["mel_std"][0].min() > 0  # copies made on reading
+
+
 def test_mimi_backend_frames():
     pytest.importorskip("pocket_tts")
     from drifting_tts.latents import load_backend

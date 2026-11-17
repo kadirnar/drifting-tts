@@ -1,0 +1,35 @@
+# Issue #96: a second way to give the English ARDrift a voice, beside the prompt of #95: a recording of the speaker
+# from *another* utterance. Its mel patches stand in front of the backbone's sequence with a segment embedding, as
+# what a prompt's positions look like to the backbone plus the correction of two transformer layers (VoxCPM2's REF
+# tokens; docs/ENGLISH.md). The prompted model is fine-tuned with both paths: 40% of the utterances that can be cut
+# have a prompt, 85% of those with a second utterance of their speaker have a reference, and the speaker row is
+# dropped for half of each (always for the recorded corpus, whose speakers have no row).
+#   drifting-tts train-ar --config configs/ar_tts_en_reference.yaml --workdir runs/ar_en_reference
+#   tts = Synthesizer("runs/ar_en_reference/model_ema.pt", "cuda", vocoder=...); tts(text, ref_audio="voice.wav")
+#   tts(text, ref_audio=tts.reference("voice.wav", mode="reference"))    # reference | prefix | both
+#   python scripts/clone_eval.py --model runs/ar_en_reference/model_ema.pt --manifest <manifest.json> \
+#       --systems prompt reference both --f0 --out <dir>
+base: ar_tts_en_prompt_recorded.yaml
+
+model:
+  ar:
+    reference:
+      kind: patches        # the reference's own patches as tokens, read as a prompt's are; resampler: 32 new
+                           # tokens from a Perceiver resampler, which did not learn a voice in a fine-tune
+      dim: 512             # the width of the layers that correct the tokens (their output starts at zero)
+      layers: 2
+      heads: 8
+      null_tokens: 32      # tokens of a call without any reference
+
+drift:
+  prompt:
+    prob: 0.4              # a prompt for 40% of the utterances that can be cut (0.85 without a reference)
+  reference:
+    prob: 0.85             # share of the utterances with a second utterance of their speaker that get it; the rest:
+                           # the null tokens (the row or the prompt alone, or no voice: voice guidance's null branch)
+    id_dropout: 0.5        # share of them whose speaker row is the prompted one
+    min_seconds: 3.0       # the reference: a crop of 3 to 10 s of the other utterance
+    max_seconds: 10.0
+
+train:
+  init_from: runs/ar_en_prompt_rec/model_ema.pt   # configs/ar_tts_en_prompt_recorded.yaml
