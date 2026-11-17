@@ -297,6 +297,9 @@ class Synthesizer:
         spk_file = Path(self.cfg.data.root) / "speakers.json"
         self.speakers = json.loads(spk_file.read_text()) if spk_file.exists() else {}
         self.acoustic, self.vocoder_graphs, self.prosody = None, None, None
+        # ARDrift, set after construction: what the null branch of `cfg_scale` is without ("text", "voice": the
+        # speaker row and the reference's tokens, or "both"; #99), and Gaussian noise on the model's own history (#101)
+        self.guidance, self.history_noise = "text", 0.0
         self.fast, self._graph_opts = fast, {"compile": compile, "tf32": tf32}
         resolve_pause(pause, 0)  # validate
         self.pause = pause

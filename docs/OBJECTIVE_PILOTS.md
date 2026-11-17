@@ -247,7 +247,40 @@ guided state `s_null + g (s − s_null)` against the recording.
   (0.103 at 1.5 against 0.081) and the patch wrong. In Pocket TTS the text reaches the output only through the
   state, and its extrapolation is more text.
 - **What #99 expected** ("the prior mean still carries the text in the null branch... the gain, if any, would be
-  in naturalness") holds in its first half only: there is no gain to distil.
+  in naturalness") holds in its first half only: text guidance has no gain to distil.
+
+**Voice guidance works.** The model with a reference path ([ENGLISH.md](ENGLISH.md#a-reference-from-another-utterance-96))
+fine-tuned for 4,000 more steps with voice dropout 0.15 and text dropout 0.1; then guidance with a null branch
+without the voice (the row of a voice that is not in the table and the null tokens in place of the reference's;
+the text stays). The 36 unseen recorded speakers, the voice from the reference alone:
+
+| scale | SIM-o | SIM with a recording the model was not given | WER | F0 std |
+|---|---|---|---|---|
+| 1.0 | 0.438 | 0.387 | 2.79% | 3.19 st |
+| 1.5 | 0.491 | 0.422 | 2.60% | 3.33 st |
+| 2.0 | 0.524 | 0.443 | 2.79% | 3.32 st |
+| 2.5 | 0.548 | 0.457 | 2.99% | 3.38 st |
+| **3.0** | **0.563** | **0.466** | 3.04% | 3.39 st |
+| the prompt, no guidance | 0.546 | 0.464 | 3.24% | 3.03 st |
+| prompt + reference, no guidance | 0.554 | 0.464 | 3.24% | 3.01 st |
+
+- **Every step of the scale adds voice**: +0.035, +0.056, +0.070 and +0.079 on the voice alone (the last: 95%
+  +0.065 to +0.092, higher on 87% of the items), for a quarter of a point of WER at most. The curve had not turned
+  at 3.
+- **At 3 the reference alone is the prompt's equal**: the same similarity with an unheard recording (0.466 against
+  0.464, the difference inside its interval), a higher SIM-o (+0.017), fewer word errors and a wider F0. A
+  reference need not be contiguous with the output and does not carry its recording's conditions into it.
+- **Why the voice and not the text.** The voice reaches the output only through the state (the tokens and the
+  speaker row), as the text does in Pocket TTS; the text reaches ARDrift's output through the prior mean as well.
+- **It does little for a prompt** (prompt + reference at 1.5: +0.003): the prompt is history, and the null branch
+  reads it too.
+- **Text guidance breaks this model as well**: at 1.5 the reference alone falls to 0.311 with 18.8% WER, with or
+  without the voice in the null branch.
+- **The dropouts cost nothing**: without guidance the model is where it was before them (0.546 / 0.438 / 0.554 for
+  prompt / reference / both).
+- Not done: scales above 3, guidance with a prompt in the null branch removed, and the distillation of voice
+  guidance into the backbone (`drift.distill` takes voices of the speaker table; a reference would have to come
+  with the batch).
 
 **Distillation** (`drift.distill`: the backbone alone is trained towards the frozen teacher's guided state, mean
 squared error; the text encoder and the head are not touched). 3,000 steps towards scale 1.5 close 82% of the

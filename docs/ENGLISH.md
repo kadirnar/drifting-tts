@@ -575,6 +575,11 @@ On the corpus's own 40 voices (120 sentences):
 `runs/ar_en_reference3` is this model: `Synthesizer(model, "cuda", vocoder=...)(text, ref_audio="voice.wav")` uses
 both paths; `tts.reference("voice.wav", mode="reference")` the reference alone.
 
+**With voice guidance the reference alone is the prompt's equal** (#99,
+[OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#guidance-99)): 4,000 more steps with voice dropout, then guidance at 3
+with a null branch without the voice: SIM-o 0.563 and 0.466 with an unheard recording (the prompt: 0.546 and
+0.464), WER 3.0%. `runs/ar_en_voice` is that model; `tts.guidance = "voice"` and `cfg_scale=3` select it.
+
 Not done: the long run (the prompt path stopped rising at 0.54 here; the reference path was still new at 6,000
 steps), references longer than the 6 s it was trained on, a reference through a noisy channel (where a prompt would
 copy the noise and a reference need not), and the speaker-verification and CTC losses through the head that #96
