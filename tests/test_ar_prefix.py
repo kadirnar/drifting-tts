@@ -8,7 +8,7 @@ import torch
 
 from drifting_tts.config import Config, load_config
 from drifting_tts.models.ar import patchify
-from drifting_tts.models.ar_prefix import ARPrefixTTS, characters, eos_loss, front_pad
+from drifting_tts.models.ar_prefix import ARPrefixTTS, PreNet, characters, eos_loss, front_pad
 from drifting_tts.text import BLANK_ID, text_to_ids
 from drifting_tts.train_ar_prefix import training_step
 from tests.test_prompt import _batch
@@ -90,6 +90,23 @@ def test_generation_matches_teacher_forcing_and_stops_at_the_end():
     assert voiced.shape != mel.shape or not torch.allclose(voiced, mel, atol=1e-4)
 
 
+def test_prenet_is_a_bottleneck_with_dropout_at_inference():
+    m = _model(prenet={"dim": 16, "dropout": 0.5})
+    assert isinstance(m.x_in, PreNet) and m.x_in.layers[0].out_features == 16 and not m.training
+    text, n = torch.randint(3, 20, (1, 7)), torch.tensor([7])
+    y, spk = torch.randn(1, 100, 16), torch.tensor([0])
+    a, b = m.teacher_forced(text, n, y, spk), m.teacher_forced(text, n, y, spk)
+    assert a.shape == (1, 5, 32) and not torch.allclose(a, b)  # the dropout is on in eval mode
+    torch.manual_seed(0)
+    c = m.teacher_forced(text, n, y, spk)
+    torch.manual_seed(0)
+    assert torch.allclose(c, m.teacher_forced(text, n, y, spk))
+    m.x_in.dropout = 0.0
+    assert torch.allclose(m.teacher_forced(text, n, y, spk), m.teacher_forced(text, n, y, spk))
+    mel = m.generate(text, spk, max_steps=6, generator=torch.Generator().manual_seed(0))
+    assert mel.shape[:2] == (1, 100) and mel.shape[-1] % 4 == 0
+
+
 def test_eos_loss_marks_the_step_after_the_last_patch():
     logits = torch.full((2, 5), -10.0)
     logits[0, 4], logits[1, 2] = 10.0, 10.0
@@ -111,6 +128,10 @@ def test_training_step_of_the_prefix_model():
     loss.backward()
     assert torch.isfinite(loss) and {"eos", "eos_acc", "p_data", "loss/patch"} <= set(metrics)
     assert metrics["prompted"] == 0.5 and metrics["id_dropped"] == 0.5 and metrics["rows"] == 24
+    # one of the two utterances lost its text at this seed: the gap of the errors is measured on this step
+    assert metrics["null_steps"] in (0.0, 1.0) and (metrics["null_steps"] == 1.0) == (float(metrics["text_gap"]) != 0)
+    none = load_config("configs/ar_tts.yaml", OVER + ["drift.cond_dropout=0.0"])
+    assert training_step(m, _batch(), none, "cpu", tau)[1]["null_steps"] == 0.0
     for p in (m.tok.weight, m.head.out.weight, m.eos.weight, m.x_in.weight, m.seg):
         assert p.grad is not None and p.grad.abs().sum() > 0
     grad = m.spk.weight.grad  # the prompted utterance reads the prompted row, the other its own

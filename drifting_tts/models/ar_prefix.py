@@ -13,6 +13,9 @@ The sequence is Kyutai's: ``[voice] [text] [audio]``.
 * **audio**: the patches of ``patch`` mel frames, each drawn in one pass by the drifting head from the state after
   the patches before it. No prior mean: the head draws the patch itself.
 
+With ``model.ar.prenet`` the patches the model reads back go through a narrow pre-net with dropout
+(:class:`PreNet`), so that the history alone does not say what comes next.
+
 One causal transformer reads all of it. A second head on the same state says whether the utterance is over (the
 step after the last patch; Kyutai's ``eos_loss_weight: 0.1``). The rows of a batch are padded **in front**, so that
 the audio starts at the same position in every row; rotary positions are relative, so a row does not see its
@@ -30,6 +33,25 @@ from .ar import Block, DriftHead, patchify, unpatchify
 from .generator import RMSNorm
 
 TEXT, VOICE, AUDIO = 0, 1, 2  # segments
+
+
+class PreNet(nn.Module):
+    """A bottleneck on the patches the model reads back (``model.ar.prenet``): narrow layers with dropout, **in
+    training and at inference**. Teacher-forced, the patch before a step says most of what the next one is, and a
+    model that can read it exactly has little to gain from the text; Tacotron 2 found this bottleneck "essential
+    for learning attention", and MELLE, the mel model with the text as a prefix, keeps it (three layers, dropout
+    0.5, at inference too)."""
+
+    def __init__(self, inp: int, out: int, dim: int = 256, dropout: float = 0.5, layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(dim if i else inp, dim) for i in range(layers)])
+        self.out = nn.Linear(dim, out)
+        self.dropout = dropout
+
+    def forward(self, x: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = F.dropout(F.relu(layer(x)), self.dropout, training=True)
+        return self.out(x)
 
 
 def characters(text: Tensor, text_len: Tensor) -> tuple[Tensor, Tensor]:
@@ -64,7 +86,9 @@ class ARPrefixTTS(nn.Module):
         k = self.patch
         self.tok = nn.Embedding(self.vocab, dim)
         self.seg = nn.Parameter(torch.zeros(3, dim))
-        self.x_in = nn.Linear(k * n_mels, dim)
+        pn = a.get("prenet")  # {dim, dropout, layers}: a bottleneck on the history (see PreNet)
+        self.x_in = (PreNet(k * n_mels, dim, int(pn.get("dim", 256)), float(pn.get("dropout", 0.5)),
+                            int(pn.get("layers", 2))) if pn else nn.Linear(k * n_mels, dim))
         self.spk = nn.Embedding(num_speakers, dim)
         nn.init.normal_(self.spk.weight, std=0.02)
         self.bos = nn.Parameter(torch.zeros(k * n_mels))

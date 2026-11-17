@@ -14,6 +14,7 @@ model:
   ar:
     prompt: true           # a crop of another utterance of the speaker as the [voice] prefix, for a share of them
     max_seconds_per_char: 0.35   # the bound on a generated utterance's length, should the end head not fire
+    # prenet: {dim: 256, dropout: 0.5}   # a bottleneck on the history (Tacotron 2, MELLE), at inference too
 
 drift:
   cond_dropout: 0.1        # utterances without their text (the null branch of guidance)

@@ -11,6 +11,9 @@ One step:
    is no prior mean to add to); the drifting loss, or the energy score (``drift.loss``), on the maps of
    :func:`~drifting_tts.models.ar.ar_features`;
 4. the end head: binary cross-entropy at every step, 1 at the step after the last patch (``loss.eos``, 0.1).
+
+The log's ``text_gap / null_steps`` says whether the model reads: how much larger the error of the mean patch is on
+the utterances that lost their text (``drift.cond_dropout``) than on the others.
 """
 
 from __future__ import annotations
@@ -83,6 +86,16 @@ def training_step(model: ARPrefixTTS, batch: dict, cfg: Config, device, tau: tor
             vals = [v for kk, v in info.items() if kk.startswith(name + "/")]
             if vals:
                 metrics[name] = torch.stack(vals).mean()
+        # does the model read? The error of the mean patch without the text over the error with it, minus 1, on
+        # the steps that have utterances of both kinds (`null_steps`: their share; text_gap / null_steps is the
+        # mean). 0: the states do not depend on the text.
+        gap, both = 0.0, 0.0
+        if drop is not None:
+            null = drop[idx // S]
+            if bool(null.any()) and not bool(null.all()):
+                err = ((x.mean(1) - target) ** 2).mean(1)
+                gap, both = err[null].mean() / err[~null].mean() - 1.0, 1.0
+        metrics["text_gap"], metrics["null_steps"] = gap, both
         if model.prompted:
             metrics["prompted"] = (prompt_len > 0).float().mean() if prompt_len is not None else 0.0
             metrics["id_dropped"] = dropped.float().mean()
