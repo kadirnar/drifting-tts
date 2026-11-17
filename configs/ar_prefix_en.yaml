@@ -6,7 +6,7 @@
 # compare what the issue asks: WER, pauses per utterance, duration spread, F0, at equal steps.
 #   drifting-tts train-ar --config configs/ar_prefix_en.yaml --workdir runs/ar_prefix_en
 # Not run to the end: the aligned model took 200k steps of 48 utterances on an RTX 5090 (11 h). The pilot on an A10
-# (docs/ENGLISH.md: 20,000 steps of about 12 utterances) reaches the first words of a sentence, WER 68%.
+# (docs/ENGLISH.md: 40,000 steps of about 12 utterances) says 86% of a sentence's words, WER 35.5% at temperature 1.
 base: ar_tts_en_10k.yaml
 
 model:
@@ -35,3 +35,7 @@ loss:
 train:
   eval_every: 10000
   ema_decays: [0.999, 0.9999]
+  sample_temperature: 1.0  # the samples and (eval.temperature) the in-loop evaluation at the temperature the head
+  eval:                    # is trained with. At the aligned model's 0.5 this model falls silent after the first
+    temperature: 1.0       # words (WER 55% against 35.5% at 1.0, docs/ENGLISH.md): the words are not in a prior
+                           # mean here, the head's draw decides whether a patch speaks
