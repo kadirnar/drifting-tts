@@ -18,6 +18,11 @@ One step:
 
 ``train.eval_every`` evaluates every EMA inside the loop, on the held-out objective and on synthesised held-out
 sentences, and ``train.ema_decays`` keeps more than one EMA (#102, :mod:`drifting_tts.loop_eval`).
+
+``model.ar.prompt`` with ``drift.prompt`` trains voices from a prompt (#95, Kyutai's Pocket TTS recipe): an utterance
+is cut at a word boundary, the frames before the cut are history without a text condition, the words after it are
+the text, and the loss is taken after the cut (:func:`cut_prompts`). For a share of them the speaker row is the
+"prompted" one, so the voice has to come from the prompt.
 """
 
 from __future__ import annotations
@@ -29,8 +34,10 @@ import time
 from pathlib import Path
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 from .alignment import sequence_mask
+from .audio import HOP_LENGTH, SAMPLE_RATE
 from .config import Config, load_config, save_config
 from .data import MelDataset, collate
 from .drift import feature_drift_loss
@@ -38,6 +45,7 @@ from .latents import VAE_BACKENDS
 from .loop_eval import AudioEval, build_emas, heldout_metrics, load_emas, other_emas, record
 from .models.ar import ARDriftTTS, ar_features, patchify
 from .models.text_encoder import align, duration_loss, expand, prior_loss
+from .text import BLANK_ID, PAD_ID, frontend
 from .train import build_loader, dataset_stats, grow_speakers
 from .utils import count_params, infinite, lr_lambda, rng_state, save_checkpoint, seed_everything, set_rng_state
 
@@ -46,6 +54,68 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--config", default="configs/ar_tts.yaml")
     p.add_argument("--workdir", default="runs/ar_tts")
     p.add_argument("overrides", nargs="*", help="config overrides, e.g. train.steps=1000")
+
+
+@torch.no_grad()
+def cut_prompts(model: ARDriftTTS, text: torch.Tensor, text_len: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor,
+                spk: torch.Tensor, pc, space: int, always: torch.Tensor | None = None) -> dict:
+    """Prompts for a batch (#95): an utterance that is long enough is cut where a word starts, between
+    ``min_seconds`` and ``max_seconds`` and at least ``min_target`` seconds before its end (the model's own
+    alignment gives the frame). The frames before the cut, less up to ``max_trim`` seconds of their end, are the
+    prompt; the tokens and frames from the cut on are the utterance that is trained. Kyutai's loader on why the cut
+    is at a word: "Without a boundary to cut at, the prompt would be a window of the target itself and the model
+    would learn to copy it instead of reading the text."
+
+    Returns ``text`` / ``text_len`` / ``mel`` / ``mel_len`` of the part after the cut (the whole utterance where
+    there is no cut), ``prompt`` ``[B, n_mels, P]`` with ``prompt_len`` (whole patches; 0: no prompt), and
+    ``dropped`` ``[B]``: the prompted utterances whose speaker row is the prompted one (``id_dropout``). ``always``
+    ``[B]``: utterances of voices without a row (a corpus streamed with ``speakers: prompt``), which are cut
+    whenever they can be and never keep a row."""
+    B, k, dev = y.shape[0], model.patch, y.device
+    fps = SAMPLE_RATE / HOP_LENGTH
+    lo, hi, rest, trim = (int(round(float(pc.get(name, default)) * fps)) for name, default in
+                          (("min_seconds", 2.0), ("max_seconds", 6.0), ("min_target", 1.5), ("max_trim", 0.5)))
+    y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda):
+        _, mu, _, x_mask = model.encoder(text, text_len, spk)
+    frames = align(mu.float(), x_mask.float(), y, y_mask)[0].sum(-1)  # [B, N] frames per token
+    start = (frames.cumsum(-1) - frames).long()  # the first frame of every token
+    # a cut is the blank after a space: the next word starts there, and the rest is again blank, character, blank, ...
+    after_space = torch.nn.functional.pad(text[:, :-1] == space, (1, 0)) & (text == BLANK_ID)
+    inside = torch.arange(text.shape[1], device=dev)[None] < text_len[:, None]
+    ok = after_space & inside & (start >= lo) & (start <= hi) & (start <= y_len[:, None] - rest)
+    always = torch.zeros(B, dtype=torch.bool, device=dev) if always is None else always
+    ok &= ((torch.rand(B, device=dev) < float(pc.get("prob", 0.85))) | always)[:, None]
+    texts, mels, prompts = [], [], []
+    for b in range(B):
+        cand = ok[b].nonzero()[:, 0]
+        j = int(cand[torch.randint(len(cand), (1,), device=dev)]) if len(cand) else 0
+        f0 = int(start[b, j]) if len(cand) else 0
+        p = max(f0 - int(torch.randint(trim + 1, (1,), device=dev)), 0) // k * k if len(cand) else 0
+        texts.append(text[b, j: int(text_len[b])])
+        mels.append(y[b, :, f0: int(y_len[b])].T)
+        prompts.append(y[b, :, :p].T)
+    prompt_len = torch.tensor([p.shape[0] for p in prompts], device=dev)
+    dropped = (prompt_len > 0) & ((torch.rand(B, device=dev) < float(pc.get("id_dropout", 0.5))) | always)
+    return {"text": pad_sequence(texts, batch_first=True, padding_value=PAD_ID),
+            "text_len": torch.tensor([t.numel() for t in texts], device=dev),
+            "mel": pad_sequence(mels, batch_first=True).transpose(1, 2),
+            "mel_len": torch.tensor([m.shape[0] for m in mels], device=dev),
+            "prompt": pad_sequence(prompts, batch_first=True).transpose(1, 2), "prompt_len": prompt_len,
+            "dropped": dropped}
+
+
+def prepend_prompts(cond: torch.Tensor, y: torch.Tensor, y_len: torch.Tensor, prompt: torch.Tensor,
+                    prompt_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every utterance's prompt in front of it: the mel ``[B, n_mels, P_b + T_b]`` (prompt, then target) and the
+    condition, zero over the prompt (the backbone gets no text for it). Padded to the longest."""
+    B, total = y.shape[0], int((prompt_len + y_len).max())
+    full_c, full_y = cond.new_zeros(B, cond.shape[1], total), y.new_zeros(B, y.shape[1], total)
+    for b in range(B):
+        p, t = int(prompt_len[b]), int(y_len[b])
+        full_y[b, :, :p], full_y[b, :, p: p + t] = prompt[b, :, :p], y[b, :, :t]
+        full_c[b, :, p: p + t] = cond[b, :, :t]
+    return full_c, full_y
 
 
 def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torch.Tensor,
@@ -57,29 +127,50 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
     text, text_len, y, y_len, spk = (batch[k].to(device, non_blocking=True)
                                      for k in ("text", "text_len", "mel", "mel_len", "spk"))
     amp = torch.autocast("cuda", dtype=torch.bfloat16, enabled=y.is_cuda)
+    B = y.shape[0]
+    unknown = spk < 0  # voices without a speaker row (a corpus streamed with `speakers: prompt`, #104)
+    if unknown.any():
+        if not model.prompted:
+            raise ValueError("utterances without a speaker row need a model trained with prompts (model.ar.prompt)")
+        spk = torch.where(unknown, torch.full_like(spk, model.prompt_row), spk)  # without a prompt: the null voice
+    lead, spk_emb, spk_in = torch.zeros_like(y_len), None, spk  # prompt frames, the encoder's and the backbone's voice
+    prompting = model.prompted and dc.get("prompt")
+    if prompting:  # voices from a prompt (#95): the utterance's own beginning, cut off at a word
+        cut = cut_prompts(model, text, text_len, y, y_len, spk, dc.prompt,
+                          frontend(cfg.model.text.get("language")).SYMBOL_TO_ID[" "], unknown)
+        text, text_len, y, y_len, lead = cut["text"], cut["text_len"], cut["mel"], cut["mel_len"], cut["prompt_len"]
+        with amp:
+            vec = model.prompt_vector(cut["prompt"], lead)
+        spk_emb = torch.where(cut["dropped"][:, None], vec.float(), model.encoder.spk(spk))
+        spk_in = torch.where(cut["dropped"], torch.full_like(spk, model.prompt_row), spk)
     y_mask = sequence_mask(y_len, y.shape[-1])[:, None].float()
     with amp:
-        h, mu, logw, x_mask = model.encoder(text, text_len, spk)
+        h, mu, logw, x_mask = model.encoder(text, text_len, spk, spk_emb)
     h, mu, logw = h.float(), mu.float(), logw.float()
     attn, logw_target = align(mu, x_mask, y, y_mask)
     l_prior = prior_loss(expand(mu, attn), y, y_mask)
     l_dur = duration_loss(logw, logw_target, x_mask)
 
     k, C = model.patch, model.n_mels
-    cond, y = model.pad_frames(model.frame_condition(h, mu, attn)), model.pad_frames(y)
-    B = y.shape[0]
+    cond = model.frame_condition(h, mu, attn)
+    if prompting:
+        cond, y = prepend_prompts(cond, y, y_len, cut["prompt"], lead)
+    cond, y = model.pad_frames(cond), model.pad_frames(y)
     noise = torch.rand(B, device=device) * float(dc.get("input_noise", 0.0))
     p_drop = float(dc.get("cond_dropout", 0.0))  # the null condition of guidance
     drop = torch.rand(B, device=device) < p_drop if p_drop > 0 else None
     hist, share = y, float(dc.get("self_history", 0.0))
     if share > 0:  # the model's own one-step patches as the history of a share of the utterances
         with amp:
-            own = model.gta(cond, y, spk, float(dc.get("self_history_temperature", 0.5))).float()
-        hist = torch.where((torch.rand(B, device=device) < share)[:, None, None], own, y)
+            own = model.gta(cond, y, spk_in, float(dc.get("self_history_temperature", 0.5))).float()
+        swap = (torch.rand(B, device=device) < share)[:, None, None]
+        swap = swap & (torch.arange(y.shape[-1], device=device)[None, None] >= lead[:, None, None])  # not a prompt
+        hist = torch.where(swap, own, y)
     with amp:
-        s = model.teacher_forced(cond, hist, spk, noise, drop)  # [B, S, dim]
+        s = model.teacher_forced(cond, hist, spk_in, noise, drop)  # [B, S, dim]
     S = s.shape[1]
-    valid = (torch.arange(S, device=device)[None] * k < y_len[:, None])  # steps that start inside the utterance
+    pos = torch.arange(S, device=device)[None] * k
+    valid = (pos >= lead[:, None]) & (pos < (lead + y_len)[:, None])  # steps that start inside the utterance
     idx = valid.flatten().nonzero()[:, 0]
     if idx.numel() > dc.max_rows:  # a random subset of the steps (rows) keeps the head's batch bounded
         idx = idx[torch.randperm(idx.numel(), device=device)[: dc.max_rows]]
@@ -108,6 +199,10 @@ def training_step(model: ARDriftTTS, batch: dict, cfg: Config, device, tau: torc
                    "centroid_mse": ((x.mean(1) - target) ** 2).mean(), "sample_std": x.std(1).mean(),
                    "rows": float(R), "tau": tau.detach().reshape(()),
                    "p_data": torch.stack([v for kk, v in info.items() if kk.startswith("p_data/")]).mean()}
+        if prompting:
+            metrics["prompted"] = (lead > 0).float().mean()
+            metrics["id_dropped"] = cut["dropped"].float().mean()
+            metrics["no_row"] = unknown.float().mean()
         if detail:
             metrics.update({kk: v for kk, v in info.items() if kk.startswith(("loss/", "force/", "p_data/"))})
     return loss, metrics
@@ -273,10 +368,11 @@ def run(args) -> None:
         if eval_every and (step % eval_every == 0 or step == tc.steps):
             evaluate(step)
         if step % tc.save_every == 0 or step == tc.steps:
-            save_checkpoint(work / "last.pt", model=model.state_dict(), ema=ema.model.state_dict(),
-                            tau=float(tau.detach()), opt=opt.state_dict(), sched=sched.state_dict(), step=step,
-                            rng=rng_state(), epoch=getattr(loader.batch_sampler, "epoch", 0), config=cfg.to_dict(),
-                            num_speakers=ds.num_speakers, emas=other_emas(emas))
+            if tc.get("save_last", True):  # false: exports only, the run cannot be resumed (a pilot on a small disk)
+                save_checkpoint(work / "last.pt", model=model.state_dict(), ema=ema.model.state_dict(),
+                                tau=float(tau.detach()), opt=opt.state_dict(), sched=sched.state_dict(), step=step,
+                                rng=rng_state(), epoch=getattr(loader.batch_sampler, "epoch", 0),
+                                config=cfg.to_dict(), num_speakers=ds.num_speakers, emas=other_emas(emas))
             for n, (name, e) in enumerate(emas.items()):  # model_ema.pt, and model_ema_<decay>.pt for another EMA
                 save_checkpoint(work / ("model_ema.pt" if n == 0 else f"model_ema_{name}.pt"),
                                 ema=e.model.state_dict(), config=cfg.to_dict(), num_speakers=ds.num_speakers,

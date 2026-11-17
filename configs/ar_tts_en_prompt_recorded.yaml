@@ -1,0 +1,21 @@
+# Issues #104 (step 2) and #95: recorded English speech for the prompted model. The corpus the English ARDrift was
+# trained on is synthetic (4,000 voices of one generator), and a model that has never heard a recording clones a
+# recorded voice poorly (docs/ENGLISH.md: SIM-o 0.44 on unseen recorded speakers against 0.68 on the corpus's own).
+# LibriTTS-R (CC BY 4.0; 24 kHz, restored) is mixed into the stream: its speakers have no row of the speaker table,
+# so every one of its utterances is trained through a prompt (speakers: prompt), next to the synthetic corpus, which
+# keeps the model's own voices.
+#   drifting-tts train-ar --config configs/ar_tts_en_prompt_recorded.yaml --workdir runs/ar_en_prompt_rec
+base: ar_tts_en_prompt.yaml
+
+data:
+  stream:
+    extra:
+      - files: [hf://datasets/mythicinfinity/libritts_r/data/train.clean.100/*.parquet,
+                hf://datasets/mythicinfinity/libritts_r/data/train.clean.360/*.parquet]   # 245 h, 1,151 speakers
+        speaker_column: speaker_id
+        text_column: text_normalized
+        share: 0.25            # of the shards; its shards hold four times the utterances of the corpus's
+        speakers: prompt
+
+train:
+  init_from: runs/ar_en_prompt/model_ema.pt   # the prompted model (configs/ar_tts_en_prompt.yaml)

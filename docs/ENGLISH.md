@@ -394,6 +394,98 @@ ignored a prosody predictor before).
 `floor_letters`, `pause_durations`) looked up the space and the punctuation in the Turkish symbol table for every
 language; the English frontend has other ids for them. They take the model's language now.
 
+## Voices from a prompt (#95)
+
+A voice was a row of two speaker tables: a new one took a fine-tune of 30-40k steps. Kyutai's Pocket TTS, whose
+recipe ARDrift follows, has no speaker encoder: the reference audio is a prompt in front of the sequence. The same
+here, on mel patches.
+
+**Training** (`model.ar.prompt`, `drift.prompt`; `train_ar.cut_prompts`). An utterance is cut where a word starts,
+between 2 and 6 s and at least 1.5 s before its end; the model's own alignment gives the frame. The frames before
+the cut, less up to 0.5 s of their end, are the prompt: history that the backbone reads without a text condition.
+The tokens and frames after the cut are the utterance that is trained, and the loss is taken there. Kyutai's
+loader on why the cut is at a word: "Without a boundary to cut at, the prompt would be a window of the target itself
+and the model would learn to copy it instead of reading the text." For half of the prompted utterances the speaker
+row is a new one, "the voice is in the prompt", and the text encoder and the duration predictor get a vector pooled
+from the prompt's patches instead of a table row. In this corpus 60% of the utterances of a batch get a prompt
+(`prob: 0.85`; the others are too short or keep the old path) and 30% lose their speaker row.
+
+**Inference.** `tts(text, ref_audio="voice.wav")`: the first 6 s of the recording, prepared as the training data
+(silence trimmed, loudness normalised), no transcript. The prompt stays in front of every unit of a call,
+`tts.reference(...)` prepares a voice once, and streaming draws the same audio.
+
+**A pilot.** The released model fine-tuned for 8,000 steps of 16 utterances at 1e-4, streamed from the corpus
+(`configs/ar_tts_en_prompt.yaml`; 1.5 it/s on an A10, 90 minutes). The released checkpoint does not hold its learned
+temperature: tau alone, optimised on its loss with the model frozen, settles at 0.056-0.065, so the run starts at
+0.06 (it ends at 0.075).
+
+**Speakers never heard** (LibriTTS-R test-clean, 24 kHz recordings: 36 speakers, one prompt recording of 5-9 s and
+the texts of three other utterances each, 108 items; `scripts/clone_eval.py`). SIM-o: the cosine between the
+WavLM-ECAPA embeddings of the generated audio and of the prompt recording; WER by Whisper large-v3:
+
+| system | SIM-o | 95% | WER |
+|---|---|---|---|
+| the speaker's own recording of the target | 0.656 | 0.636-0.675 | 2.35% |
+| another speaker's recording | 0.153 | 0.131-0.175 | – |
+| released model, the nearest training speaker (of 1,000 rows, by embedding) | 0.308 | 0.290-0.326 | 3.73% |
+| ... which continues the prompt under its transcript (no training) | 0.415 | 0.395-0.434 | 6.72% |
+| prompt, 2,000 steps | 0.381 | 0.357-0.404 | 4.85% |
+| prompt, 4,000 steps | 0.425 | 0.402-0.446 | 5.05% |
+| prompt, 6,000 steps | 0.427 | 0.405-0.448 | 4.90% |
+| **prompt, 8,000 steps** | **0.435** | 0.414-0.454 | 3.77% |
+| ... the first 3 s of the recording | 0.402 | 0.380-0.421 | 4.36% |
+| ... the whole recording (5-9 s) | 0.442 | 0.422-0.461 | 3.43% |
+
+**Voices of the corpus** (40 held-out recordings of training speakers as prompts, three held-out texts each, 120
+items; "by its row" is the speaker ID, what the model did before):
+
+| system | SIM-o | 95% | WER |
+|---|---|---|---|
+| released model, by its row | 0.768 | 0.754-0.782 | 1.35% |
+| fine-tuned, by its row | 0.741 | 0.725-0.756 | 1.64% |
+| prompt, 2,000 / 4,000 / 6,000 steps | 0.645 / 0.667 / 0.673 | | 1.93% / 2.09% / 2.63% |
+| **prompt, 8,000 steps** | **0.680** | 0.659-0.699 | 1.76% |
+
+- **The prompt carries the voice.** For the corpus's voices a recording of 6 s gives 0.68 without their row, against
+  0.74 with it: 92% of what the speaker table holds, after 8,000 steps, at the same WER (+3 word errors of 2,437).
+- **On speakers never heard it is the best of the systems here and far from the recordings**: 0.435 against 0.656
+  for the speaker's own recording and 0.153 for another speaker's. It is 0.13 above the nearest training speaker
+  (higher on 89% of the items) at the same WER, and 0.02 above that speaker continuing the prompt under its
+  transcript (95%: +0.002 to +0.039), which costs 60 word errors more of 2,040 and needs the transcript.
+- **Longer prompts help**: +0.04 from 3 s to the whole recording (higher on 80% of the items), and fewer word
+  errors. Between speakers the similarity goes from 0.17 to 0.61 (median 0.44).
+- **The curve is flat after 4,000 steps on unseen voices** (0.425, 0.427, 0.435) and still rising slowly on the
+  corpus's. More steps of this recipe on this data will not close the gap: the model has heard 4,000 synthetic
+  voices of one generator and no recording (#104; recorded speech in the stream, below, adds 0.10). #95 cites 0.66 for F5-TTS on LibriSpeech-PC, a system trained
+  on recorded speech; the test set here is another, so only the rows of one table compare.
+- **What the pilot costs the old path**: the speaker rows lose 0.03 similarity (0.768 to 0.741) and make 7 word
+  errors more of 2,437 (inside its interval). The duration predictor is trained with the log loss again, which the release
+  re-fitted to the mean (#72): `train-durations` has to follow a fine-tune, and it does not know prompts yet.
+
+**Recorded speech in the stream (#104).** The gap on unseen voices is the data's: the model had heard 4,000
+synthetic voices and no recording. `data.stream.extra` mixes another corpus into the stream; with `speakers:
+prompt` its speakers have no row of the table and every one of its utterances is trained through a prompt (cut
+whenever it can be; too short, it is the prompted row without a prompt). `configs/ar_tts_en_prompt_recorded.yaml`:
+LibriTTS-R train-clean (CC BY 4.0; 245 h, 1,151 speakers, none of the test's) as a quarter of the shards, half of
+the utterances, for 6,000 more steps from the pilot above (1.9 it/s, 53 minutes):
+
+| model | unseen recorded speakers: SIM-o | WER | corpus voices, prompt | by its row |
+|---|---|---|---|---|
+| the speaker's own recording | 0.656 | 2.35% | – | – |
+| synthetic corpus only, 8,000 steps | 0.435 | 3.77% | 0.680 | 0.741 |
+| **+ recorded speech, 6,000 steps** | **0.532** | 3.77% | 0.678 | 0.731 |
+
+- **Recorded speech is what was missing**: +0.097 on speakers never heard (95%: +0.082 to +0.113; higher on 88% of
+  the items) with the same word errors, and nothing lost on the corpus's own voices (prompt -0.002, row -0.009).
+  The worst speaker goes from 0.17 to 0.37, the median from 0.44 to 0.54.
+- **0.12 is left to the speaker's own recording** (0.532 against 0.656), after 53 minutes on 245 h. The test's
+  vocoder was fine-tuned on the model's mels of synthetic voices only, and neither the long run of #95 (40-100k
+  steps) nor more recorded speakers (LibriTTS-R has another 500 h) were tried.
+
+Not done: the per-voice pause tables and the prosody sampler fall back to the pooled defaults for a prompted
+voice; the benchmark has no `--ref-audio` yet; voice guidance (#99) and the reference encoder (#96) are their own
+issues.
+
 ## Release
 
 [Vyvo/drifting-tts-en](https://huggingface.co/Vyvo/drifting-tts-en) holds:
@@ -453,6 +545,12 @@ drifting-tts prosody-cache --model runs/en_dur/model_poisson.pt --data data/en_m
 drifting-tts train-prosody --config configs/prosody_drift_ar_en.yaml --workdir runs/prosody_ar_en
 python scripts/eval_prosody_tokens.py --cache runs/pm_cache/targets_en.pt --tts runs/en_dur/model_poisson.pt \
     --prosody sampler=runs/prosody_ar_en/prosody_ema.pt --temperatures 1.0 0.5 --splits dev --out outputs/prosody_ar_en
+# voices from a prompt (#95): the released model fine-tuned; SIM-o and WER on a manifest of prompts and targets
+drifting-tts train-ar --config configs/ar_tts_en_prompt.yaml --workdir runs/ar_en_prompt
+drifting-tts train-ar --config configs/ar_tts_en_prompt_recorded.yaml --workdir runs/ar_en_prompt_rec  # + LibriTTS-R
+python scripts/clone_eval.py --model runs/ar_en_prompt/model_ema.pt --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt \
+    --manifest data/clone_eval/libritts_r/manifest.json --systems recording other prompt --out outputs/clone/libritts_r
+drifting-tts synthesize --model runs/ar_en_prompt/model_ema.pt --ref-audio voice.wav --text "Hello there."
 # release: stage, verify and scan, then upload; the public demo downloads from the model repo
 python scripts/prepare_english_release.py --model runs/en_dur/model_poisson.pt \
     --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt --data data/en_pilot --out runs/en_release
@@ -464,4 +562,6 @@ scripts/deploy_english_demo.sh Vyvo/drifting-tts-en-demo
 tts = Synthesizer("runs/ar_en_10k/model_ema.pt", "cuda", vocoder="vocos-v2")
 wav, _ = tts("Hello! It's 7:45, and the 90s called.", speaker="spk_0042", temperature=0.5)
 varied = tts.variant(prosody="runs/prosody_ar_en/prosody_ema.pt")   # sampled pauses (#100): another seed, another rhythm
+clone = Synthesizer("runs/ar_en_prompt/model_ema.pt", "cuda", vocoder="vocos-v2")   # trained with prompts (#95)
+wav, _ = clone("Hello! It's 7:45, and the 90s called.", ref_audio="voice.wav")    # the voice of a recording
 ```

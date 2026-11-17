@@ -11,6 +11,7 @@ data:
     min_mos: 2.5           # DNSMOS P.835 OVRL
     rate: [8, 20]          # letters per second
     max_cer: 0.15          # Whisper large-v3 against the transcript
+    # require_scores: true # an utterance without a score fails instead of passing (#104)
 
 model:
   kind: ar

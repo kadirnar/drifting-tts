@@ -82,5 +82,7 @@ data:
 ```
 
 Only the `train` split is filtered, so evaluation stays comparable; training prints how many val
-utterances would fail (`apply_to_val: true` filters them too). DNSMOS and ECAPA work at 16 kHz and the
+utterances would fail (`apply_to_val: true` filters them too). An utterance without a score passes;
+`require_scores: true` makes it fail, for a corpus where every kept utterance must have been checked (#104).
+DNSMOS and ECAPA work at 16 kHz and the
 MOS models were trained on English, so use their scores to rank clips, not as absolute quality.

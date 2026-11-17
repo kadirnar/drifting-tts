@@ -38,10 +38,10 @@ def parse_filters(filters: dict | None) -> list[tuple[str, float, float]]:
 
     Keys are ``min_<field>``, ``max_<field>`` or ``<field>: [low, high]`` (``null`` = open end) over the fields of
     ``scores.jsonl``; ``mos``, ``rate`` and ``bandwidth`` alias ``mos_ovrl``, ``cps`` and ``bw_hz``.
-    ``apply_to_val`` is a flag, not a rule."""
+    ``apply_to_val`` and ``require_scores`` are flags, not rules."""
     rules = []
     for key, v in (filters or {}).items():
-        if key == "apply_to_val":
+        if key in ("apply_to_val", "require_scores"):
             continue
         if key.startswith(("min_", "max_")):
             lo, hi = (v, None) if key.startswith("min_") else (None, v)
@@ -55,10 +55,12 @@ def parse_filters(filters: dict | None) -> list[tuple[str, float, float]]:
     return rules
 
 
-def passes(rec: dict | None, rules: list[tuple[str, float, float]]) -> bool:
-    """Whether the scores satisfy every rule. A missing score passes: unscored utterances are never dropped."""
+def passes(rec: dict | None, rules: list[tuple[str, float, float]], require: bool = False) -> bool:
+    """Whether the scores satisfy every rule. A missing score passes, so that unscored utterances are not dropped;
+    with ``require`` (``data.filters.require_scores``, #104) it fails: an utterance nobody scored is not known to be
+    good."""
     rec = rec or {}
-    return all(rec.get(f) is None or lo <= rec[f] <= hi for f, lo, hi in rules)
+    return all((not require) if rec.get(f) is None else lo <= rec[f] <= hi for f, lo, hi in rules)
 
 
 class MelStats:
@@ -148,7 +150,7 @@ class MelDataset(Dataset):
                 n_tokens = 2 * len(e["norm_text"]) + 1
                 if (e["split"] == split and (e.get("quality_score") or 0) >= min_quality
                         and min_frames <= e["frames"] <= max_frames and n_tokens <= e["frames"]):
-                    if scores and not passes(scores.get(n), rules):
+                    if scores and not passes(scores.get(n), rules, bool(filters.get("require_scores"))):
                         failed += 1
                         if drop:
                             continue

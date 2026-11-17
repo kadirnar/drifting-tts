@@ -295,7 +295,9 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 
 ## Limitations
 
-- **Voices:** three built-in voices; no voice cloning from a reference recording.
+- **Voices:** three built-in voices; no voice cloning from a reference recording in the released models (a pilot
+  for the English ARDrift reaches a speaker similarity of 0.53 on recorded voices it never heard, against 0.66 for
+  their own recordings: [docs/ENGLISH.md](docs/ENGLISH.md#voices-from-a-prompt-95)).
 - **Prosody:** v3.2 samples the intonation with the recordings' spread, but the rhythm still comes from a
   deterministic duration predictor, and each sentence is generated without the context of its neighbours. Sampling
   the durations too (opt-in) costs intelligibility for the male and female voices.
