@@ -34,6 +34,8 @@ padding.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -198,15 +200,18 @@ class ARPrefixTTS(nn.Module):
                  eos_threshold: float = 0.5, rate: float | None = None) -> Tensor:
         """Characters ``[1, N]`` -> normalised mel ``[1, n_mels, T]``: one utterance, one patch at a time with a KV
         cache, until the end head says so (``eos_threshold``; never before ``min_steps``) or ``max_steps`` (default:
-        :attr:`max_rate` seconds per character). ``rate``: with a clock, the patches per character the text is
-        laid out at (the tempo; default :attr:`rate`)."""
+        :attr:`max_rate` seconds per character; with a clock, the length of the text at its tempo). ``rate``: with
+        a clock, the patches per character the text is laid out at (the tempo; default :attr:`rate`)."""
         from ..audio import HOP_LENGTH, SAMPLE_RATE
 
         if text.shape[0] != 1:
             raise ValueError("generate takes one utterance (rows of different length need padding in front)")
         k = self.patch
         n = torch.tensor([text.shape[1]], device=text.device)
-        if max_steps is None:
+        if max_steps is None and self.clock:
+            # the clock says where the text ends: as in training, the utterance is as long as its text at this tempo
+            max_steps = max(math.ceil(text.shape[1] * (self.rate if rate is None else rate)), min_steps + 1)
+        elif max_steps is None:
             max_steps = max(int(text.shape[1] * self.max_rate * SAMPLE_RATE / HOP_LENGTH / k), min_steps + 1)
         prefix, _, pos = self.prefix(text, n, spk, prompt,
                                      rate=None if rate is None else torch.tensor([rate], device=text.device))

@@ -138,6 +138,9 @@ def test_the_clock_lays_the_text_over_the_audio():
     assert not torch.allclose(m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, rate=1.0), mel, atol=1e-4)  # the tempo
     voiced = m.generate(one, spk1, 0.0, max_steps=5, min_steps=5, prompt=torch.randn(1, 100, 16))
     assert voiced.shape == (1, 100, 20)
+    with torch.no_grad():
+        m.eos.bias.fill_(-20.0)  # the end head silent: the utterance is as long as its text at the tempo
+    assert m.generate(one, spk1, 0.5).shape[-1] == 9 * 4 and m.generate(one, spk1, 0.5, rate=2.5).shape[-1] == 15 * 4
     # the training step lays every utterance out at its own rate
     cfg = load_config("configs/ar_tts.yaml", OVER + ["drift.cond_dropout=0.5"])
     seen = {}
