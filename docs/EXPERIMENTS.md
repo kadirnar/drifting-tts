@@ -418,6 +418,21 @@ pause energy (+1.4 to +1.6 dB), and no judge moves. Most of that distance is ano
 an error: two teacher-forced draws are already 1.6 dB apart. The corpus is clean; the podcast voices, where the
 one-step history took 2.3 dB off, are where rollouts remain to be tried.
 
+**More than one positive per drift problem (#98, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#positives-from-a-teacher-98)).**
+`drift.teacher`: a frozen model draws 31 positives per row beside the recording. With the released model's own
+head (self-distillation), 5,000 steps move no judge outside its interval (UTMOSv2 +0.05, WER 2.03% against 2.17%)
+and no distribution test in the right direction. With a flow-matching head trained on the frozen backbone's states
+(30,000 steps on 6 h; evenly calibrated across temporal frequencies at 32 Euler steps, 0.88–0.93, but with a worse
+mean than the drifting head), six of seven judges fall and a classifier tells the mels from recordings 96–99% of
+the time: the student inherits a teacher that is worse than itself.
+
+**Guidance for ARDrift (#99, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#guidance-99)).** Text dropout 0.15 for 5,000
+steps, then a sweep: WER 2.4 / 7.9 / 25 / 45% at scales 1 / 1.25 / 1.5 / 1.75, every judge lower at each step.
+Teacher-forced, the mean patch's error is smallest at scale 1 and 1.8 times as large at 1.5: the head adds a
+residual to the aligned prior mean, the prior mean carries the text also in the null branch, and guidance on the
+state scales the residual. Distilling the guided state into the backbone works as a mechanism (the student speaks
+in one pass as its teacher in two) and has nothing good to distil here.
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**
