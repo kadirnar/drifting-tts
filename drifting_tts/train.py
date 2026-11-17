@@ -513,6 +513,7 @@ def load_tts(path: str | Path, device="cpu") -> tuple[DriftingTTS, Config, dict]
     else:
         model = DriftingTTS(cfg.model, num_speakers=ck["num_speakers"], n_mels=ck.get("n_mels", 100))
     model.load_state_dict(ck["ema"])
+    model.language = cfg.model.get("text", {}).get("language")  # its text frontend (None: Turkish)
     model.duration_scale = float(ck.get("duration_scale", 1.0))  # set by `drifting-tts calibrate-durations`
     model.duration_scales = {int(k): float(v) for k, v in ck.get("duration_scales", {}).items()}  # per voice
     model.temperature = ck.get("temperature")  # preferred noise temperature (`calibrate-durations --temperature`)

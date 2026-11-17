@@ -357,6 +357,16 @@ sampled durations cost intelligibility (WER 2.63%). Flow matching with the same 
 model (CRPS), but it is 10–14% flatter and needs 8 network evaluations. BERTurk word features help the pitch
 (polar questions) but not the durations.
 
+**A duration-only sampler for ARDrift (#100, [ENGLISH.md](ENGLISH.md#sampled-durations-and-pauses-100)).** ARDrift has
+no token pitch, so the same network samples durations alone (the English model, 6 h, a sampler pooled over 1,266
+speakers). On held-out tokens the letter spread goes from 0.83 to 0.99 of the recordings' and the CRPS from 0.456 to
+0.282. With the pauses sampled at temperature 0.5 and the letters left to the model, 100 held-out sentences have the
+recordings' pauses (1.83 of 1.08 s per utterance; recordings 1.81 of 1.05 s; regressor 2.49 of 0.69 s), differ by
+12% in length between seeds, and lose no word (WER 2.30% against 2.37%) and no judge of the panel; on 500 held-out
+utterances the WER is 1.52% against 1.36%, most of the difference Whisper's spelling of contractions and fillers next
+to a pause. Letters sampled at temperature 1 cost words (4.94%) and 0.1 to 0.2 on UTMOS22 and SCOREQ. No predicted
+MOS rewards the rhythm; they fall with the length of the silences, in recordings too.
+
 ## 6. Pitfalls and engineering notes
 
 **Training and evaluation:**

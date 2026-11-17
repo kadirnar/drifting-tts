@@ -1,0 +1,28 @@
+# Issue #100: a duration-only drift sampler for the English ARDrift. ARDrift samples its intonation, but its durations
+# are one number per token (the regressor), so every seed reads a sentence with the same rhythm. The model has no
+# token pitch: the sampler is trained on its MAS durations alone (`prosody-cache` stores no pitch for it), on the
+# frozen text encoder, pooled over the corpus's 4,000 speakers.
+#   drifting-tts prosody-cache --model runs/en_dur/model_poisson.pt --out runs/pm_cache/targets_en.pt
+#   drifting-tts train-prosody --config configs/prosody_drift_ar_en.yaml --workdir runs/prosody_ar_en
+base: prosody_drift.yaml
+
+tts: runs/en_dur/model_poisson.pt     # the released English ARDrift (durations re-fitted to the mean, #72)
+cache: runs/pm_cache/targets_en.pt
+
+net:
+  duration_only: true
+
+loss:
+  voiced: 0.0              # no voicing to learn
+
+eval_temperatures: [1.0, 0.5]
+
+train:
+  steps: 10000             # on 6 h of audio the held-out CRPS stops falling at 6,000 steps
+  batch_size: 4            # 4 x 4 utterances per step: the corpus's utterances are long (16 at once need > 7 GB)
+  accum: 4
+
+calibrate:
+  speakers: all            # one factor for every speaker
+  temperature: 0.5         # the operating point (docs/ENGLISH.md): the pauses sampled at 0.5, ...
+  durations: pauses        # ... the letters the model's own: letters sampled at 1 cost words (WER 2.4% -> 4.9%)

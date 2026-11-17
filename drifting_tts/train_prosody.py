@@ -56,6 +56,7 @@ class ProsodyData:
     """The utterances of one or more splits of a prosody cache, as padded batches."""
 
     def __init__(self, cache: dict, splits: tuple[str, ...], speakers: list[int] | None = None):
+        self.language = cache.get("language")  # the frontend of the token ids (None: Turkish)
         self.sent = False  # batches carry the sentence features (set by train-prosody when the net uses them)
         self.sent_boundary = False  # ... with the boundary channel (ProsodyNet ctx_boundaries)
         t = cache["tokens"]
@@ -81,7 +82,7 @@ class ProsodyData:
     def subset(self, idx) -> ProsodyData:
         out = object.__new__(ProsodyData)
         out.utts, out.items, out.sent = [self.utts[i] for i in idx], [self.items[i] for i in idx], self.sent
-        out.sent_boundary = self.sent_boundary
+        out.sent_boundary, out.language = self.sent_boundary, self.language
         return out
 
     def batch(self, idx: list[int], device) -> dict:
@@ -97,7 +98,7 @@ class ProsodyData:
             out[k] = x
         for i, it in enumerate(items):
             out["ids"][i, : len(it["ids"])] = torch.from_numpy(it["ids"])
-        out["word"] = word_index(out["ids"])
+        out["word"] = word_index(out["ids"], self.language)
         out["mask"] = torch.arange(N)[None] < out["len"][:, None]
         if self.sent:
             out["sent_tok"] = sentence_tokens(out["ids"], out["len"], self.sent_boundary)
@@ -107,7 +108,7 @@ class ProsodyData:
         out["n_words"] = n_words
         out["dur"] = out["dur"].clamp_min(1) * out["mask"]
         if "wf" in items[0]:  # contextual word features broadcast to the tokens [B, D, N]
-            word = word_index(out["ids"]).cpu()
+            word = word_index(out["ids"], self.language).cpu()
             wt = torch.zeros(B, N, items[0]["wf"].shape[1])
             for i, it in enumerate(items):
                 n = len(it["ids"])
@@ -155,7 +156,7 @@ def set_stats(pred: ProsodyPredictor, data: ProsodyData, device, n: int = 4000, 
     idx = rng.choice(len(data), min(n, len(data)), replace=False)
     ld = np.concatenate([np.log(np.maximum(data.items[i]["dur"], 1)) for i in idx])
     pc = np.concatenate([data.items[i]["pcont"] for i in idx])
-    pred.stats.seq.copy_(torch.tensor([[ld.mean(), ld.std()], [pc.mean(), pc.std()]]))
+    pred.stats.seq.copy_(torch.tensor([[ld.mean(), ld.std()], [pc.mean(), max(pc.std(), 1e-3)]]))  # no pitch: 0, 1e-3
     words, utts = [], []
     for s in range(0, len(idx), 256):
         b = data.batch(list(idx[s: s + 256]), device)
@@ -285,7 +286,7 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
         else:
             cond, base, x_mask = encode(tts, pred, b)
             dcond = None
-            dmask = ~boundary_tokens(b["ids"])  # as predict: the pauses keep the first row's durations ...
+            dmask = ~boundary_tokens(b["ids"], data.language)  # as predict: the pauses keep the first row's ...
             if rhythm and any(int(k) in rhythm for k in b["spk"]):
                 rs = torch.tensor([rhythm.get(int(k), int(k)) for k in b["spk"]], device=device)
                 dcond = encode(tts, pred, {**b, "spk": rs})[:2]
@@ -298,11 +299,11 @@ def sample_split(pred: ProsodyPredictor | None, tts, data: ProsodyData, seeds: l
                                         duration_mask=dmask)
                 sc = 1.0
                 if apply_scales:
-                    sc = torch.tensor([pred.duration_scales.get(int(k), 1.0) for k in b["spk"]], device=device)[:, None]
+                    sc = torch.tensor([pred.scale(int(k)) for k in b["spk"]], device=device)[:, None]
                 fr, pitch = pred.frames_and_pitch(y, vlogit, x_mask, sc)
                 if min_letter_frames or rel_letter_floor:
                     fr = floor_letters(fr, b["ids"], min_letter_frames, rel_letter_floor,
-                                       torch.exp(b["logw_det"]) * sc) * mask
+                                       torch.exp(b["logw_det"]) * sc, data.language) * mask
                 _, pc = pred.stats.denorm(y)
                 res.append((fr, pitch[:, 0], pc, vlogit > 0))
         for j, i in enumerate(idx):
@@ -339,8 +340,21 @@ def reversal_rate(p: np.ndarray, voiced: np.ndarray, threshold: float) -> float:
     return float(((d[1:] * d[:-1] < 0) & big[1:] & big[:-1]).sum() / len(lp))
 
 
-def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: float = 0.077) -> dict:
+def gaps(ids: np.ndarray, language: str | None = None) -> np.ndarray:
+    """Group index per token: every run of tokens between words (:func:`boundary_tokens`: a space or punctuation and
+    the blanks around it) is one gap, numbered from 0; letters are -1."""
+    b = boundary_tokens(torch.from_numpy(np.asarray(ids))[None], language)[0].numpy()
+    start = b & ~np.concatenate([[False], b[:-1]])
+    return np.where(b, np.cumsum(start) - 1, -1)
+
+
+def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: float = 0.077,
+                  pause_frames: int = 14) -> dict:
     """Token / letter / word / utterance prosody statistics of sampled sequences against the recordings' targets.
+
+    The gaps between words (:func:`gaps`): ``gap_std_ratio`` (within-utterance spread of their log length),
+    ``w1_gap``, ``div_gap`` (across seeds), and ``pauses`` / ``pauses_gt``: gaps of at least ``pause_frames`` frames
+    (0.15 s at 93.75 frames/s) per utterance.
 
     ``*_std_ratio``: within-utterance spread, predicted / ground truth (1 = as varied as the recordings);
     ``*_corr``: Pearson with the ground truth; ``*_crps``: continuous ranked probability score over the seeds
@@ -351,14 +365,15 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
     (:func:`reversal_rate`; threshold 0.077 normalised log-F0 = 0.5 semitone with v3.1's statistics; the recordings'
     value is ``reversal_rate_gt``); ``rate``: median predicted / recorded length;
     ``div_*``: standard deviation across seeds."""
-    from .text import SYMBOL_TO_ID
+    from .models.prosody_net import punctuation_ids
 
-    space = SYMBOL_TO_ID[" "]
+    language = getattr(data, "language", None)
+    space = punctuation_ids(language)[0]
     acc = {k: [] for k in ("p_std", "p_std_gt", "ld_std", "ld_std_gt", "let_std", "let_std_gt", "wd_std", "wd_std_gt",
                            "wp_std", "wp_std_gt", "p_corr", "ld_corr", "let_corr", "wd_corr", "p_crps", "ld_crps",
                            "jit", "jit_gt", "rev", "rev_gt", "rate", "div_p", "div_ld", "div_total", "div_mean_p",
-                           "vacc")}
-    pdev, pdev_gt, ld_all, ld_gt_all, ustd, ustd_gt = [], [], [], [], [], []
+                           "vacc", "gap_std", "gap_std_gt", "pauses", "pauses_gt", "div_gap")}
+    pdev, pdev_gt, ld_all, ld_gt_all, ustd, ustd_gt, gap_all, gap_gt_all = [], [], [], [], [], [], [], []
     for s, it in zip(samples, data.items):
         v = it["voiced"]
         ids = it["ids"]
@@ -383,6 +398,19 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
         let_gt, let = np.log(group(it["dur"], let_grp)), np.log(group(fr, let_grp))
         wcnt = group(np.ones(len(ids)), wd_grp)
         wd_gt, wd = np.log(group(it["dur"], wd_grp)), np.log(group(fr, wd_grp))
+        gap_grp = gaps(ids, language)
+        gsel = gap_grp >= 0
+        if gsel.any():  # the gaps between words: their frames, recorded and sampled
+            g_gt = group(it["dur"][gsel], gap_grp[gsel])
+            g = group(fr[:, gsel], gap_grp[gsel])
+            acc["gap_std"] += [np.log(g[k]).std() for k in range(K)]
+            acc["gap_std_gt"].append(np.log(g_gt).std())
+            acc["pauses"] += [(g[k] >= pause_frames).sum() for k in range(K)]
+            acc["pauses_gt"].append((g_gt >= pause_frames).sum())
+            gap_all.append(np.log(g).ravel())
+            gap_gt_all.append(np.log(g_gt))
+            if K > 1:
+                acc["div_gap"].append(np.log(g).std(0).mean())
         vw = group(v.astype(float), wd_grp)
         wp_gt = group(np.where(v, p_gt, 0), wd_grp) / np.maximum(vw, 1)
         wp = group(np.where(v, pc, 0), wd_grp) / np.maximum(vw, 1)
@@ -430,18 +458,21 @@ def token_metrics(samples: list[dict], data: ProsodyData, reversal_threshold: fl
             acc["div_total"].append(np.log(fr.sum(1)).std())
             acc["div_mean_p"].append(pc[:, v].mean(1).std() if v.any() else 0.0)
     m = lambda k: float(np.mean(acc[k])) if acc[k] else float("nan")
+    w1 = lambda a, b: _w1(np.concatenate(a), np.concatenate(b)) if a and b else float("nan")  # no voiced tokens
     return {
         "p_std_ratio": m("p_std") / m("p_std_gt"), "ld_std_ratio": m("ld_std") / m("ld_std_gt"),
         "letter_std_ratio": m("let_std") / m("let_std_gt"), "word_dur_std_ratio": m("wd_std") / m("wd_std_gt"),
         "word_p_std_ratio": m("wp_std") / m("wp_std_gt"),
         "p_corr": m("p_corr"), "ld_corr": m("ld_corr"), "letter_corr": m("let_corr"), "word_dur_corr": m("wd_corr"),
         "p_crps": m("p_crps"), "ld_crps": m("ld_crps"),
-        "w1_pdev": _w1(np.concatenate(pdev), np.concatenate(pdev_gt)),
+        "w1_pdev": w1(pdev, pdev_gt),
         "w1_ld": _w1(np.concatenate(ld_all), np.concatenate(ld_gt_all)),
-        "w1_utt_pstd": _w1(np.array(ustd), np.array(ustd_gt)),
+        "w1_utt_pstd": _w1(np.array(ustd), np.array(ustd_gt)) if ustd and ustd_gt else float("nan"),
         "jitter_ratio": m("jit") / m("jit_gt"), "reversal_rate": m("rev"), "reversal_rate_gt": m("rev_gt"),
         "rate": float(np.median(acc["rate"])), "voicing_acc": m("vacc"),
         "div_p": m("div_p"), "div_ld": m("div_ld"), "div_total": m("div_total"), "div_mean_p": m("div_mean_p"),
+        "gap_std_ratio": m("gap_std") / m("gap_std_gt"), "w1_gap": w1(gap_all, gap_gt_all), "div_gap": m("div_gap"),
+        "pauses": m("pauses"), "pauses_gt": m("pauses_gt"),
     }
 
 
@@ -478,13 +509,32 @@ def calibrate(pred: ProsodyPredictor, tts, cache: dict, device, temperature: flo
     return scales
 
 
+@torch.no_grad()
+def calibrate_all(pred: ProsodyPredictor, tts, cache: dict, device, temperature: float, num: int = 1000,
+                  seed: int = 0, spread: float = 1.0, duration_temperature: float | None = None) -> float:
+    """One duration factor for every speaker (``calibrate.speakers: all``; a corpus of many speakers with little audio
+    each): the median recorded / sampled length over ``num`` training utterances."""
+    data = ProsodyData(cache, ("train",))
+    rng = np.random.default_rng(seed)
+    sub = data.subset(rng.choice(len(data), min(num, len(data)), replace=False))
+    samples = sample_split(pred, tts, sub, [seed], temperature, device, spread=spread,
+                           duration_temperature=duration_temperature)
+    r = [it["dur"].sum() / s["frames"][0].sum() for s, it in zip(samples, sub.items)]
+    print(f"all speakers: recorded / sampled length median {np.median(r):.3f} (p10 {np.percentile(r, 10):.3f}, "
+          f"p90 {np.percentile(r, 90):.3f}) over {len(sub)} training utterances, T={temperature:g}", flush=True)
+    return float(np.median(r))
+
+
 # ------------------------------------------------------------------------------------------------------- train
+def _speakers(cal) -> dict:
+    """``calibrate.speakers`` (a list of speaker IDs) as :func:`calibrate`'s argument; without it, its default."""
+    return {"speakers": tuple(int(k) for k in cal.speakers)} if cal.get("speakers") else {}
+
+
 def load_frozen_tts(path: str, device):
     from .train import load_tts
 
-    tts, _, _ = load_tts(path, device)
-    if not tts.pitch_enabled:
-        raise SystemExit("the prosody predictor needs a pitch-conditioned TTS model")
+    tts, _, _ = load_tts(path, device)  # without token pitch (ARDrift): a duration-only predictor
     return tts.eval().requires_grad_(False)
 
 
@@ -510,13 +560,18 @@ def run(args) -> None:
         pred = ProsodyPredictor.load(path, device, tts=tts)
         ck = torch.load(path, map_location="cpu", weights_only=False)
         dt, rhythm = cal.get("duration_temperature"), {int(k): int(v) for k, v in (cal.get("rhythm") or {}).items()}
-        ck["duration_scales"] = calibrate(pred, tts, cache, device, cal.get("temperature", 1.0),
-                                          spread=cal.get("spread", 1.0), duration_temperature=dt, rhythm=rhythm)
+        if cal.get("speakers") == "all":
+            ck["duration_scale"] = calibrate_all(pred, tts, cache, device, cal.get("temperature", 1.0),
+                                                 spread=cal.get("spread", 1.0), duration_temperature=dt)
+        ck["duration_scales"] = {} if cal.get("speakers") == "all" else calibrate(
+            pred, tts, cache, device, cal.get("temperature", 1.0), spread=cal.get("spread", 1.0),
+            duration_temperature=dt, rhythm=rhythm, **_speakers(cal))
         ck["calibrate_temperature"], ck["calibrate_spread"] = cal.get("temperature", 1.0), cal.get("spread", 1.0)
         ck["temperature"] = cal.get("temperature", 1.0)  # the default of Synthesizer(prosody_temperature=None)
+        ck["durations"] = cal.get("durations")  # ... and of Synthesizer(prosody_durations=None)
         ck["duration_temperature"], ck["rhythm"] = dt, rhythm  # and of prosody_duration_temperature, the voices
         save_checkpoint(path, **ck)
-        print(f"stored duration_scales {ck['duration_scales']} in {path}")
+        print(f"stored duration_scales {ck['duration_scales']} (others: {ck.get('duration_scale', 1.0):.3f}) in {path}")
         return
     train = ProsodyData(cache, ("train",))
     dev = ProsodyData(cache, (cfg.get("eval_split", "dev"),))
@@ -531,7 +586,14 @@ def run(args) -> None:
         from .sentence_features import DIM
 
         cfg.net.sent_dim = DIM + int(bool(cfg.net.get("ctx_boundaries", False)))
+    if not tts.pitch_enabled and not cfg.net.get("duration_only", False):
+        print("the TTS model has no token pitch: training a duration-only predictor (net.duration_only)", flush=True)
+        cfg.net.duration_only = True
     pred = ProsodyPredictor(cfg.net.to_dict(), cond_dim).to(device)
+    pred.language = getattr(tts, "language", None)
+    if cache.get("language", pred.language) != pred.language:
+        raise SystemExit(f"the cache holds {cache.get('language')!r} tokens, the TTS model reads {pred.language!r}")
+    train.language = dev.language = pred.language
     train.sent = dev.sent = pred.net.sent_dim > 0
     train.sent_boundary = dev.sent_boundary = pred.net.ctx_boundaries
     pred.flow_steps = int(cfg.get("flow", {}).get("steps", 8))
@@ -563,11 +625,14 @@ def run(args) -> None:
     t0, agg = time.time(), {}
     history = []
 
+    calibrated: dict = {}  # what the calibration at the end adds to the checkpoint
+
     def save(path: Path, full: bool) -> None:
         state = dict(ema=ema.model.state_dict(), stats=pred.stats.state_dict(), net_cfg=pred.net_cfg,
                      cond_dim=cond_dim, step=step, tts=str(cfg.tts), config=cfg.to_dict(),
                      tau=None if tau is None else float(tau.detach()), flow_steps=pred.flow_steps,
-                     duration_scales=pred.duration_scales)
+                     duration_scales=pred.duration_scales, duration_scale=pred.duration_scale,
+                     language=pred.language, durations=cal.get("durations"), **calibrated)
         if full:
             state.update(net=pred.net.state_dict(), opt=opt.state_dict(), sched=sched.state_dict())
         save_checkpoint(path, **state)
@@ -611,6 +676,10 @@ def run(args) -> None:
                     writer.add_scalar(f"dev_T{T:g}/{k}", v, step)
                 keys = ("p_std_ratio", "ld_std_ratio", "word_p_std_ratio", "word_dur_std_ratio", "p_corr",
                         "p_crps", "ld_crps", "w1_pdev", "w1_ld", "jitter_ratio", "rate", "div_p", "div_total")
+                if pred.net.duration_only:  # the rhythm alone: letters, gaps between words, pauses
+                    keys = ("ld_std_ratio", "letter_std_ratio", "gap_std_ratio", "word_dur_std_ratio", "ld_corr",
+                            "ld_crps", "w1_ld", "w1_gap", "pauses", "pauses_gt", "rate", "div_ld", "div_gap",
+                            "div_total")
                 print(f"  dev T={T:g} " + " ".join(f"{k}={res[k]:.3f}" for k in keys), flush=True)
                 history.append({"step": step, "temperature": T, **res})
             pred.net = live
@@ -620,7 +689,14 @@ def run(args) -> None:
             save(work / "prosody_ema.pt", False)
     if cal.get("enabled", True):
         pred.net = ema.model
-        pred.duration_scales = calibrate(pred, tts, cache, device, cal.get("temperature", 1.0),
-                                         spread=cal.get("spread", 1.0))
+        if cal.get("speakers") == "all":
+            pred.duration_scale = calibrate_all(pred, tts, cache, device, cal.get("temperature", 1.0),
+                                                spread=cal.get("spread", 1.0))
+        else:
+            pred.duration_scales = calibrate(pred, tts, cache, device, cal.get("temperature", 1.0),
+                                             spread=cal.get("spread", 1.0), **_speakers(cal))
+        # the factors hold at this temperature: it is the default of Synthesizer(prosody_temperature=None)
+        calibrated.update(temperature=cal.get("temperature", 1.0), calibrate_temperature=cal.get("temperature", 1.0),
+                          calibrate_spread=cal.get("spread", 1.0))
         save(work / "prosody_ema.pt", False)
     print(f"done: {work / 'prosody_ema.pt'}", flush=True)

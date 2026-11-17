@@ -407,7 +407,9 @@ T 0.3:
 - **Retraining was not tried** (a speaker-pooled duration model, a penalty on short letters): even the best-modelled
   rhythm of the corpus, the studio voice's at T 0.3 with their own edges, costs these voices 0.4–0.6 pp, which
   points at how their generator renders varied durations rather than at their duration model. A speaker-pooled
-  sampler would sit between their own rhythm and the studio's.
+  sampler would sit between their own rhythm and the studio's. (#100 trained one for the English ARDrift, pooled
+  over 1,266 speakers with two or three utterances each: its letters at temperature 1 cost words there too, its
+  pauses at 0.5 cost 0 to 0.16 points of WER; [ENGLISH.md](ENGLISH.md#sampled-durations-and-pauses-100).)
 
 So **sampled rhythm stays a studio-voice option**; for the male and female voices the demo keeps falling back to
 v3.2 (pitch only). The borrowed studio rhythm is in the recommended checkpoint for them (`rhythm` below): the

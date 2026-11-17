@@ -304,6 +304,96 @@ On the 500 held-out utterances (BigVGAN-v2 GTA 40k, as above):
 - **Where**: the private English Space offers both and defaults to the re-fitted one. It holds only the predictor
   (`durations_en.pt`, 2.2 MB, `drifting_tts.publish.export_durations`), since the Space stores at most 1 GB.
 
+## Sampled durations and pauses (#100)
+
+ARDrift samples its intonation, but its durations are one number per token (`ceil(exp(logw))`, re-fitted to the
+mean in #72): every seed reads a sentence with the same rhythm, and every pause is about as long as the next. The
+prosody sampler of the Turkish DiT ([PROSODY_MODEL.md](PROSODY_MODEL.md)) needed a token-pitch predictor, which
+ARDrift does not have.
+
+**A duration-only sampler.** `ProsodyNet` with `net.duration_only` (set automatically for a model without token
+pitch) holds the pitch channel at zero: the same 8.2 M network, feature maps and drifting loss, on the frozen text
+encoder's states, the speaker embedding and the regressor's log-durations. `prosody-cache` stores the MAS durations
+alone for such a model. `configs/prosody_drift_ar_en.yaml`: the 3,194 utterances of the vocoder comparison above
+(6.0 h, 1,266 speakers), so the sampler is pooled over speakers with two or three utterances each and has one
+duration factor for all of them (`calibrate.speakers: all`). 10,000 steps of 16 utterances (2.4 it/s on an A10);
+the held-out CRPS stops falling at 6,000.
+
+**Tokens** (dev 300: utterances of 13 s with several sentences; 8 seeds; `scripts/eval_prosody_tokens.py`; a spread
+is the within-utterance standard deviation relative to the recordings'):
+
+| durations | letter spread | gap spread | log-duration CRPS | W1 log-duration | W1 gaps | gaps of 0.15 s or more | length | log length between seeds |
+|---|---|---|---|---|---|---|---|---|
+| recordings | 1 | 1 | 0 | 0 | 0 | 5.36 | 1 | – |
+| regressor (re-fitted, #72) | 0.83 | 0.92 | 0.456 | 0.204 | 0.088 | 6.03 | 0.95 | 0 |
+| sampler, T 1 | 0.99 | 0.99 | 0.282 | 0.024 | 0.033 | 4.99 | 0.98 | 0.13 |
+| sampler, T 0.5 | 0.94 | 0.97 | 0.306 | 0.045 | 0.068 | 4.26 | 0.92 | 0.08 |
+
+The gaps between words in seconds: mean (standard deviation; 10th to 90th percentile):
+
+| durations | between words | at a comma | at a sentence end |
+|---|---|---|---|
+| recordings | 0.071 (0.067) | 0.34 (0.43; 0.06 to 0.83) | 1.11 (1.44; 0.10 to 2.51) |
+| regressor | 0.067 (0.028) | 0.28 (0.18; 0.13 to 0.48) | 0.85 (0.58; 0.27 to 1.67) |
+| sampler, T 1 | 0.068 (0.043) | 0.32 (0.46; 0.06 to 0.77) | 0.97 (1.05; 0.11 to 2.36) |
+| sampler, T 0.5 | 0.064 (0.034) | 0.27 (0.35; 0.06 to 0.70) | 0.92 (0.82; 0.12 to 2.08) |
+
+- **The regressor reads every comma alike**, 0.13 to 0.48 s, where the recordings go from no pause (0.06 s) to
+  0.83 s. The sampler has both ends, and the recordings' letter rhythm (0.99 against 0.83).
+- **It is the better forecast, not only the more varied one**: the CRPS, which a deterministic forecast pays as its
+  absolute error, falls from 0.456 to 0.282.
+
+**Audio** (val 100, the released vocoder, model T 0.5; a pause is a silent run of 0.1 s or more inside the
+utterance; two seeds per sentence; WER by Whisper large-v3; the judges of
+[HEAD_REALISM.md](HEAD_REALISM.md#a-panel-of-judges-where-the-audible-gap-is), `*`: the paired 95% interval against
+the regressor excludes 0):
+
+| durations | pauses per utterance | pause, s (std) | length, s | length between seeds | WER | UTMOSv2 | UTMOS22 | SCOREQ | NISQA | Audiobox PQ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| recording | 1.81 | 1.05 (1.03) | 5.61 | – | 2.44% | 3.27 | 4.20 | 4.28 | 4.63 | 7.49 |
+| regressor (released) | 2.49 | 0.69 (0.68) | 5.35 | 0% | 2.37% | 3.38 | 4.13 | 4.25 | 4.63 | 7.51 |
+| **pauses sampled, T 0.5** (the checkpoint's default) | **1.83** | **1.08 (0.96)** | **5.58** | 12% | 2.30% | 3.40 | 4.12 | 4.23 | 4.62 | 7.50 |
+| pauses sampled, T 1 | 1.89 | 1.23 (1.33) | 6.00 | 19% | 2.71% | 3.24* | 4.08* | 4.15* | 4.57* | 7.48 |
+| all sampled: letters 0.3, pauses 0.5 | 1.72 | 1.14 (0.95) | 5.55 | 12% | 2.51% | 3.35 | 4.12 | 4.22 | 4.61 | 7.50 |
+| all sampled, T 1 | 1.83 | 1.27 (1.33) | 6.15 | 20% | 4.94% | 3.24* | 4.01* | 4.06* | 4.59 | 7.45* |
+
+DNSMOS (3.29 to 3.33) and SQUIM (4.32 to 4.37) do not separate the rows. All rows use the factor 1.046 measured at
+T 0.5, which makes the T 1 rows 7 to 10% longer than the recordings.
+
+- **Sampled pauses at T 0.5 give the recordings' pauses.** 1.83 pauses of 1.08 s per utterance against the
+  recordings' 1.81 of 1.05 s; the regressor makes 2.49 of 0.69 s. One word error fewer than the regressor (34
+  against 35 of 1,477; 95% of the difference: -7 to +4), no judge lower. Two seeds of a sentence differ by 0.3
+  pauses, 0.67 s of silence and 12% in length; the regressor's are the same.
+- **On all 500 held-out utterances** (the long ones of dev included; pauses of 0.15 s or more): 3.07 pauses and
+  2.57 s of silence per utterance against the recordings' 3.03 and 2.82 s (regressor 3.87 and 2.22 s), and 233 word
+  errors against the regressor's 208 of 15,302 (WER 1.52% against 1.36%; +25, 95%: +1 to +49; worse on 48
+  utterances, better on 28). In the 24 utterances that lose most, 15 of the 38 extra errors are Whisper's other
+  spelling of the same words (`gonna` / *going to*, `kinda` / *kind of*), 17 a filler or short word dropped or
+  added next to a pause (`um`, `uh`, `and`, `i`), and 6 another word (`core` / *cool*, `onto` / *under*).
+- **Sampled letters at full temperature cost words**, as they did for the Turkish DiT's low-data voices
+  ([PROSODY_MODEL.md](PROSODY_MODEL.md)): 73 errors against 35 (+38; 95%: +20 to +57; worse on 26 sentences, better
+  on 3), with dropped and doubled words, and 0.12 UTMOS22 and 0.19 SCOREQ. At noise temperature 0.3, the plan of
+  #100, they cost nothing measurable on these 100 sentences (37 errors, no judge lower), but on the 500 held-out
+  utterances 66 word errors (WER 1.79% against 1.36%; 95%: +35 to +99), against 25 for the pauses alone. So the
+  checkpoint's default keeps the model's own letters.
+- **Pauses at T 1 are too long for the judges, not for the data.** They follow the corpus (sentence ends of up to
+  2.5 s), but the predicted MOS falls with the silence itself: cutting every pause to 0.15 s moves the
+  *recordings* by +0.19 SCOREQ, +0.04 UTMOS22 and -0.08 Audiobox PQ, and the regressor's audio alike.
+- **No judge rewards the rhythm.** The panel separates one vocoder from another by 0.7 UTMOS22; the recordings'
+  pauses in place of the regressor's move it by 0.02. These predictors hear the signal, not the timing: what this
+  section gains is measured against the recordings (pauses, spreads, CRPS) and between seeds, not by a predicted
+  MOS.
+
+**In the pipeline.** The checkpoint stores its operating point (`calibrate.temperature`, `calibrate.durations:
+pauses`, the factor), so `Synthesizer(model, prosody="runs/prosody_ar_en/prosody_ema.pt")` samples the pauses at
+0.5 and keeps the letters; `prosody_durations="sampled"`, `prosody_temperature` and
+`prosody_duration_temperature` override it. ARDrift's streaming path draws the same durations as one pass (it
+ignored a prosody predictor before).
+
+**Found on the way.** The helpers that tell letters from the gaps between words (`boundary_tokens`, `word_index`,
+`floor_letters`, `pause_durations`) looked up the space and the punctuation in the Turkish symbol table for every
+language; the English frontend has other ids for them. They take the model's language now.
+
 ## Release
 
 [Vyvo/drifting-tts-en](https://huggingface.co/Vyvo/drifting-tts-en) holds:
@@ -357,6 +447,12 @@ drifting-tts benchmark --model runs/ar_en_10k/model_ema.pt --vocoder vocos-v2 --
 drifting-tts score --data data/en_pilot --scorers asr,rate,mos
 # pauses (#72): the duration predictor re-fitted to the mean duration, the rest of the model unchanged
 drifting-tts train-durations --model runs/ar_en_10k/model_ema.pt --out runs/en_dur/model_poisson.pt
+# sampled pauses (#100): a duration-only drift sampler on the frozen text encoder (a data root with train and dev
+# splits); the checkpoint stores its operating point: the pauses sampled at 0.5, the letters the model's own
+drifting-tts prosody-cache --model runs/en_dur/model_poisson.pt --data data/en_mel_ft --out runs/pm_cache/targets_en.pt
+drifting-tts train-prosody --config configs/prosody_drift_ar_en.yaml --workdir runs/prosody_ar_en
+python scripts/eval_prosody_tokens.py --cache runs/pm_cache/targets_en.pt --tts runs/en_dur/model_poisson.pt \
+    --prosody sampler=runs/prosody_ar_en/prosody_ema.pt --temperatures 1.0 0.5 --splits dev --out outputs/prosody_ar_en
 # release: stage, verify and scan, then upload; the public demo downloads from the model repo
 python scripts/prepare_english_release.py --model runs/en_dur/model_poisson.pt \
     --vocoder runs/en_bigvgan_gta/bigvgan_ft_40000.pt --data data/en_pilot --out runs/en_release
@@ -367,4 +463,5 @@ scripts/deploy_english_demo.sh Vyvo/drifting-tts-en-demo
 ```python
 tts = Synthesizer("runs/ar_en_10k/model_ema.pt", "cuda", vocoder="vocos-v2")
 wav, _ = tts("Hello! It's 7:45, and the 90s called.", speaker="spk_0042", temperature=0.5)
+varied = tts.variant(prosody="runs/prosody_ar_en/prosody_ema.pt")   # sampled pauses (#100): another seed, another rhythm
 ```

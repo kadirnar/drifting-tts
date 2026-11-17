@@ -18,6 +18,8 @@ net:
   ctx_pitch_only: false  # true: word / sentence features feed only a pitch branch (pitch_layers on top of the
   pitch_layers: 2        #   trunk), so the sampled durations do not depend on them
   ctx_boundaries: false  # with ctx_pitch_only: that branch also predicts the durations between words (phrase breaks)
+  duration_only: false   # true: durations alone, the pitch channel held at zero; set for a TTS model without token
+                         #   pitch (ARDrift, #100: configs/prosody_drift_ar_en.yaml)
 
 drift:
   gen_per_cond: 16       # G samples per utterance; the recording's prosody is the one positive
@@ -60,3 +62,7 @@ calibrate:                 # per-voice duration factors at the end of training (
   duration_temperature: null  # the letters' durations at their own noise temperature (null: temperature; the pauses
                            # keep it); stored as the preferred one
   rhythm: {}               # voice -> speaker whose rhythm its sampled durations borrow, e.g. {389: 722, 323: 722}
+  durations: null          # the duration source a Synthesizer uses with this checkpoint unless told otherwise:
+                           # sampled (null) | pauses (the gaps between words sampled, the letters the model's) | regressor
+  # speakers: [722, 389, 323]  # the voices that get a factor of their own (default: these three); `all`: one factor
+  #                            # for every speaker, from 1,000 training utterances (many speakers, little audio each)

@@ -138,7 +138,7 @@ class GraphedAcoustic:
                     out = pros.net(torch.cat([cond, cd]), xm2)
                 y = (torch.cat([base, bd]) + out[:, :2]) * xm2
                 own = (rspk == spk)[:, None, None]  # no borrowed rhythm: the pauses keep the first row's (predict)
-                ld = torch.where(boundary_tokens(ids)[:, None] & own, y[:1, :1], y[1:, :1])
+                ld = torch.where(boundary_tokens(ids, pros.language)[:, None] & own, y[:1, :1], y[1:, :1])
                 y = torch.cat([ld, y[:1, 1:]], 1)
                 frames, pitch = pros.frames_and_pitch(y, out[:1, 2], x_mask, scale)
                 edges = edge_tokens(length, ids.shape[1]) & ~own[:, 0] & (escale > 0)
@@ -264,7 +264,8 @@ class GraphedAcoustic:
                 frames, padded = frames[:, context:], padded[:, context:]
             if self.prosody_durations == "pauses":
                 rs = length_scale if regressor_scale is None else regressor_scale
-                attn, y_len = frames_to_alignment(pause_durations(frames, logw, padded, x_mask, rs), x_mask)
+                frames = pause_durations(frames, logw, padded, x_mask, rs, self.prosody.language)
+                attn, y_len = frames_to_alignment(frames, x_mask)
             elif self.prosody_durations == "sampled":
                 attn, y_len = frames_to_alignment(frames, x_mask)
             else:

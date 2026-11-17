@@ -198,7 +198,7 @@ class Synthesizer:
     def __init__(self, model_path: str | Path, device: str = "cuda", vocoder: str | None = None,
                  cuda_kernel: bool = False, fast: bool = False, compile: bool = False, tf32: bool = False,
                  prosody: str | Path | None = None, prosody_temperature: float | None = None,
-                 prosody_spread: float = 1.0, prosody_durations: str = "sampled", pause: Pause = 0.15,
+                 prosody_spread: float = 1.0, prosody_durations: str | None = None, pause: Pause = 0.15,
                  prosody_duration_temperature: float | None = None, prosody_pitch: str | Path | None = None,
                  paragraph: bool | int | None = None, context: bool = False, temperature: float | None = None,
                  cfg_scale: float | None = None, acoustic_context: bool | int | None = None,
@@ -301,7 +301,7 @@ class Synthesizer:
         return cls(model if Path(model).is_file() else hub_file(model, f"release {release}"), device, **opts)
 
     def variant(self, vocoder=_KEEP, prosody=_KEEP, pause: Pause = _KEEP, prosody_temperature: float | None = None,
-                prosody_spread: float = 1.0, prosody_durations: str = "sampled",
+                prosody_spread: float = 1.0, prosody_durations: str | None = None,
                 prosody_duration_temperature: float | None = None,
                 prosody_pitch: str | Path | None = None, paragraph: bool | int = _KEEP,
                 context: bool = _KEEP, temperature: float = _KEEP, cfg_scale: float = _KEEP,
@@ -401,7 +401,7 @@ class Synthesizer:
             previous = unit
 
     def set_prosody(self, prosody=None, temperature: float | None = None, spread: float = 1.0,
-                    durations: str = "sampled", duration_temperature: float | None = None, pitch=None) -> None:
+                    durations: str | None = None, duration_temperature: float | None = None, pitch=None) -> None:
         """Where the durations and token pitch come from. ``prosody``: ``None`` (the model's deterministic
         regressors), a :class:`~drifting_tts.models.prosody_net.ProsodyPredictor`, a name of
         :data:`drifting_tts.hub.PROSODY_MODELS` (``"drift"``) or a ``train-prosody`` checkpoint.
@@ -410,8 +410,9 @@ class Synthesizer:
         1) and output-space temperature ``spread`` (:meth:`ProsodyPredictor.sample`); the seed of each call drives
         it, before the DiT's noise. ``durations="regressor"`` keeps the model's durations (and per-voice factors) and
         samples only the token pitch; ``"pauses"`` also samples the durations of the tokens between words (pauses and
-        phrase breaks, at the predictor's own factors) and keeps the model's for the letters; otherwise its own
-        per-voice duration factors replace the model's.
+        phrase breaks, at the predictor's own factors) and keeps the model's for the letters; ``"sampled"`` takes
+        every duration from the predictor, whose own per-voice duration factors replace the model's. ``None``: the
+        predictor's preferred source (``calibrate.durations`` of ``train-prosody``), else ``"sampled"``.
         ``duration_temperature``: the noise temperature of the sampled durations apart from the pitch's
         (``ProsodyPredictor.sample``; ``None``: the checkpoint's preferred one, else the prosody temperature of each
         call). A voice listed in the predictor's ``rhythm`` table samples its durations as that speaker (its
@@ -421,12 +422,12 @@ class Synthesizer:
         ``prosody``'s (needs ``prosody``). With ``fast``, a one-pass predictor (``drift`` / ``mse``, spread 1, no
         word or sentence features, no second pitch predictor) runs in the acoustic model's CUDA graphs (recaptured
         here); others run eagerly."""
-        if durations not in DURATION_SOURCES:
+        if durations is not None and durations not in DURATION_SOURCES:
             raise ValueError(f"prosody_durations must be one of {DURATION_SOURCES}, got {durations!r}")
         if pitch is not None and prosody is None:
             raise ValueError("a second pitch predictor needs a prosody predictor for the durations")
         self.prosody, self.prosody_temperature = None, temperature
-        self.prosody_spread, self.prosody_durations = spread, durations
+        self.prosody_spread, self.prosody_durations = spread, durations or "sampled"
         self.prosody_duration_temperature = duration_temperature
         self.prosody_pitch = None
         if prosody is not None:
@@ -436,6 +437,8 @@ class Synthesizer:
                 return p if isinstance(p, ProsodyPredictor) else ProsodyPredictor.load(p, self.device, tts=self.model)
 
             self.prosody = load(prosody)
+            if durations is None:  # the predictor's preferred source (calibrate.durations), else all sampled
+                self.prosody_durations = self.prosody.durations or "sampled"
             if temperature is None:
                 self.prosody_temperature = 1.0 if self.prosody.temperature is None else self.prosody.temperature
             if duration_temperature is None:
@@ -495,7 +498,7 @@ class Synthesizer:
         if src is None or src == spk_id:
             return None
         own = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
-        return torch.tensor([src], device=self.device), own / self.prosody.duration_scales.get(spk_id, 1.0)
+        return torch.tensor([src], device=self.device), own / self.prosody.scale(spk_id)
 
     def speaker_id(self, speaker: str | int) -> int:
         """A voice name (``male`` / ``female``), a training speaker ID, or a dataset speaker name."""
@@ -509,7 +512,7 @@ class Synthesizer:
         if spk_id >= self.model.encoder.spk.num_embeddings:
             raise ValueError(f"speaker {speaker!r} ({spk_id}) is not in this checkpoint")
         if self.prosody is not None and self.prosody_durations in ("sampled", "pauses"):  # the sampler's own factors
-            tempo = self.prosody.duration_scales.get(spk_id, 1.0)
+            tempo = self.prosody.scale(spk_id)
         else:
             tempo = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
         return torch.tensor([spk_id], device=self.device), tempo
@@ -521,7 +524,30 @@ class Synthesizer:
             return None
         spk_id = int(spk[0])
         own = getattr(self.model, "duration_scales", {}).get(spk_id, self.model.duration_scale)
-        return length_scale * own / self.prosody.duration_scales.get(spk_id, 1.0)
+        return length_scale * own / self.prosody.scale(spk_id)
+
+    def _sample_prosody(self, ids: torch.Tensor, spk: torch.Tensor, g: torch.Generator, length_scale: float,
+                        pt: float | None, dt: float | None, rs: torch.Tensor | None, edge_scale: float | None
+                        ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The prosody predictor's frames per token and token pitch for one unit (``None`` for what the model's own
+        regressors give), drawn from ``g`` before the acoustic model's noise. ``pt`` / ``dt``: the prosody and the
+        letters' duration temperature; ``rs`` / ``edge_scale``: :meth:`_rhythm`."""
+        durations = pitch = None
+        if self.prosody is None:
+            return durations, pitch
+        ids_len = torch.tensor([ids.shape[1]], device=self.device)
+        durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
+                                                spread=self.prosody_spread, duration_temperature=dt,
+                                                duration_speaker=rs, edge_scale=edge_scale,
+                                                regressor_scale=self._regressor_scale(spk, length_scale))
+        if self.prosody_pitch is not None:  # the token pitch from the second predictor, drawn next
+            _, pitch = self.prosody_pitch.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
+                                                  spread=self.prosody_spread)
+        if self.prosody_durations == "regressor":
+            durations = None
+        if self.ar:  # a duration-only predictor (#100): the intonation is the model's own
+            pitch = None
+        return durations, pitch
 
     def _mel(self, sentence: str, spk: torch.Tensor, g: torch.Generator, cfg_scale: float, temperature: float,
              length_scale: float, attn_window: int | None = None, pitch_shift: float = 0.0,
@@ -545,17 +571,8 @@ class Synthesizer:
                                  rhythm=rs, edge_scale=edge_scale,
                                  regressor_scale=self._regressor_scale(spk, length_scale), context=ctx)
         ids_len = torch.tensor([ids.shape[1]], device=self.device)
-        durations = pitch = None
-        if self.prosody is not None:  # sampled first, from the same generator as the DiT's noise
-            durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
-                                                    spread=self.prosody_spread, duration_temperature=dt,
-                                                    duration_speaker=rs, edge_scale=edge_scale,
-                                                    regressor_scale=self._regressor_scale(spk, length_scale))
-            if self.prosody_pitch is not None:  # the token pitch from the second predictor, drawn next
-                _, pitch = self.prosody_pitch.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
-                                                      spread=self.prosody_spread)
-            if self.prosody_durations == "regressor":
-                durations = None
+        # sampled first, from the same generator as the acoustic model's noise
+        durations, pitch = self._sample_prosody(ids, spk, g, length_scale, pt, dt, rs, edge_scale)
         if self.ar:  # ARDriftTTS.synthesize, with the acoustic context of the units before
             cond, _ = self.model.aligned_condition(ids, ids_len, spk, length_scale, pitch_shift, durations, pitch, ctx)
             return self._ar_generate(cond, spk, temperature, g, cfg_scale, history)
@@ -585,17 +602,7 @@ class Synthesizer:
                                          rhythm=rs, edge_scale=edge_scale,
                                          regressor_scale=self._regressor_scale(spk, length_scale), context=ctx)
         ids_len = torch.tensor([ids.shape[1]], device=self.device)
-        durations = pitch = None
-        if self.prosody is not None:  # as _mel
-            durations, pitch = self.prosody.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
-                                                    spread=self.prosody_spread, duration_temperature=dt,
-                                                    duration_speaker=rs, edge_scale=edge_scale,
-                                                    regressor_scale=self._regressor_scale(spk, length_scale))
-            if self.prosody_pitch is not None:
-                _, pitch = self.prosody_pitch.predict(self.model, ids, ids_len, spk, pt, length_scale, generator=g,
-                                                      spread=self.prosody_spread)
-            if self.prosody_durations == "regressor":
-                durations = None
+        durations, pitch = self._sample_prosody(ids, spk, g, length_scale, pt, dt, rs, edge_scale)  # as _mel
         cond, _ = self.model.aligned_condition(ids, ids_len, spk, length_scale, durations=durations, pitch=pitch,
                                                context=ctx)
         z = torch.randn(1, self.model.n_mels, cond.shape[-1], device=self.device, generator=g)
@@ -726,7 +733,7 @@ class Synthesizer:
         cfg_scale, temperature = self.operating_point(cfg_scale, temperature)
         if self.ar:  # ARDrift: generated step by step, streamed as it goes
             yield from self._stream_ar(text, speaker, cfg_scale, temperature, length_scale, seed, pause, first, chunk,
-                                       paragraph, context, acoustic_context)
+                                       paragraph, context, acoustic_context, prosody_temperature)
             return
         if chunked:
             yield from self._stream_chunked(text, speaker, cfg_scale, temperature, length_scale, seed, pause, first,
@@ -753,7 +760,8 @@ class Synthesizer:
 
     def _stream_ar(self, text: str, speaker: str | int, cfg_scale: float, temperature: float, length_scale: float,
                    seed: int, pause: Pause | None, first: int, chunk: int, paragraph: bool | int | None,
-                   context: bool | None, acoustic_context: bool | int | None = None) -> Iterator[torch.Tensor]:
+                   context: bool | None, acoustic_context: bool | int | None = None,
+                   prosody_temperature: float | None = None) -> Iterator[torch.Tensor]:
         """:meth:`stream` for an ARDrift model: each vocoder window runs as soon as the steps that cover it and its
         right context are generated, so the first piece waits for ``first`` + context frames, not the sentence (a
         unit after the first also for the steps of its acoustic context, which only fill the caches). The same draws
@@ -764,6 +772,12 @@ class Synthesizer:
 
         m = self.model
         spk, tempo = self._speaker(speaker)
+        rhythm = self._rhythm(speaker)
+        rs, edge = (None, None) if rhythm is None else (rhythm[0], length_scale * tempo * rhythm[1])
+        pt = self.prosody_temperature if prosody_temperature is None else prosody_temperature
+        dt = self.prosody_duration_temperature if self.prosody_durations == "sampled" else None
+        if dt is None and self._duration_row():  # as _mel
+            dt = pt
         pause = self._pause(pause, speaker, context)
         g = torch.Generator(device=self.device).manual_seed(seed)
         gen = m.fast_generator or ARGenerator(m, graphs=False)
@@ -774,8 +788,9 @@ class Synthesizer:
         for sentence, prev in self._units(text, paragraph, context):
             ids, c = self.with_context(sentence, prev, self.language)
             ids = torch.tensor([ids], device=self.device)
+            durations, _ = self._sample_prosody(ids, spk, g, length_scale * tempo, pt, dt, rs, edge)  # as _mel
             cond, _ = m.aligned_condition(ids, torch.tensor([ids.shape[1]], device=self.device), spk,
-                                          length_scale * tempo, context=c)
+                                          length_scale * tempo, durations=durations, context=c)
             t = cond.shape[-1]
             pc, pm = (None, None) if history is None else history.prefix(t)
             if previous is not None:
@@ -873,7 +888,7 @@ def pipeline_args(args) -> dict:
         pause = "punct"
     if pause == "punct" and getattr(args, "pause_jitter", 0.0):
         pause = f"punct:{args.pause_jitter}"
-    durations = getattr(args, "prosody_durations", None) or rel.get("prosody_durations", "sampled")
+    durations = getattr(args, "prosody_durations", None) or rel.get("prosody_durations")  # None: the predictor's
     paragraph = getattr(args, "paragraph", None)  # None: the release's, else the model's default; 0: off
     return {"model_path": model, "vocoder": args.vocoder or rel.get("vocoder"),
             "prosody": None if str(prosody).lower() == "none" else prosody, "prosody_durations": durations,

@@ -1,0 +1,28 @@
+# Issue #100: the duration-only drift sampler of configs/prosody_drift_ar_en.yaml for the Turkish ARDrift (the model
+# of configs/vocoder_bigvgan_tr_gta.yaml). Its durations are one number per token, so every seed reads a sentence
+# with the same rhythm and every pause is about as long as the next.
+# Not run yet: the Turkish corpus was not available where this was written. On the English model (docs/ENGLISH.md)
+# the sampler reaches the recordings' duration statistics within 6,000 steps of 6 h of audio; sampling the pauses
+# alone at temperature 0.5 costs no judge and 0 to 0.16 points of WER, sampling the letters too at temperature 1
+# costs words (WER 2.4% -> 4.9%), as it did on the Turkish DiT's low-data voices (docs/PROSODY_MODEL.md). Check
+# both again here before changing a default:
+#   drifting-tts prosody-cache --model runs/ar_voices_fa/model_ema.pt --data data/tr12_eleven_podfa \
+#       --out runs/pm_cache/targets_ar.pt
+#   drifting-tts train-prosody --config configs/prosody_drift_ar_tr.yaml --workdir runs/prosody_ar_tr
+#   python scripts/eval_prosody_tokens.py --cache runs/pm_cache/targets_ar.pt --tts runs/ar_voices_fa/model_ema.pt \
+#       --prosody sampler=runs/prosody_ar_tr/prosody_ema.pt --temperatures 1.0 0.5 --out outputs/prosody_ar_tr
+#   Synthesizer("runs/ar_voices_fa/model_ema.pt", prosody="runs/prosody_ar_tr/prosody_ema.pt")   # pauses, T 0.5
+base: prosody_drift.yaml
+
+tts: runs/ar_voices_fa/model_ema.pt   # the Turkish ARDrift
+cache: runs/pm_cache/targets_ar.pt
+
+net:
+  duration_only: true
+
+loss:
+  voiced: 0.0              # no voicing to learn
+
+calibrate:                 # the studio, male and female voices keep a factor of their own (the default speakers)
+  temperature: 0.5         # the pauses sampled at 0.5, ...
+  durations: pauses        # ... the letters the model's own
