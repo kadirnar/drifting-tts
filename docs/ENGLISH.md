@@ -637,13 +637,13 @@ the end head are new), batches of 12,000 frames (about 12 utterances; the aligne
 | | 17,500 | +60.8% (+49.0 to +73.6) | +60% | 0.040 | 82% | 4.1 |
 | | 20,000 | **+69.5%** (+56.6 to +83.2) | +63% | 0.039 | 88% | 4.3 |
 
-The WER of this table is the training loop's: 24 sentences up to the bound of 0.35 s per character, which every
-output reached (the last column), so most of it is what was said after the text.
+The WER of this table is the training loop's: 24 sentences at temperature 0.5 up to the bound of 0.35 s per
+character, which every output reached (the last column), so most of it is what was said after the text.
 
 - **A plain prefix model is an audio model for its first 10,000 steps.** Its states do not depend on the text at
   5,000 steps and barely at 10,000, and what it reads first is the beginning of the utterance. Its end head reads
   the end from the audio (it fires at the right step with another utterance's text as often as with its own), so
-  free-running there is no end: every output runs into the length bound.
+  free-running at temperature 0.5 there is no end: every output runs into the length bound.
 - **A pre-net** on the history (`model.ar.prenet`; Tacotron 2: "essential for learning attention"; MELLE keeps it,
   dropout 0.5, at inference too) is a quarter faster: at 7,500 steps where the plain model is at 10,000, with twice
   the error of the mean patch, since half of the history is dropped. A fresh pre-net needs the temperature of a
@@ -665,18 +665,68 @@ output reached (the last column), so most of it is what was said after the text.
   - It reads from the start of the utterance onwards, and what it loses the text at is mostly a pause: after
     "um", "so", "oh" and a comma the rest is often not speech.
   - Teacher-forced it is further than free-running: the text counts for 70% of the error there.
-- **The plain and the pre-net models do not speak the text** in the steps they had (10,000 and 7,500).
+- **The plain and the pre-net models do not speak the text** in the steps they had (10,000 and 7,500), at
+  temperature 0.5 or at 1.0 ([below](#the-continuation-20000-more-steps-and-the-temperature)).
 - **The scale of the published models**: MELLE (mel frames, the text as a prefix, no alignment) trains 400,000
   updates of 480,000 frames on 16 GPUs with 50,000 h; CALM's TTS has 88,000 h. 20,000 steps of 12,000 frames are
   0.13% of MELLE's frames, and 2.5% of the utterances the aligned model saw (200,000 steps of 48).
 
+### The continuation: 20,000 more steps, and the temperature
+
+The clock arm went on for 20,000 more steps (40,000 in all; the same batch and learning rate), and its 100
+held-out sentences were then read at four noise temperatures. Every free-running number above is at 0.5, the
+aligned model's temperature.
+
+| steps | temperature | WER (95%) | CER | quiet share of the output | words transcribed, of the text's | of them the text's | sentences right / under 20% / under 50% WER | UTMOSv2 |
+|---|---|---|---|---|---|---|---|---|
+| 20,000 | 0.5 | 67.6% (63.1 to 71.8) | 64.1% | 66% | 42% | 79% | 2 / 8 / 24 | 2.78 |
+| | 1.0 | 70.9% (66.5 to 75.6) | 51.1% | 39% | 100% | 45% | 0 / 1 / 18 | 2.95 |
+| 40,000 | 0.5 | 55.1% (49.4 to 60.8) | 55.1% | 64% | 48% | 94% | 7 / 17 / 49 | 2.84 |
+| | 0.75 | 44.1% (38.7 to 49.8) | 40.7% | 55% | 67% | 87% | 7 / 23 / 60 | 3.01 |
+| | **1.0** | **35.5%** (31.0 to 39.9) | 29.1% | 44% | 86% | 81% | 9 / 30 / 72 | 3.09 |
+| | 1.25 | 43.4% (38.5 to 48.4) | 31.4% | 36% | 103% | 68% | 7 / 25 / 60 | 2.98 |
+| recordings | | 2.4% | | 36% | 100% | 98% | 78 / 96 / 100 | 3.27 |
+| the aligned model (released) | 0.5 | 2.1% | | 36% | 100% | 98% | 82 / 95 / 100 | 2.91 |
+
+Quiet share: 20 ms frames more than 35 dB under the utterance's loudest one. "Of them the text's": the transcribed
+words that are the sentence's words in the sentence's order. UTMOSv2: one crop per utterance.
+
+- **At 0.5 the model falls silent, it does not misread.** At 40,000 steps 94% of what it says is the sentence,
+  and it says 48% of it: in 66 sentences of 100 the transcript is the beginning of the sentence and nothing
+  else, and 64% of the output is quiet (the recordings: 36%). The aligned model can halve the noise because the
+  words are in its prior mean; here the head's draw decides whether the next patch speaks.
+- **At the temperature the head is trained with, 1.0, the WER is 35.5%** (19.6 points under 0.5 on the same
+  sentences, 95% 12.7 to 26.3): 86% of the words are said, 81% of those right, 72 sentences of 100 under 50% WER
+  and 30 under 20%. 0.75 and 1.25 are both worse (+8.6 and +7.9 points): 1.25 says every word and misreads a
+  third.
+- **The second 20,000 steps halve the WER at 1.0**: 70.9% to 35.5% (35.4 points, 95% 29.3 to 41.6). At 20,000
+  steps the temperature only trades silence for wrong words: 67.6% and 70.9% (+3.3 points, 95% -2.3 to +9.4).
+- Teacher-forced, text use is +97.0% (95% +90.5 to +103.6, 200 utterances; +69.5% at 20,000 steps), and the
+  error of the mean patch on held-out utterances is 0.036 (0.039).
+- **The WER in the training loop was at 0.5** (24 sentences, cut at the clock's length): 60.4, 52.4, 54.2 and
+  53.5% at 25, 30, 35 and 40 thousand steps. It is flat over the last 10,000 steps, and at 0.5 it measures how
+  soon the model falls silent; `configs/ar_prefix_en.yaml` evaluates at 1.0 now.
+- The end head fires by itself in 21 utterances of 100 at 1.0 (7 at 0.5); the others end on the clock.
+- **The other two arms do not read at 1.0 either** (24 sentences): the transcripts hold 8% (plain, 10,000 steps)
+  and 6% (pre-net, 7,500) of the text's words at 0.5, and 10% and 10% at 1.0. The clock model on the same
+  sentences: 38% at 0.5 and 47% at 1.0 at 20,000 steps, 73% at 1.0 at 40,000. At 0.5 their outputs are 85% and
+  94% quiet; at 1.0 they speak other words (34% and 52% quiet), 1.9 and 1.5 times as many as the text has (WER
+  201% and 160%). The plain model's utterances end by themselves at 1.0: 22 of 24, at 0.90 of the recording's
+  length (median); at 0.5, 3 of 24.
+- At every recording's own tempo the WER is 40.3% at 1.0 (+4.8 points over the mean tempo, 95% -0.2 to +10.0)
+  and 53.2% at 0.5 (-1.9, -6.6 to +2.5): the recording's tempo is not better than the corpus's mean.
+- UTMOSv2 does not pay for the temperature: 3.09 at 1.0 against 2.84 at 0.5 (the aligned model 2.91, the
+  recordings 3.27), on outputs of which 44% is quiet.
+
 **What the pilot says about #103's decision.** A prefix model with a drifting head learns to read on one A10
 without an aligner, a duration predictor or a prior mean, **if the text stands on the clock**; as a plain prefix
-it does not within what a pilot can afford. At 20,000 small steps it is at the first words of a sentence, far from
-the aligned model's 2.4% WER, so the aligned model stays the released one and v2 is a long run to decide on:
+it does not within what a pilot can afford. At 40,000 small steps it says 86% of the words of a sentence and 81%
+of those right (WER 35.5% at temperature 1.0), far from the aligned model's 2.1%, and its WER halved over the last
+20,000 steps, so the aligned model stays the released one and v2 is a long run to decide on:
 
 - the recipe: `configs/ar_prefix_en.yaml` (the clock is its default now), the aligned model's batch of 48 and
-  200,000 steps on the machine that trained it, `text_gap / null_steps` and the in-loop WER as the signs to watch;
+  200,000 steps on the machine that trained it, `text_gap / null_steps` and the in-loop WER at temperature 1.0
+  as the signs to watch;
 - what the clock leaves of the duration model is **one number per utterance**, the tempo. The pilot speaks at the
   corpus's mean (1.57 patches per character); a model for release needs that number from the text and the voice
   (a regression or a sampler on the prefix), or from the user as a speed control;

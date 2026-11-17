@@ -418,7 +418,12 @@ dropout on the history (Tacotron 2, MELLE): +2.4% at 7,500. **The text on the au
 character `j` at rotary position `(j + 0.5) * rate - lead`, the diagonal prior of attention-based TTS as
 positions): +0.9 / +3.2 / +8.0 / +13.7 / +26.9 / +45.3 / +60.8 / +69.5% every 2,500 steps, and at 20,000 steps
 WER 67.6% on 100 sentences: the first 3.5 words of a sentence on average. The price is the tempo as an input.
-The aligned model stays the release; v2 is a long run.
+20,000 more steps (40,000): text use +97.0%, WER 55.1% at the aligned model's temperature 0.5 and **35.5% at
+1.0**, the temperature the head is trained with (70.9% at 20,000 steps). At 0.5 the model falls silent, it does
+not misread: 94% of what it says is the sentence, it says 48% of it, and 64% of the output is quiet (recordings:
+36%). Lesson: a model whose words are not in a prior mean cannot be evaluated at a halved noise; over the same
+20,000 steps the WER at 0.5 moved 12 points while the WER at 1.0 halved. The aligned model stays the release; v2
+is a long run.
 
 **A kernel over a window for ARDrift (#97, [OBJECTIVE_PILOTS.md](OBJECTIVE_PILOTS.md#a-kernel-over-a-window-97)).**
 `drift.window` in `train-ar`: the recorded patches before a step and the generated patch through a frozen Mel-MAE,
