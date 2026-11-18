@@ -286,6 +286,7 @@ be added later by fine-tuning ([docs/TRAINING.md](docs/TRAINING.md#adding-a-voic
 | [space_en/](space_en/) | a private Space of its own for the English model with its fine-tuned BigVGAN-v2 (docs/ENGLISH.md; `scripts/deploy_english_space.sh`) |
 | [space_en_demo/](space_en_demo/), [release_en/](release_en/) | the public English demo (weights from the model repo; `scripts/deploy_english_demo.sh`) and the model repo's card and voices (`scripts/prepare_english_release.py`) |
 | [space_mimi/](space_mimi/) | a private Space of its own for the English model on Mimi latents (docs/MIMI.md; `scripts/deploy_mimi_space.sh`) |
+| [space_pilots/](space_pilots/) | a private Space of its own for the English pilots: ARDrift v2 (the text as a prefix) and a voice from a recording with guidance (docs/ENGLISH.md; `scripts/deploy_pilots_space.sh`) |
 | [drifting_tts/mlx/](drifting_tts/mlx/) | MLX inference for Apple silicon (`python -m drifting_tts.mlx`) |
 | [drifting-tts-swift](https://github.com/kadirnar/drifting-tts-swift) | native Swift MLX engine and iPhone app (separate repository) |
 | [web/](web/) | the WebGPU demo and the ONNX pipeline in JavaScript (`scripts/deploy_webgpu_space.sh` deploys it) |
